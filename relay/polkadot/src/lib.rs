@@ -2084,8 +2084,7 @@ pub mod migrations {
 		>,
 		CancelAuctions,
 		restore_corrupted_ledgers::Migrate<Runtime>,
-		// Migrate NominationPools to `DelegateStake` adapter. This is unversioned upgrade and
-		// should not be applied yet in Kusama/Polkadot.
+		// Migrate NominationPools to `DelegateStake` adapter.
 		pallet_nomination_pools::migration::unversioned::DelegationStakeMigration<
 			Runtime,
 			MaxPoolsToMigrate,
