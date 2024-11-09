@@ -65,10 +65,11 @@ use frame_support::{
 	genesis_builder_helper::{build_state, get_preset},
 	parameter_types,
 	traits::{
-		fungible::HoldConsideration, tokens::UnityOrOuterConversion, ConstU32, ConstU8, EitherOf,
-		EitherOfDiverse, Everything, FromContains, Get, InstanceFilter, KeyOwnerProofSystem,
-		LinearStoragePrice, OnRuntimeUpgrade, PrivilegeCmp, ProcessMessage, ProcessMessageError,
-		WithdrawReasons,
+		fungible::HoldConsideration,
+		tokens::{imbalance::ResolveTo, UnityOrOuterConversion},
+		ConstU32, ConstU8, EitherOf, EitherOfDiverse, Everything, FromContains, Get,
+		InstanceFilter, KeyOwnerProofSystem, LinearStoragePrice, OnRuntimeUpgrade, PrivilegeCmp,
+		ProcessMessage, ProcessMessageError, WithdrawReasons,
 	},
 	weights::{
 		constants::{WEIGHT_PROOF_SIZE_PER_KB, WEIGHT_REF_TIME_PER_MICROS},
@@ -76,7 +77,6 @@ use frame_support::{
 	},
 	PalletId,
 };
-use frame_support::traits::tokens::imbalance::ResolveTo;
 use frame_system::EnsureRoot;
 use pallet_grandpa::{fg_primitives, AuthorityId as GrandpaId};
 use pallet_session::historical as session_historical;
