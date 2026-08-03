@@ -12591,6 +12591,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "polkadot-integration-tests-minimal-relay"
+version = "0.1.0"
+dependencies = [
+ "asset-hub-polkadot-runtime",
+ "coretime-polkadot-runtime",
+ "cumulus-pallet-parachain-system",
+ "cumulus-primitives-core",
+ "frame-remote-externalities",
+ "frame-support",
+ "frame-system",
+ "log",
+ "pallet-message-queue",
+ "parity-scale-codec",
+ "polkadot-primitives",
+ "polkadot-runtime",
+ "polkadot-runtime-parachains",
+ "sp-core 41.0.0",
+ "sp-io 46.0.0",
+ "sp-runtime 47.0.0",
+ "sp-storage 23.0.0",
+ "sp-tracing",
+ "staging-xcm",
+ "tokio",
+]
+
+[[package]]
 name = "polkadot-parachain-primitives"
 version = "23.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
