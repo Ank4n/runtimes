@@ -23,27 +23,10 @@ sp-io = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }
 sp-storage = { workspace = true, default-features = true }
 sp-tracing = { workspace = true, default-features = true }
-tokio = { features = ["full", "macros"], workspace = true }
+tokio = { features = ["macros", "rt-multi-thread", "sync"], workspace = true }
 xcm = { workspace = true, default-features = true }
 
 asset-hub-polkadot-runtime = { workspace = true, default-features = true }
 coretime-polkadot-runtime = { workspace = true, default-features = true }
 polkadot-runtime = { workspace = true, default-features = true }
-
-[features]
-default = ["std"]
-std = [
-	"log/std",
-	"polkadot-runtime/std",
-]
-try-runtime = [
-	"asset-hub-polkadot-runtime/try-runtime",
-	"coretime-polkadot-runtime/try-runtime",
-	"cumulus-pallet-parachain-system/try-runtime",
-	"frame-support/try-runtime",
-	"frame-system/try-runtime",
-	"pallet-message-queue/try-runtime",
-	"polkadot-runtime/try-runtime",
-	"runtime-parachains/try-runtime",
-	"sp-runtime/try-runtime",
-]
+polkadot-runtime-constants = { workspace = true, default-features = true }

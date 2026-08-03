@@ -26,7 +26,8 @@ test *args: _ensure-snapshots
 # TODO: Host the snapshots somewhere easy to download and fetch from there instead.
 
 # Download fresh snapshots from the daily `Check Migrations` CI artifacts (needs `gh` auth).
-snapshots:
+# With no arguments all chains are re-downloaded; pass keys (e.g. `just snapshots ct`) to limit it.
+snapshots *keys="rc ah ct":
 	#!/usr/bin/env bash
 	set -euo pipefail
 	mkdir -p "{{ snap_dir }}"
@@ -39,13 +40,14 @@ snapshots:
 	fi
 	while read -r key name _uri; do
 		[ -z "$key" ] && continue
+		case " {{ keys }} " in *" $key "*) ;; *) continue ;; esac
 		tmp=$(mktemp -d)
 		echo "Downloading try-runtime-snapshot-$name from CI run $run_id..."
 		gh run download "$run_id" --repo {{ repo }} --name "try-runtime-snapshot-$name" --dir "$tmp"
 		mv "$tmp/snapshot.raw" "{{ snap_dir }}/snap_$key.snap"
 		rmdir "$tmp"
 	done <<< "{{ chains }}"
-	ls -lh "{{ snap_dir }}"/snap_{rc,ah,ct}.snap
+	ls -lh "{{ snap_dir }}"/snap_*.snap
 
 # Needs the try-runtime CLI: https://github.com/paritytech/try-runtime-cli
 
@@ -60,15 +62,19 @@ snapshots-from-rpc:
 		# swallows the snapshot path argument.
 		try-runtime create-snapshot "--uri=$uri" "{{ snap_dir }}/snap_$key.snap"
 	done <<< "{{ chains }}"
-	ls -lh "{{ snap_dir }}"/snap_{rc,ah,ct}.snap
+	ls -lh "{{ snap_dir }}"/snap_*.snap
 
+# Download only the snapshots that are missing, so one deleted file does not force a
+# re-download of the others (the AH artifact is multi-GB).
 _ensure-snapshots:
 	#!/usr/bin/env bash
 	set -euo pipefail
-	for key in rc ah ct; do
-		if [ ! -f "{{ snap_dir }}/snap_$key.snap" ]; then
-			echo "Missing snapshots in {{ snap_dir }} -- fetching from CI..."
-			just --justfile "{{ justfile() }}" snapshots
-			break
-		fi
-	done
+	missing=""
+	while read -r key _rest; do
+		[ -z "$key" ] && continue
+		[ -f "{{ snap_dir }}/snap_$key.snap" ] || missing="$missing $key"
+	done <<< "{{ chains }}"
+	if [ -n "$missing" ]; then
+		echo "Missing snapshots in {{ snap_dir }}:$missing -- fetching from CI..."
+		just --justfile "{{ justfile() }}" snapshots $missing
+	fi

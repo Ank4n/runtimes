@@ -12394,6 +12394,7 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-primitives",
  "polkadot-runtime",
+ "polkadot-runtime-constants",
  "polkadot-runtime-parachains",
  "sp-core 41.0.0",
  "sp-io 46.0.0",
