@@ -63,7 +63,7 @@ type MqPallet<P> = pallet_message_queue::Pallet<<P as Para>::Runtime>;
 pub trait Para {
 	type Runtime: frame_system::Config<
 			RuntimeEvent: TryInto<pallet_message_queue::Event<Self::Runtime>>
-				              + TryInto<frame_system::Event<Self::Runtime>>,
+			                  + TryInto<frame_system::Event<Self::Runtime>>,
 			RuntimeCall: GetDispatchInfo,
 		> + pallet_message_queue::Config<
 			MessageProcessor: ProcessMessage<Origin = ParachainMessageOrigin>,
@@ -192,7 +192,9 @@ async fn load_snapshot_uncached(chain: Chain) -> RawSnapshot {
 		.mode(Mode::Offline(OfflineConfig { state_snapshot: abs.display().to_string().into() }))
 		.build()
 		.await
-		.unwrap_or_else(|e| panic!("Corrupt snapshot at {}: {e:?}{}", abs.display(), chain.missing_snapshot_help()));
+		.unwrap_or_else(|e| {
+			panic!("Corrupt snapshot at {}: {e:?}{}", abs.display(), chain.missing_snapshot_help())
+		});
 
 	ext.inner_ext.into_raw_snapshot()
 }
@@ -217,12 +219,14 @@ pub async fn load_externalities() -> (TestExternalities, TestExternalities, Test
 
 /// Execute the next Relay Chain block.
 ///
-/// Only runs the hooks that the migration relies on (`MessageQueue`); once `pallet-rc2-migrator`
-/// is wired into the Polkadot runtime, its hooks get added here.
+/// Only runs the hooks that the migration relies on: `MessageQueue` first (as declared in the
+/// runtime, so inbound messages are processed before the migrator acts) and then `Rc2Migrator`.
 pub fn next_block_rc() {
 	next_block::<Polkadot>(LOG_RC, |now| {
-		let weight = <polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		let mut weight = <polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		weight += <polkadot_runtime::Rc2Migrator as OnInitialize<_>>::on_initialize(now);
 		<polkadot_runtime::MessageQueue as OnFinalize<_>>::on_finalize(now);
+		<polkadot_runtime::Rc2Migrator as OnFinalize<_>>::on_finalize(now);
 		weight
 	});
 }
@@ -342,7 +346,8 @@ pub fn enqueue_ump(para: ParaId, msgs: Vec<UpwardMessage>) {
 /// decode the inner call. This is what catches encode/decode drift between the chains.
 fn sanity_check_xcm<Call: Decode + GetDispatchInfo>(msg: &[u8]) {
 	let versioned = VersionedXcm::<Call>::decode(&mut &msg[..]).expect("Must decode forwarded XCM");
-	let xcm: Xcm<Call> = versioned.try_into().expect("Must convert forwarded XCM to latest version");
+	let xcm: Xcm<Call> =
+		versioned.try_into().expect("Must convert forwarded XCM to latest version");
 	for instruction in xcm.0 {
 		if let Instruction::Transact { call, .. } = instruction {
 			let _call: Call = Decode::decode(&mut &call.into_encoded()[..])

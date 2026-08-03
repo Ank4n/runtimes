@@ -12,7 +12,12 @@ codec = { workspace = true, features = ["max-encoded-len"] }
 scale-info = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
+log = { workspace = true }
+pallet-balances = { workspace = true }
+pallet-ct-migrator = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
+sp-runtime = { workspace = true }
+xcm = { workspace = true }
 
 [features]
 default = ["std"]
@@ -20,15 +25,27 @@ std = [
 	"codec/std",
 	"frame-support/std",
 	"frame-system/std",
+	"log/std",
+	"pallet-balances/std",
+	"pallet-ct-migrator/std",
 	"polkadot-parachain-primitives/std",
 	"scale-info/std",
+	"sp-runtime/std",
+	"xcm/std",
 ]
 runtime-benchmarks = [
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
+	"pallet-balances/runtime-benchmarks",
+	"pallet-ct-migrator/runtime-benchmarks",
 	"polkadot-parachain-primitives/runtime-benchmarks",
+	"sp-runtime/runtime-benchmarks",
+	"xcm/runtime-benchmarks",
 ]
 try-runtime = [
 	"frame-support/try-runtime",
 	"frame-system/try-runtime",
+	"pallet-balances/try-runtime",
+	"pallet-ct-migrator/try-runtime",
+	"sp-runtime/try-runtime",
 ]

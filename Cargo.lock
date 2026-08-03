@@ -3718,6 +3718,7 @@ dependencies = [
  "pallet-balances",
  "pallet-broker",
  "pallet-collator-selection",
+ "pallet-ct-migrator",
  "pallet-message-queue",
  "pallet-multisig",
  "pallet-proxy",
@@ -10031,8 +10032,10 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "log",
  "parity-scale-codec",
  "scale-info",
+ "sp-runtime 47.0.0",
 ]
 
 [[package]]
@@ -10925,9 +10928,14 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "log",
+ "pallet-balances",
+ "pallet-ct-migrator",
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",
+ "sp-runtime 47.0.0",
+ "staging-xcm",
 ]
 
 [[package]]
@@ -12390,10 +12398,15 @@ dependencies = [
  "frame-support",
  "frame-system",
  "log",
+ "pallet-balances",
+ "pallet-ct-migrator",
  "pallet-message-queue",
+ "pallet-rc2-migrator",
+ "pallet-xcm",
  "parity-scale-codec",
  "polkadot-primitives",
  "polkadot-runtime",
+ "polkadot-runtime-common",
  "polkadot-runtime-constants",
  "polkadot-runtime-parachains",
  "sp-core 41.0.0",
@@ -12501,6 +12514,7 @@ dependencies = [
  "pallet-preimage",
  "pallet-proxy",
  "pallet-rc-migrator",
+ "pallet-rc2-migrator",
  "pallet-referenda",
  "pallet-scheduler",
  "pallet-session",
