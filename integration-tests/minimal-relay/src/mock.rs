@@ -30,8 +30,10 @@ use frame_support::{
 	traits::{EnqueueMessage, Get, OnFinalize, OnInitialize, ProcessMessage},
 	weights::Weight,
 };
+use frame_system::pallet_prelude::BlockNumberFor;
 use polkadot_primitives::UpwardMessage;
 use polkadot_runtime::{Block as PolkadotBlock, Runtime as Polkadot};
+use polkadot_runtime_constants::system_parachain;
 use remote_externalities::{Builder, Mode, OfflineConfig};
 use runtime_parachains::{
 	configuration::ActiveConfig,
@@ -49,7 +51,6 @@ use xcm::{
 
 const LOG_RC: &str = "runtime::relay";
 
-pub type RuntimeEventFor<P> = <<P as Para>::Runtime as frame_system::Config>::RuntimeEvent;
 pub type RuntimeCallFor<P> = <<P as Para>::Runtime as frame_system::Config>::RuntimeCall;
 type MqPallet<P> = pallet_message_queue::Pallet<<P as Para>::Runtime>;
 
@@ -57,9 +58,14 @@ type MqPallet<P> = pallet_message_queue::Pallet<<P as Para>::Runtime>;
 ///
 /// Everything chain-specific that the harness needs lives here; the block production and message
 /// shuttling functions are generic over it.
+/// The event bounds are satisfied by the `TryInto<pallet::Event>` impls that `construct_runtime`
+/// generates for every runtime; no per-chain event-matching code is needed.
 pub trait Para {
-	type Runtime: frame_system::Config
-		+ pallet_message_queue::Config<
+	type Runtime: frame_system::Config<
+			RuntimeEvent: TryInto<pallet_message_queue::Event<Self::Runtime>>
+				              + TryInto<frame_system::Event<Self::Runtime>>,
+			RuntimeCall: GetDispatchInfo,
+		> + pallet_message_queue::Config<
 			MessageProcessor: ProcessMessage<Origin = ParachainMessageOrigin>,
 		> + cumulus_pallet_parachain_system::Config;
 	const PARA_ID: u32;
@@ -67,63 +73,22 @@ pub trait Para {
 	const NAME: &'static str;
 	/// Which snapshot this chain loads from.
 	const CHAIN: Chain;
-
-	/// `Some(success)` if the event is a `MessageQueue::Processed` event, `None` otherwise.
-	fn mq_processed(event: &RuntimeEventFor<Self>) -> Option<bool>;
-	/// Whether the event is a `System::Remarked` event. The message-passing smoke tests use a
-	/// `System::remark_with_event` transact as their cross-chain payload and this is how they
-	/// observe its execution on the destination.
-	fn is_remarked(event: &RuntimeEventFor<Self>) -> bool;
 }
 
 pub struct AssetHubPolkadot;
 impl Para for AssetHubPolkadot {
 	type Runtime = asset_hub_polkadot_runtime::Runtime;
-	const PARA_ID: u32 = 1000;
+	const PARA_ID: u32 = system_parachain::ASSET_HUB_ID;
 	const NAME: &'static str = "runtime::asset-hub";
 	const CHAIN: Chain = Chain::AssetHub;
-
-	fn mq_processed(event: &asset_hub_polkadot_runtime::RuntimeEvent) -> Option<bool> {
-		match event {
-			asset_hub_polkadot_runtime::RuntimeEvent::MessageQueue(
-				pallet_message_queue::Event::Processed { success, .. },
-			) => Some(*success),
-			_ => None,
-		}
-	}
-
-	fn is_remarked(event: &asset_hub_polkadot_runtime::RuntimeEvent) -> bool {
-		matches!(
-			event,
-			asset_hub_polkadot_runtime::RuntimeEvent::System(
-				frame_system::Event::Remarked { .. }
-			)
-		)
-	}
 }
 
 pub struct CoretimePolkadot;
 impl Para for CoretimePolkadot {
 	type Runtime = coretime_polkadot_runtime::Runtime;
-	const PARA_ID: u32 = 1005;
+	const PARA_ID: u32 = system_parachain::BROKER_ID;
 	const NAME: &'static str = "runtime::coretime";
 	const CHAIN: Chain = Chain::Coretime;
-
-	fn mq_processed(event: &coretime_polkadot_runtime::RuntimeEvent) -> Option<bool> {
-		match event {
-			coretime_polkadot_runtime::RuntimeEvent::MessageQueue(
-				pallet_message_queue::Event::Processed { success, .. },
-			) => Some(*success),
-			_ => None,
-		}
-	}
-
-	fn is_remarked(event: &coretime_polkadot_runtime::RuntimeEvent) -> bool {
-		matches!(
-			event,
-			coretime_polkadot_runtime::RuntimeEvent::System(frame_system::Event::Remarked { .. })
-		)
-	}
 }
 
 // ---------------------------------------------------------------------------
@@ -165,7 +130,7 @@ impl Chain {
 	}
 
 	/// Public RPC endpoint, used in error messages to tell the developer how to create a missing
-	/// snapshot. Must match `create-snapshots.sh`.
+	/// snapshot. Must stay in sync with the `chains` table in the justfile.
 	pub const fn rpc(self) -> &'static str {
 		match self {
 			Chain::Relay => "wss://try-runtime.polkadot.io:443",
@@ -253,77 +218,57 @@ pub async fn load_externalities() -> (TestExternalities, TestExternalities, Test
 /// Execute the next Relay Chain block.
 ///
 /// Only runs the hooks that the migration relies on (`MessageQueue`); once `pallet-rc2-migrator`
-/// is wired into the Polkadot runtime, its hooks get added here. Every block asserts that no
-/// message failed processing and that the consumed weight stays below 80% of the block limit.
+/// is wired into the Polkadot runtime, its hooks get added here.
 pub fn next_block_rc() {
-	let now = frame_system::Pallet::<Polkadot>::block_number() + 1;
-	log::debug!(target: LOG_RC, "Executing RC block: {now:?}");
-	frame_system::Pallet::<Polkadot>::set_block_number(now);
-	frame_system::Pallet::<Polkadot>::reset_events();
-	let weight = <polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
-	<polkadot_runtime::MessageQueue as OnFinalize<_>>::on_finalize(now);
-
-	let events = frame_system::Pallet::<Polkadot>::events();
-	for record in &events {
-		if let polkadot_runtime::RuntimeEvent::MessageQueue(
-			pallet_message_queue::Event::Processed { success: false, .. },
-		) = record.event
-		{
-			panic!("RC: message processing failure: {:?}", record.event);
-		}
-	}
-
-	let limit = <Polkadot as frame_system::Config>::BlockWeights::get().max_block;
-	assert!(
-		weight.all_lte(weight_threshold(limit)),
-		"RC: weight exceeded 80% of limit: {weight:?}, limit: {limit:?}"
-	);
+	next_block::<Polkadot>(LOG_RC, |now| {
+		let weight = <polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		<polkadot_runtime::MessageQueue as OnFinalize<_>>::on_finalize(now);
+		weight
+	});
 }
 
 /// Execute the next block on parachain `P`. Same hooks and assertions as [`next_block_rc`].
 pub fn next_block_para<P: Para>() {
-	let now = frame_system::Pallet::<P::Runtime>::block_number() + One::one();
-	log::debug!(target: P::NAME, "Executing block: {now:?}");
-	frame_system::Pallet::<P::Runtime>::set_block_number(now);
-	frame_system::Pallet::<P::Runtime>::reset_events();
-	let weight = <MqPallet<P> as OnInitialize<_>>::on_initialize(now);
-	<MqPallet<P> as OnFinalize<_>>::on_finalize(now);
+	next_block::<P::Runtime>(P::NAME, |now| {
+		let weight = <MqPallet<P> as OnInitialize<_>>::on_initialize(now);
+		<MqPallet<P> as OnFinalize<_>>::on_finalize(now);
+		weight
+	});
+}
 
-	let events = frame_system::Pallet::<P::Runtime>::events();
-	for record in &events {
-		if P::mq_processed(&record.event) == Some(false) {
-			panic!("{}: message processing failure: {:?}", P::NAME, record.event);
+/// Shared block-execution skeleton: bump the block number, reset events, run the chain's hooks,
+/// then assert that no message failed processing and that the consumed weight stays below 80% of
+/// the block limit. The per-block assertions live here, in one place, so they cannot drift apart
+/// between the chains.
+fn next_block<T>(name: &str, hooks: impl FnOnce(BlockNumberFor<T>) -> Weight)
+where
+	T: frame_system::Config + pallet_message_queue::Config,
+	<T as frame_system::Config>::RuntimeEvent: TryInto<pallet_message_queue::Event<T>>,
+{
+	let now = frame_system::Pallet::<T>::block_number() + One::one();
+	log::debug!(target: name, "Executing block: {now:?}");
+	frame_system::Pallet::<T>::set_block_number(now);
+	frame_system::Pallet::<T>::reset_events();
+	let weight = hooks(now);
+
+	for record in frame_system::Pallet::<T>::events() {
+		if let Ok(pallet_message_queue::Event::Processed { success: false, .. }) =
+			record.event.clone().try_into()
+		{
+			panic!("{name}: message processing failure: {:?}", record.event);
 		}
 	}
 
-	let limit = <P::Runtime as frame_system::Config>::BlockWeights::get().max_block;
+	let limit = <T as frame_system::Config>::BlockWeights::get().max_block;
 	assert!(
 		weight.all_lte(weight_threshold(limit)),
-		"{}: weight exceeded 80% of limit: {weight:?}, limit: {limit:?}",
-		P::NAME
+		"{name}: weight exceeded 80% of limit: {weight:?}, limit: {limit:?}"
 	);
 }
 
 /// 80% of the given weight limit; blocks that consume more than this are considered overweight.
 fn weight_threshold(limit: Weight) -> Weight {
 	Weight::from_parts(limit.ref_time() / 5 * 4, limit.proof_size() / 5 * 4)
-}
-
-/// Execute the next block on parachain `P`, referencing the given Relay Chain block number as its
-/// relay parent.
-pub fn next_block_para_with_rc_block<P: Para>(rc_block: u32) {
-	cumulus_pallet_parachain_system::ValidationData::<P::Runtime>::mutate(|maybe_data| {
-		if let Some(data) = maybe_data.as_mut() {
-			data.relay_parent_number = rc_block;
-		} else {
-			*maybe_data = Some(polkadot_primitives::PersistedValidationData {
-				relay_parent_number: rc_block,
-				..Default::default()
-			});
-		}
-	});
-
-	next_block_para::<P>();
 }
 
 // ---------------------------------------------------------------------------
@@ -366,10 +311,7 @@ pub fn take_ump<P: Para>() -> Vec<UpwardMessage> {
 ///
 /// This bypasses `set_validation_data` and `enqueue_inbound_downward_messages` by enqueuing them
 /// directly, like the v1 harness did.
-pub fn enqueue_dmp<P: Para>(msgs: Vec<InboundDownwardMessage>)
-where
-	RuntimeCallFor<P>: GetDispatchInfo,
-{
+pub fn enqueue_dmp<P: Para>(msgs: Vec<InboundDownwardMessage>) {
 	log::info!(target: P::NAME, "Received {} DMP messages from RC", msgs.len());
 	for msg in msgs {
 		sanity_check_xcm::<RuntimeCallFor<P>>(&msg.msg);
