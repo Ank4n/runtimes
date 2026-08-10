@@ -1837,6 +1837,13 @@ impl pallet_rc_migrator::Config for Runtime {
 	type Currency = Balances;
 }
 
+impl pallet_rc2_migrator::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type SendXcm = xcm_config::XcmRouter;
+	type CtParaId = BrokerId;
+}
+
 construct_runtime! {
 	pub enum Runtime
 		{
@@ -1946,6 +1953,10 @@ construct_runtime! {
 		// The pallet must be located below `MessageQueue` to get the XCM message acknowledgements
 		// from Asset Hub before we get the `RcMigrator` `on_initialize` executed.
 		RcMigrator: pallet_rc_migrator = 255,
+
+		// Relay-chain side of the Minimal Relay migration. Below `MessageQueue` for the same
+		// reason as `RcMigrator`: its `on_initialize` must see the block's inbound messages.
+		Rc2Migrator: pallet_rc2_migrator = 254,
 	}
 }
 
