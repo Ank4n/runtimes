@@ -229,6 +229,7 @@ pub fn next_block_rc() {
 		<polkadot_runtime::Rc2Migrator as OnFinalize<_>>::on_finalize(now);
 		weight
 	});
+	crate::events::emit_rc_block();
 }
 
 /// Execute the next block on parachain `P`. Same hooks and assertions as [`next_block_rc`].
@@ -238,6 +239,7 @@ pub fn next_block_para<P: Para>() {
 		<MqPallet<P> as OnFinalize<_>>::on_finalize(now);
 		weight
 	});
+	crate::events::emit_para_block(P::CHAIN);
 }
 
 /// Shared block-execution skeleton: bump the block number, reset events, run the chain's hooks,

@@ -664,6 +664,22 @@ impl cumulus_pallet_weight_reclaim::Config for Runtime {
 	type WeightInfo = weights::cumulus_pallet_weight_reclaim::WeightInfo<Runtime>;
 }
 
+impl pallet_ct_migrator::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type RuntimeHoldReason = RuntimeHoldReason;
+}
+
+/// What each hold migrated from the relay chain becomes on this chain.
+impl From<pallet_ct_migrator::PortableHoldReason> for RuntimeHoldReason {
+	fn from(reason: pallet_ct_migrator::PortableHoldReason) -> Self {
+		match reason {
+			pallet_ct_migrator::PortableHoldReason::UnnamedReserve =>
+				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::RcMigratedReserve),
+		}
+	}
+}
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime
@@ -699,6 +715,10 @@ construct_runtime!(
 
 		// The main stage.
 		Broker: pallet_broker = 50,
+
+		// Coretime-chain side of the Minimal Relay migration. The pallet index is encoded into
+		// the calls that `pallet-rc2-migrator` sends here; keep them in sync.
+		CtMigrator: pallet_ct_migrator = 100,
 	}
 );
 

@@ -24,5 +24,6 @@
 
 #![cfg(test)]
 
+pub mod events;
 pub mod mock;
 pub mod tests;
