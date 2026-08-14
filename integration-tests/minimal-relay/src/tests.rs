@@ -251,6 +251,59 @@ async fn balance_census() {
 	rc.execute_with(|| {
 		print_balance_census::<polkadot_runtime::Runtime>("Polkadot Relay Chain");
 
+		// Decompose which accounts the accounts stage keeps on the RC, with amounts — the
+		// direct answer to "where does the kept balance sit".
+		{
+			type Rc = polkadot_runtime::Runtime;
+			let ed = <pallet_balances::Pallet<Rc> as frame_support::traits::fungible::Inspect<_>>::minimum_balance();
+			let mut cats: BTreeMap<&str, (u32, u128)> = BTreeMap::new();
+			for (who, info) in frame_system::Account::<Rc>::iter() {
+				let d = &info.data;
+				let total = d.free + d.reserved;
+				let bytes: &[u8] = who.as_ref();
+				let cat = if bytes.starts_with(b"para") { "para sovereign" }
+					else if bytes.starts_with(b"sibl") { "sibl sovereign" }
+					else if bytes.starts_with(b"modl") { "module account" }
+					else if total < ed { "below-ED" }
+					else if d.frozen > 0 ||
+						!pallet_balances::Locks::<Rc>::get(&who).is_empty() ||
+						!pallet_balances::Freezes::<Rc>::get(&who).is_empty() ||
+						!pallet_balances::Holds::<Rc>::get(&who).is_empty() { "locks/freezes/holds" }
+					else { continue };
+				let e = cats.entry(cat).or_default();
+				e.0 += 1; e.1 += total;
+			}
+			println!("\n### kept-account decomposition (accounts the migrator skips)");
+			let mut sum = 0u128;
+			for (cat, (n, amt)) in &cats {
+				println!("{cat}: {n} accounts, {:.4} DOT", *amt as f64 / 1e10);
+				sum += amt;
+			}
+			println!("skipped-account total: {:.4} DOT", sum as f64 / 1e10);
+		}
+
+		// The Balances pallet's own storage keys: how many are empty leftovers, and how many
+		// belong to accounts that no longer exist (v1 reaped the account, the key survived).
+		{
+			type Rc = polkadot_runtime::Runtime;
+			let mut report = |name: &str, entries: Vec<(sp_runtime::AccountId32, bool)>| {
+				let n = entries.len();
+				let empty = entries.iter().filter(|(_, e)| *e).count();
+				let orphan = entries.iter()
+					.filter(|(who, _)| !frame_system::Account::<Rc>::contains_key(who))
+					.count();
+				println!("{name}: {n} keys, {empty} empty-value, {orphan} for nonexistent accounts");
+			};
+			report("Balances::Locks", pallet_balances::Locks::<Rc>::iter()
+				.map(|(w, v)| (w, v.is_empty())).collect());
+			report("Balances::Reserves", pallet_balances::Reserves::<Rc>::iter()
+				.map(|(w, v)| (w, v.is_empty())).collect());
+			report("Balances::Freezes", pallet_balances::Freezes::<Rc>::iter()
+				.map(|(w, v)| (w, v.is_empty())).collect());
+			report("Balances::Holds", pallet_balances::Holds::<Rc>::iter()
+				.map(|(w, v)| (w, v.is_empty())).collect());
+		}
+
 		// Unclaimed pre-genesis claims are part of total issuance but sit in no account — the
 		// prime suspect for the "not held by any account" row above.
 		let unclaimed =
