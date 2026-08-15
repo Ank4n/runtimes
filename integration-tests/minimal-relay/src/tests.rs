@@ -250,11 +250,11 @@ where
 	}
 
 	// Issuance that no account holds: free + reserved across all accounts versus TotalIssuance.
+	// The exact planck value is the source of truth for `TiCorrection` in the RC runtime config.
 	let in_accounts = free.total + reserved.total;
-	println!(
-		"| issuance not held by any account | — | {:.4} |",
-		dot(pallet_balances::TotalIssuance::<T>::get().saturating_sub(in_accounts)),
-	);
+	let phantom = pallet_balances::TotalIssuance::<T>::get().saturating_sub(in_accounts);
+	println!("| issuance not held by any account | — | {:.4} |", dot(phantom));
+	println!("phantom issuance, exact planck: {phantom}");
 }
 
 /// Print the balance census of the Relay Chain snapshot. Run with `--nocapture` to see it.
@@ -804,11 +804,20 @@ async fn full_migration_rc_to_ct() {
 		);
 		let tracker = RcMigratedBalance::<Rc>::get();
 		assert_eq!(
-			tracker.kept + tracker.ct_reserved + tracker.ct_free + tracker.ah_free,
+			tracker.kept +
+				tracker.ct_reserved + tracker.ct_free +
+				tracker.ah_free + tracker.ti_corrected,
 			rc_ti_before,
 			"balance bookkeeping is exact"
 		);
 		assert_eq!(pallet_balances::TotalIssuance::<Rc>::get(), tracker.kept);
+		// The audited phantom issuance was burned in full: the runtime constant equals the
+		// measured unaccounted issuance on this snapshot, so nothing remains and no anomaly.
+		assert_eq!(
+			tracker.ti_corrected,
+			polkadot_runtime::TiCorrection::get(),
+			"TI correction burned exactly the audited amount"
+		);
 		tracker
 	});
 	let migrated_ct = tracker.migrated_ct();

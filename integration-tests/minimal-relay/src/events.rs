@@ -186,6 +186,22 @@ pub fn emit_rc_block() {
 						"reserved": planck(reserved),
 					}),
 				),
+				MigEvent::TiCorrected { expected, unaccounted, burned } => emit(
+					"rc",
+					block,
+					"ti_corrected",
+					json!({
+						"expected": planck(expected),
+						"unaccounted": planck(unaccounted),
+						"burned": planck(burned),
+					}),
+				),
+				MigEvent::TiCorrectionAnomaly { expected, unaccounted } => emit(
+					"rc",
+					block,
+					"ti_correction_anomaly",
+					json!({ "expected": planck(expected), "unaccounted": planck(unaccounted) }),
+				),
 				MigEvent::RegistrarBatchSent { count } =>
 					emit("rc", block, "registrar_batch_sent", json!({ "count": count })),
 				MigEvent::HrmpBatchSent { count } =>
@@ -211,6 +227,7 @@ pub fn emit_rc_block() {
 			"ct_reserved": planck(tracker.ct_reserved),
 			"ct_free": planck(tracker.ct_free),
 			"ah_free": planck(tracker.ah_free),
+			"ti_corrected": planck(tracker.ti_corrected),
 			"paras": polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter().count(),
 			"hrmp_channels": runtime_parachains::hrmp::HrmpChannels::<Rc>::iter().count(),
 		}),

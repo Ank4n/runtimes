@@ -110,6 +110,15 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 		last_key: Option<HrmpChannelId>,
 	},
 	HrmpDone,
+	/// Placeholder stages: the proxy migration is analysed but not designed yet
+	/// (`migration-poc/report.md` §5); the machine passes straight through.
+	ProxyInit,
+	ProxyOngoing {
+		last_key: Option<AccountId>,
+	},
+	ProxyDone,
+	/// Burn the audited amount of issuance that no account holds (see `Config::TiCorrection`).
+	TiCorrection,
 	/// All data sent; waiting for manual verification before finishing.
 	CoolOff {
 		end_at: BlockNumber,
@@ -179,6 +188,8 @@ pub struct MigratedBalances<Balance> {
 	pub ct_free: Balance,
 	/// Free balance burned here and teleported to Asset Hub.
 	pub ah_free: Balance,
+	/// Phantom issuance burned by the `TiCorrection` stage (issuance no account held).
+	pub ti_corrected: Balance,
 }
 
 impl MigratedBalances<u128> {
@@ -218,6 +229,16 @@ pub mod pallet {
 
 		/// Para id of Asset Hub, the destination of teleported free balances.
 		type AhParaId: Get<u32>;
+
+		/// The audited amount of total issuance that no account holds ("phantom issuance"),
+		/// burned by the `TiCorrection` stage at the end of the migration.
+		///
+		/// Governance-legible tunable: measured off-chain ahead of the migration
+		/// (`balance_census` prints the exact planck value) and pinned here. The stage burns
+		/// `min(this, measured-on-chain)` — anything unaccounted beyond it is left for
+		/// investigation, and a measured value *below* it is reported as an anomaly; the stage
+		/// never burns issuance that an account actually holds.
+		type TiCorrection: Get<u128>;
 	}
 
 	#[pallet::pallet]
@@ -275,6 +296,20 @@ pub mod pallet {
 			who: AccountId32,
 			free: u128,
 			reserved: u128,
+		},
+		/// Phantom issuance burned: `burned = min(expected, unaccounted)`. Any
+		/// `unaccounted - burned` remainder is left on the books for investigation.
+		TiCorrected {
+			expected: u128,
+			unaccounted: u128,
+			burned: u128,
+		},
+		/// The measured unaccounted issuance was BELOW the audited expectation — the phantom
+		/// shrank since it was measured, which no known mechanism explains. Observability only;
+		/// the correction still burned the measured amount.
+		TiCorrectionAnomaly {
+			expected: u128,
+			unaccounted: u128,
 		},
 		/// A batch of drained registrar records was sent to the Coretime chain.
 		RegistrarBatchSent {
@@ -400,16 +435,47 @@ pub mod pallet {
 					)
 				},
 				MigrationStage::HrmpDone => {
-					let tracker = RcMigratedBalance::<T>::get();
-					match Self::send_finish(tracker.kept, tracker.migrated_ct()) {
+					Self::transition(MigrationStage::ProxyInit);
+					T::DbWeight::get().reads_writes(1, 1)
+				},
+				// Dummy pass-through: proxy migration is analysed but not designed yet
+				// (`migration-poc/report.md` §5). The stages exist so the machine shape (and the
+				// monitor) is final; the migrator lands here later.
+				MigrationStage::ProxyInit => {
+					log::info!(target: LOG_TARGET, "Proxy stage not implemented; passing through");
+					Self::transition(MigrationStage::ProxyOngoing { last_key: None });
+					T::DbWeight::get().reads_writes(1, 1)
+				},
+				MigrationStage::ProxyOngoing { .. } => {
+					Self::transition(MigrationStage::ProxyDone);
+					T::DbWeight::get().reads_writes(1, 1)
+				},
+				MigrationStage::ProxyDone => {
+					Self::transition(MigrationStage::TiCorrection);
+					T::DbWeight::get().reads_writes(1, 1)
+				},
+				MigrationStage::TiCorrection => {
+					// Correction, bookkeeping and the finish signal commit or roll back together:
+					// a failed send retries the whole arm next block without double-burning.
+					let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
+						match Self::correct_total_issuance() {
+							Ok(()) => TransactionOutcome::Commit(Ok(())),
+							Err(e) => TransactionOutcome::Rollback(Err(e)),
+						}
+					})
+					.expect("Always returning Ok; qed");
+
+					match res {
 						Ok(()) => Self::transition(MigrationStage::CoolOff {
 							end_at: now + COOL_OFF_BLOCKS.into(),
 						}),
 						Err(e) => {
-							defensive!("Finish signal failed, retrying: {:?}", e);
+							defensive!("TI correction failed, retrying: {:?}", e);
 						},
 					}
-					T::DbWeight::get().reads_writes(2, 1)
+					// Placeholder: the unaccounted-issuance measurement iterates every remaining
+					// account once.
+					T::DbWeight::get().reads_writes(10_000, 10)
 				},
 				MigrationStage::CoolOff { end_at } if now >= end_at => {
 					Self::transition(MigrationStage::MigrationDone);
@@ -485,6 +551,45 @@ pub mod pallet {
 		/// Signal to the Coretime chain that all data has been sent.
 		pub(crate) fn send_finish(rc_kept: u128, rc_migrated: u128) -> Result<(), Error<T>> {
 			Self::send_to_ct(CtMigratorCall::FinishMigration { rc_kept, rc_migrated })
+		}
+
+		/// Burn the audited phantom issuance and send the finish signal.
+		///
+		/// Measures the issuance no account holds, burns `min(expected, measured)` — never
+		/// touching issuance that an account actually backs — and reports via events: a
+		/// remainder above the expectation stays on the books for investigation, a measurement
+		/// below it is an explicit anomaly.
+		fn correct_total_issuance() -> Result<(), Error<T>> {
+			let expected = T::TiCorrection::get();
+			let in_accounts: u128 = frame_system::Account::<T>::iter_values()
+				.map(|a| a.data.free.saturating_add(a.data.reserved))
+				.sum();
+			let ti = pallet_balances::TotalIssuance::<T>::get();
+			let unaccounted = ti.saturating_sub(in_accounts);
+			let burned = expected.min(unaccounted);
+
+			if unaccounted < expected {
+				log::error!(
+					target: LOG_TARGET,
+					"TI correction anomaly: expected {expected} unaccounted, measured {unaccounted}"
+				);
+				Self::deposit_event(Event::TiCorrectionAnomaly { expected, unaccounted });
+			}
+
+			// No account holds this balance, so there is nothing to burn *from*: the correction
+			// is a direct issuance write, mirrored in the migration tracker so the conservation
+			// invariant stays exact.
+			pallet_balances::TotalIssuance::<T>::put(ti.saturating_sub(burned));
+			RcMigratedBalance::<T>::try_mutate(|t| {
+				t.kept = t.kept.checked_sub(burned).ok_or(Error::<T>::BalanceAccounting)?;
+				t.ti_corrected =
+					t.ti_corrected.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
+				Ok::<(), Error<T>>(())
+			})?;
+			Self::deposit_event(Event::TiCorrected { expected, unaccounted, burned });
+
+			let tracker = RcMigratedBalance::<T>::get();
+			Self::send_finish(tracker.kept, tracker.migrated_ct())
 		}
 
 		/// Teleport a batch of free balances to their owners on Asset Hub.

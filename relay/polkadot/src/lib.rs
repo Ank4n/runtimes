@@ -1839,6 +1839,10 @@ impl pallet_rc_migrator::Config for Runtime {
 
 parameter_types! {
 	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
+	/// Audited issuance held by no account ("phantom issuance"), burned at the end of the
+	/// migration. Measured at RC block #32,378,714 (`balance_census` prints the exact value);
+	/// re-measure and update ahead of the real run.
+	pub const TiCorrection: u128 = 216_543_537_220_240;
 }
 
 impl pallet_rc2_migrator::Config for Runtime {
@@ -1847,6 +1851,7 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type SendXcm = xcm_config::XcmRouter;
 	type CtParaId = BrokerId;
 	type AhParaId = AssetHubId;
+	type TiCorrection = TiCorrection;
 }
 
 construct_runtime! {
