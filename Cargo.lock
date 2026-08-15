@@ -10034,6 +10034,7 @@ dependencies = [
  "frame-system",
  "log",
  "parity-scale-codec",
+ "polkadot-parachain-primitives",
  "scale-info",
  "sp-runtime 47.0.0",
 ]

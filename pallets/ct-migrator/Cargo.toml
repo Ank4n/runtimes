@@ -13,6 +13,7 @@ scale-info = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
 log = { workspace = true }
+polkadot-parachain-primitives = { workspace = true }
 sp-runtime = { workspace = true }
 
 [features]
@@ -22,12 +23,14 @@ std = [
 	"frame-support/std",
 	"frame-system/std",
 	"log/std",
+	"polkadot-parachain-primitives/std",
 	"scale-info/std",
 	"sp-runtime/std",
 ]
 runtime-benchmarks = [
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
+	"polkadot-parachain-primitives/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 ]
 try-runtime = [

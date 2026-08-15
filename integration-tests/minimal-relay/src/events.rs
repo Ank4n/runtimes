@@ -170,6 +170,22 @@ pub fn emit_rc_block() {
 				),
 				MigEvent::AccountsBatchSent { count } =>
 					emit("rc", block, "accounts_batch_sent", json!({ "count": count })),
+				MigEvent::AccountsTeleported { count, amount } => emit(
+					"rc",
+					block,
+					"accounts_teleported",
+					json!({ "count": count, "amount": planck(amount) }),
+				),
+				MigEvent::AccountHeldBack { who, free, reserved } => emit(
+					"rc",
+					block,
+					"account_held_back",
+					json!({
+						"who": format!("{who:?}"),
+						"free": planck(free),
+						"reserved": planck(reserved),
+					}),
+				),
 				MigEvent::RegistrarBatchSent { count } =>
 					emit("rc", block, "registrar_batch_sent", json!({ "count": count })),
 				MigEvent::HrmpBatchSent { count } =>
@@ -192,7 +208,9 @@ pub fn emit_rc_block() {
 			"stage": stage_str(&pallet_rc2_migrator::RcMigrationStage::<Rc>::get()),
 			"ti": planck(pallet_balances::TotalIssuance::<Rc>::get()),
 			"kept": planck(tracker.kept),
-			"migrated": planck(tracker.migrated),
+			"ct_reserved": planck(tracker.ct_reserved),
+			"ct_free": planck(tracker.ct_free),
+			"ah_free": planck(tracker.ah_free),
 			"paras": polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter().count(),
 			"hrmp_channels": runtime_parachains::hrmp::HrmpChannels::<Rc>::iter().count(),
 		}),
@@ -211,11 +229,18 @@ pub fn emit_para_block(chain: Chain) {
 		Chain::AssetHub => {
 			type Ah = asset_hub_polkadot_runtime::Runtime;
 			let block = frame_system::Pallet::<Ah>::block_number();
+			// The checking account is AH's ledger of "DOT out on the relay chain"; teleports
+			// from the RC drain it, so its delta is the AH-side receipt confirmation.
+			let checking = pallet_xcm::Pallet::<Ah>::check_account();
+			let checking_balance = frame_system::Account::<Ah>::get(&checking).data.free;
 			emit(
 				"ah",
 				block,
 				"state",
-				json!({ "ti": planck(pallet_balances::TotalIssuance::<Ah>::get()) }),
+				json!({
+					"ti": planck(pallet_balances::TotalIssuance::<Ah>::get()),
+					"checking": planck(checking_balance),
+				}),
 			);
 		},
 		Chain::Relay => unreachable!("relay blocks go through emit_rc_block"),
@@ -256,6 +281,16 @@ fn emit_ct_block() {
 				),
 				MigEvent::HrmpReceived { count } =>
 					emit("ct", block, "hrmp_received", json!({ "count": count })),
+				MigEvent::HrmpShortfallParked { sender, recipient, shortfall } => emit(
+					"ct",
+					block,
+					"hrmp_shortfall_parked",
+					json!({
+						"sender": sender,
+						"recipient": recipient,
+						"shortfall": planck(shortfall),
+					}),
+				),
 				MigEvent::MigrationFinished { rc_kept, rc_migrated, ct_minted } => emit(
 					"ct",
 					block,
@@ -283,11 +318,14 @@ fn emit_ct_block() {
 			"ti": planck(pallet_balances::TotalIssuance::<Ct>::get()),
 			"minted": planck(pallet_ct_migrator::CtMintedTotal::<Ct>::get()),
 			"reattributed": planck(pallet_ct_migrator::ReattributedDeposits::<Ct>::get()),
+			"reattributed_hrmp": planck(pallet_ct_migrator::ReattributedHrmpDeposits::<Ct>::get()),
 			"paras": pallet_ct_migrator::RcParas::<Ct>::iter().count(),
 			"hrmp_channels": pallet_ct_migrator::RcHrmpChannels::<Ct>::iter().count(),
 			"failed_accounts": pallet_ct_migrator::FailedAccounts::<Ct>::iter().count(),
 			"failed_paras": pallet_ct_migrator::FailedParas::<Ct>::iter().count(),
+			"failed_hrmp": pallet_ct_migrator::FailedHrmpChannels::<Ct>::iter().count(),
 			"parked_shortfalls": pallet_ct_migrator::ParkedDepositShortfalls::<Ct>::iter().count(),
+			"parked_hrmp_shortfalls": pallet_ct_migrator::ParkedHrmpShortfalls::<Ct>::iter().count(),
 		}),
 	);
 }

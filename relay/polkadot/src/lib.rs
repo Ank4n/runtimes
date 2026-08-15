@@ -1859,11 +1859,16 @@ impl pallet_rc_migrator::Config for Runtime {
 	type Currency = Balances;
 }
 
+parameter_types! {
+	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
+}
+
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
 	type SendXcm = xcm_config::XcmRouter;
 	type CtParaId = BrokerId;
+	type AhParaId = AssetHubId;
 }
 
 construct_runtime! {

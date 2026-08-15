@@ -69,6 +69,18 @@ pub const MAX_ACCOUNTS_PER_BLOCK: u32 = 300;
 pub const MAX_RECORDS_PER_XCM: u32 = 50;
 pub const MAX_RECORDS_PER_BLOCK: u32 = 100;
 
+/// Maximum beneficiaries in one teleport message to Asset Hub: one `DepositAsset` instruction
+/// each, and an XCM message decodes at most 100 instructions.
+pub const MAX_TELEPORTS_PER_XCM: u32 = 40;
+
+/// Working buffer of free balance that follows a migrated deposit to the Coretime chain, so
+/// deposit owners can pay fees and future deposits there without a teleport first.
+pub const CT_FREE_BUFFER: u128 = 10_000_000_000; // 1 DOT
+
+/// Asset Hub's existential deposit (relay ED / 10). Free balance below this cannot be teleported
+/// into a fresh account; such dust follows the deposit to the Coretime chain instead.
+pub const AH_EXISTENTIAL_DEPOSIT: u128 = 1_000_000_000; // 0.1 DOT
+
 /// How long the migration parks in `CoolOff` for manual verification before finishing.
 pub const COOL_OFF_BLOCKS: u32 = 10;
 
@@ -144,8 +156,8 @@ pub enum CtMigratorCall {
 
 /// Balance conservation bookkeeping for the migration.
 ///
-/// `kept + migrated` must always equal the relay-chain total issuance recorded when the accounts
-/// stage started; the invariant checks assert against this.
+/// `kept + ct_reserved + ct_free + ah_free` must always equal the relay-chain total issuance
+/// recorded when the accounts stage started; the invariant checks assert against this.
 #[derive(
 	Encode,
 	Decode,
@@ -161,8 +173,19 @@ pub enum CtMigratorCall {
 pub struct MigratedBalances<Balance> {
 	/// Balance that remains on the relay chain.
 	pub kept: Balance,
-	/// Balance burned here and minted on the destination chain.
-	pub migrated: Balance,
+	/// Deposits burned here and re-established as holds on the Coretime chain.
+	pub ct_reserved: Balance,
+	/// Free working buffer burned here and minted liquid on the Coretime chain.
+	pub ct_free: Balance,
+	/// Free balance burned here and teleported to Asset Hub.
+	pub ah_free: Balance,
+}
+
+impl MigratedBalances<u128> {
+	/// Everything that went to the Coretime chain; what `finish_migration` reconciles against.
+	pub fn migrated_ct(&self) -> u128 {
+		self.ct_reserved.saturating_add(self.ct_free)
+	}
 }
 
 #[frame_support::pallet]
@@ -192,6 +215,9 @@ pub mod pallet {
 
 		/// Para id of the Coretime chain.
 		type CtParaId: Get<u32>;
+
+		/// Para id of Asset Hub, the destination of teleported free balances.
+		type AhParaId: Get<u32>;
 	}
 
 	#[pallet::pallet]
@@ -204,6 +230,15 @@ pub mod pallet {
 	/// Balance kept on the relay chain versus migrated away. Set up by the accounts stage.
 	#[pallet::storage]
 	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances<u128>, ValueQuery>;
+
+	/// How much reserved balance each account is expected to carry to the Coretime chain:
+	/// the registrar deposits recorded for it as manager plus the HRMP channel deposits recorded
+	/// for it as (child) para sovereign. Built by `AccountsInit` from the owning pallets' state —
+	/// the recorded deposit fields are the routing source of truth, the anonymous reserves are
+	/// only trusted up to this amount.
+	#[pallet::storage]
+	pub type ExpectedCtReserve<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
 
 	#[pallet::error]
 	pub enum Error<T> {
@@ -227,6 +262,19 @@ pub mod pallet {
 		/// A batch of withdrawn accounts was sent to the Coretime chain.
 		AccountsBatchSent {
 			count: u32,
+		},
+		/// A batch of free balances was teleported to Asset Hub.
+		AccountsTeleported {
+			count: u32,
+			amount: u128,
+		},
+		/// An account was kept whole on the relay chain because part of its reserve cannot be
+		/// attributed to a registrar or HRMP deposit (e.g. proxy deposits). Migrated by a later
+		/// stage.
+		AccountHeldBack {
+			who: AccountId32,
+			free: u128,
+			reserved: u128,
 		},
 		/// A batch of drained registrar records was sent to the Coretime chain.
 		RegistrarBatchSent {
@@ -274,8 +322,13 @@ pub mod pallet {
 					let total_issuance = <T as Config>::Currency::total_issuance();
 					RcMigratedBalance::<T>::put(MigratedBalances {
 						kept: total_issuance,
-						migrated: 0,
+						..Default::default()
 					});
+					let indexed = accounts::AccountsMigrator::<T>::build_expected_ct_reserves();
+					log::info!(
+						target: LOG_TARGET,
+						"Indexed expected CT reserves for {indexed} accounts"
+					);
 					Self::transition(MigrationStage::AccountsOngoing { last_key: None });
 					T::DbWeight::get().reads_writes(2, 2)
 				},
@@ -348,7 +401,7 @@ pub mod pallet {
 				},
 				MigrationStage::HrmpDone => {
 					let tracker = RcMigratedBalance::<T>::get();
-					match Self::send_finish(tracker.kept, tracker.migrated) {
+					match Self::send_finish(tracker.kept, tracker.migrated_ct()) {
 						Ok(()) => Self::transition(MigrationStage::CoolOff {
 							end_at: now + COOL_OFF_BLOCKS.into(),
 						}),
@@ -432,6 +485,48 @@ pub mod pallet {
 		/// Signal to the Coretime chain that all data has been sent.
 		pub(crate) fn send_finish(rc_kept: u128, rc_migrated: u128) -> Result<(), Error<T>> {
 			Self::send_to_ct(CtMigratorCall::FinishMigration { rc_kept, rc_migrated })
+		}
+
+		/// Teleport a batch of free balances to their owners on Asset Hub.
+		///
+		/// A real teleport, not a `Transact`: the balances were already burned during withdrawal
+		/// (the relay chain does no teleport tracking, `NoTeleportTracking`), and on Asset Hub
+		/// each `DepositAsset` moves the amount out of the checking account — the "DOT out on the
+		/// relay chain" ledger — so AH issuance stays constant and the ledger drains in lockstep
+		/// with the relay chain. No receiving pallet is needed on Asset Hub.
+		pub(crate) fn send_teleport(
+			beneficiaries: Vec<(AccountId32, u128)>,
+		) -> Result<(), Error<T>> {
+			let count = beneficiaries.len() as u32;
+			let total: u128 = beneficiaries.iter().map(|(_, amount)| amount).sum();
+			// From Asset Hub's perspective DOT is the parent's asset.
+			let dot = |amount: u128| Asset {
+				id: AssetId(Location::parent()),
+				fun: Fungibility::Fungible(amount),
+			};
+
+			let mut message = vec![
+				UnpaidExecution { weight_limit: WeightLimit::Unlimited, check_origin: None },
+				ReceiveTeleportedAsset(dot(total).into()),
+			];
+			for (who, amount) in beneficiaries {
+				message.push(DepositAsset {
+					assets: AssetFilter::Definite(dot(amount).into()),
+					beneficiary: Location::new(
+						0,
+						[Junction::AccountId32 { network: None, id: who.into() }],
+					),
+				});
+			}
+
+			let dest = Location::new(0, [Parachain(T::AhParaId::get())]);
+			send_xcm::<T::SendXcm>(dest, Xcm(message)).map_err(|e| {
+				log::error!(target: LOG_TARGET, "Teleport to AH failed: {e:?}");
+				Error::<T>::XcmSendFailed
+			})?;
+
+			Self::deposit_event(Event::AccountsTeleported { count, amount: total });
+			Ok(())
 		}
 
 		/// Send a `pallet-ct-migrator` call to the Coretime chain.

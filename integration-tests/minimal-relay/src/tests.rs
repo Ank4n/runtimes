@@ -34,6 +34,19 @@ fn unpaid_transact<Call: Encode>(call: Call) -> Xcm<()> {
 	])
 }
 
+/// Mirror of the accounts-stage split rule, for assertions: how much of an account's free
+/// balance goes to the Coretime chain (working buffer) versus Asset Hub (teleport).
+fn expected_split(free: u128, reserved: u128) -> (u128, u128) {
+	use pallet_rc2_migrator::{AH_EXISTENTIAL_DEPOSIT, CT_FREE_BUFFER};
+	let mut ct_free = if reserved == 0 { 0 } else { free.min(CT_FREE_BUFFER) };
+	let mut ah_free = free - ct_free;
+	if ah_free > 0 && ah_free < AH_EXISTENTIAL_DEPOSIT && reserved > 0 {
+		ct_free += ah_free;
+		ah_free = 0;
+	}
+	(ct_free, ah_free)
+}
+
 // Multi-thread runtimes so snapshot loading/hydration actually runs in parallel; the default
 // `#[tokio::test]` runtime is current-thread and would serialize the CPU-bound loads.
 #[tokio::test(flavor = "multi_thread")]
@@ -282,6 +295,35 @@ async fn balance_census() {
 			println!("skipped-account total: {:.4} DOT", sum as f64 / 1e10);
 		}
 
+		// Registrar reconciliation census: for every manager, compare the recorded deposits
+		// against the live reserve. Classifies the deposit-shortfall causes: `zero`/`partial`
+		// are genuine on-chain anomalies (reserve reduced out-of-band, record never updated);
+		// `over` are accounts with additional unattributable reserves (proxy deposits) that the
+		// migration holds back whole.
+		{
+			type Rc = polkadot_runtime::Runtime;
+			let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
+			let mut paras_of = BTreeMap::<sp_runtime::AccountId32, u32>::new();
+			for (_, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+				*recorded.entry(info.manager.clone()).or_default() += info.deposit;
+				*paras_of.entry(info.manager).or_default() += 1;
+			}
+			let mut cls = BTreeMap::<&str, (u32, u32, u128)>::new(); // managers, paras, recorded
+			for (manager, expected) in &recorded {
+				let reserved = frame_system::Account::<Rc>::get(manager).data.reserved;
+				let cat = if reserved == 0 { "zero reserve (anomaly)" }
+					else if reserved < *expected { "partial reserve (anomaly)" }
+					else if reserved > *expected { "over-reserved (held back: proxy etc.)" }
+					else { "exact" };
+				let e = cls.entry(cat).or_default();
+				e.0 += 1; e.1 += paras_of[manager]; e.2 += expected;
+			}
+			println!("\n### registrar deposit reconciliation (recorded vs live reserve, per manager)");
+			for (cat, (managers, paras, dep)) in &cls {
+				println!("{cat}: {managers} managers / {paras} paras, recorded {:.4} DOT", *dep as f64 / 1e10);
+			}
+		}
+
 		// The Balances pallet's own storage keys: how many are empty leftovers, and how many
 		// belong to accounts that no longer exist (v1 reaped the account, the key survived).
 		{
@@ -370,11 +412,19 @@ async fn accounts_migrate_rc_to_ct() {
 
 	// GIVEN a parachain manager holding a live registrar deposit (reserved balance) on the RC.
 	let (manager, rc_free, rc_reserved, rc_issuance_before) = rc.execute_with(|| {
+		// Recorded registrar deposits per manager: only accounts whose whole reserve is
+		// attributable migrate; the rest are held back for the proxy stage.
+		let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
+		for (_, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+			*recorded.entry(info.manager).or_default() += info.deposit;
+		}
 		let (manager, account) = polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter()
 			.find_map(|(_para, info)| {
 				let account = frame_system::Account::<Rc>::get(&info.manager);
-				// A cleanly migratable manager: a real reserve and nothing else attached.
+				// A cleanly migratable manager: a real, fully attributable reserve and nothing
+				// else attached.
 				(account.data.reserved > 0 &&
+					account.data.reserved <= *recorded.get(&info.manager).unwrap_or(&0) &&
 					account.data.frozen == 0 &&
 					pallet_balances::Holds::<Rc>::get(&info.manager).is_empty() &&
 					pallet_balances::Locks::<Rc>::get(&info.manager).is_empty())
@@ -388,6 +438,8 @@ async fn accounts_migrate_rc_to_ct() {
 			pallet_balances::TotalIssuance::<Rc>::get(),
 		)
 	});
+	// What the split rule should do with this manager.
+	let (ct_free_exp, _ah_free_exp) = expected_split(rc_free, rc_reserved);
 
 	// WHEN the accounts stage runs to completion.
 	let (dmp, migrated) = rc.execute_with(|| {
@@ -415,18 +467,20 @@ async fn accounts_migrate_rc_to_ct() {
 	assert!(!dmp.is_empty(), "the accounts stage queued no DMP messages for Coretime");
 
 	// THEN the manager is reaped on the RC and issuance dropped by exactly what migrated.
+	let total_migrated = migrated.ct_reserved + migrated.ct_free + migrated.ah_free;
 	rc.execute_with(|| {
 		assert!(
 			!frame_system::Account::<Rc>::contains_key(&manager),
 			"the manager account must be reaped on the RC"
 		);
 		let rc_issuance = pallet_balances::TotalIssuance::<Rc>::get();
-		assert_eq!(rc_issuance, rc_issuance_before - migrated.migrated);
+		assert_eq!(rc_issuance, rc_issuance_before - total_migrated);
 		assert_eq!(rc_issuance, migrated.kept);
 	});
 
-	// AND the Coretime chain integrates every account: the manager's free balance arrives free,
-	// the registrar deposit arrives as a hold, and issuance grows by exactly what the RC burned.
+	// AND the Coretime chain integrates every CT-bound piece: the registrar deposit arrives as a
+	// hold, the working buffer arrives free, and issuance grows by exactly the CT-bound burn.
+	// (The teleported remainder is asserted end-to-end in `full_migration_rc_to_ct`.)
 	ct.execute_with(|| {
 		let ct_account_before = frame_system::Account::<Ct>::get(&manager);
 		let ct_issuance_before = pallet_balances::TotalIssuance::<Ct>::get();
@@ -451,7 +505,7 @@ async fn accounts_migrate_rc_to_ct() {
 		);
 
 		let ct_account = frame_system::Account::<Ct>::get(&manager);
-		assert_eq!(ct_account.data.free, ct_account_before.data.free + rc_free);
+		assert_eq!(ct_account.data.free, ct_account_before.data.free + ct_free_exp);
 		assert_eq!(ct_account.data.reserved, ct_account_before.data.reserved + rc_reserved);
 
 		let holds = pallet_balances::Holds::<Ct>::get(&manager);
@@ -466,8 +520,8 @@ async fn accounts_migrate_rc_to_ct() {
 
 		assert_eq!(
 			pallet_balances::TotalIssuance::<Ct>::get(),
-			ct_issuance_before + migrated.migrated,
-			"Coretime must mint exactly what the RC burned"
+			ct_issuance_before + migrated.ct_reserved + migrated.ct_free,
+			"Coretime must mint exactly the CT-bound burn"
 		);
 	});
 }
@@ -491,29 +545,65 @@ async fn full_migration_rc_to_ct() {
 	use polkadot_runtime_common::paras_registrar;
 	use runtime_parachains::hrmp::HrmpChannels;
 
-	let (rc, ct) = tokio::join!(
+	type Ah = asset_hub_polkadot_runtime::Runtime;
+
+	let (rc, ct, ah) = tokio::join!(
 		tokio::spawn(remote_ext(Chain::Relay)),
 		tokio::spawn(remote_ext(Chain::Coretime)),
+		tokio::spawn(remote_ext(Chain::AssetHub)),
 	);
 	let mut rc = rc.expect("failed to load the Relay Chain snapshot");
 	let mut ct = ct.expect("failed to load the Coretime snapshot");
+	let mut ah = ah.expect("failed to load the Asset Hub snapshot");
 
-	// GIVEN the live registrar and HRMP state of the snapshot.
-	let (paras_before, hrmp_before, rc_ti_before) = rc.execute_with(|| {
+	// GIVEN the live registrar and HRMP state of the snapshot, and one cleanly migrating
+	// manager to spot-check the AH teleport leg with.
+	let (paras_before, hrmp_before, rc_ti_before, sample) = rc.execute_with(|| {
 		crate::events::emit_rc_census("before");
 		let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
 			.map(|(id, info)| (id.into(), info.deposit))
 			.collect();
-		let channels: Vec<_> = HrmpChannels::<Rc>::iter_keys().collect();
-		(paras, channels, pallet_balances::TotalIssuance::<Rc>::get())
+		let channels: Vec<(_, u128, u128)> = HrmpChannels::<Rc>::iter()
+			.map(|(id, ch)| (id, ch.sender_deposit, ch.recipient_deposit))
+			.collect();
+
+		let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
+		for (_, info) in paras_registrar::Paras::<Rc>::iter() {
+			*recorded.entry(info.manager).or_default() += info.deposit;
+		}
+		let sample = paras_registrar::Paras::<Rc>::iter()
+			.find_map(|(_, info)| {
+				let account = frame_system::Account::<Rc>::get(&info.manager);
+				(account.data.reserved > 0 &&
+					account.data.reserved <= *recorded.get(&info.manager).unwrap_or(&0) &&
+					account.data.frozen == 0 &&
+					pallet_balances::Holds::<Rc>::get(&info.manager).is_empty() &&
+					pallet_balances::Locks::<Rc>::get(&info.manager).is_empty())
+				.then(|| (info.manager, account.data.free, account.data.reserved))
+			})
+			.expect("live RC snapshot has a cleanly migrating manager");
+
+		(paras, channels, pallet_balances::TotalIssuance::<Rc>::get(), sample)
 	});
 	assert!(!paras_before.is_empty(), "live RC snapshot has registered paras");
 	assert!(!hrmp_before.is_empty(), "live RC snapshot has HRMP channels");
 	let recorded_deposits: u128 = paras_before.iter().map(|(_, d)| d).sum();
+	let recorded_hrmp: u128 = hrmp_before.iter().map(|(_, s, r)| s + r).sum();
 
 	let ct_ti_before = ct.execute_with(|| {
 		crate::events::emit_ct_census("before");
 		pallet_balances::TotalIssuance::<Ct>::get()
+	});
+	let (ah_ti_before, ah_checking_before, ah_sample_before) = ah.execute_with(|| {
+		// Baseline probe so the event stream carries the checking account's pre-migration
+		// value; the monitor measures the teleport receipts as the drain from this baseline.
+		crate::events::emit_para_block(Chain::AssetHub);
+		let checking = pallet_xcm::Pallet::<Ah>::check_account();
+		(
+			pallet_balances::TotalIssuance::<Ah>::get(),
+			frame_system::Account::<Ah>::get(&checking).data.free,
+			frame_system::Account::<Ah>::get(&sample.0).data.free,
+		)
 	});
 
 	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks.
@@ -532,21 +622,43 @@ async fn full_migration_rc_to_ct() {
 		rounds += 1;
 		assert!(rounds <= 40, "migration must finish within 40 shuttle rounds");
 
-		let (dmp, rc_stage) = rc.execute_with(|| {
+		let (ct_dmp, ah_dmp, rc_stage) = rc.execute_with(|| {
 			for _ in 0..3 {
 				next_block_rc();
 			}
-			(take_dmp(CoretimePolkadot::PARA_ID.into()), RcMigrationStage::<Rc>::get())
+			(
+				take_dmp(CoretimePolkadot::PARA_ID.into()),
+				take_dmp(AssetHubPolkadot::PARA_ID.into()),
+				RcMigrationStage::<Rc>::get(),
+			)
 		});
 		rc.commit_all().unwrap();
 
 		ct.execute_with(|| {
-			enqueue_dmp::<CoretimePolkadot>(dmp);
+			enqueue_dmp::<CoretimePolkadot>(ct_dmp);
 			for _ in 0..3 {
 				next_block_para::<CoretimePolkadot>();
 			}
 		});
 		ct.commit_all().unwrap();
+
+		ah.execute_with(|| {
+			enqueue_dmp::<AssetHubPolkadot>(ah_dmp);
+			for _ in 0..3 {
+				next_block_para::<AssetHubPolkadot>();
+				// A trapped asset means a teleport failed half-way; that must never pass.
+				assert!(
+					!frame_system::Pallet::<Ah>::events().into_iter().any(|r| matches!(
+						r.event,
+						asset_hub_polkadot_runtime::RuntimeEvent::PolkadotXcm(
+							pallet_xcm::Event::AssetsTrapped { .. }
+						)
+					)),
+					"assets were trapped on Asset Hub"
+				);
+			}
+		});
+		ah.commit_all().unwrap();
 
 		if rc_stage == RcStage::MigrationDone {
 			break;
@@ -554,7 +666,7 @@ async fn full_migration_rc_to_ct() {
 	}
 
 	// THEN the RC is drained: registrar and HRMP gone, issuance reduced by exactly the burn.
-	let migrated = rc.execute_with(|| {
+	let tracker = rc.execute_with(|| {
 		crate::events::emit_rc_census("after");
 		assert!(
 			paras_registrar::Paras::<Rc>::iter().next().is_none(),
@@ -565,10 +677,15 @@ async fn full_migration_rc_to_ct() {
 			"all HRMP channel records must be drained from the RC"
 		);
 		let tracker = RcMigratedBalance::<Rc>::get();
-		assert_eq!(tracker.kept + tracker.migrated, rc_ti_before, "balance bookkeeping is exact");
+		assert_eq!(
+			tracker.kept + tracker.ct_reserved + tracker.ct_free + tracker.ah_free,
+			rc_ti_before,
+			"balance bookkeeping is exact"
+		);
 		assert_eq!(pallet_balances::TotalIssuance::<Rc>::get(), tracker.kept);
-		tracker.migrated
+		tracker
 	});
+	let migrated_ct = tracker.migrated_ct();
 
 	// AND Coretime holds every record, every deposit is re-attributed or parked, and issuance
 	// grew by exactly what the RC burned.
@@ -579,13 +696,17 @@ async fn full_migration_rc_to_ct() {
 		assert_eq!(CtMigrationStage::<Ct>::get(), MigrationStage::MigrationDone);
 		assert_eq!(RcParas::<Ct>::iter().count(), paras_before.len(), "every para landed");
 		assert!(FailedParas::<Ct>::iter().next().is_none(), "no para may fail to integrate");
+		assert!(
+			FailedHrmpChannels::<Ct>::iter().next().is_none(),
+			"no channel may fail to integrate"
+		);
 		assert!(RcNextFreeParaId::<Ct>::get().is_some(), "NextFreeParaId migrated");
 		assert_eq!(
 			RcHrmpChannels::<Ct>::iter().count(),
 			hrmp_before.len(),
 			"every HRMP channel landed"
 		);
-		for id in &hrmp_before {
+		for (id, _, _) in &hrmp_before {
 			assert!(
 				RcHrmpChannels::<Ct>::contains_key((
 					u32::from(id.sender),
@@ -595,28 +716,70 @@ async fn full_migration_rc_to_ct() {
 			);
 		}
 
-		// Reconciliation: re-attributed + parked shortfalls == the registrar-recorded total.
-		// Nothing is invented and nothing is silently dropped.
+		// Reconciliation: re-attributed + parked shortfalls == the recorded totals, for both
+		// deposit kinds. Nothing is invented and nothing is silently dropped.
 		let reattributed = ReattributedDeposits::<Ct>::get();
 		let parked: u128 = ParkedDepositShortfalls::<Ct>::iter().map(|(_, v)| v).sum();
 		assert_eq!(reattributed + parked, recorded_deposits, "deposit reconciliation is exact");
 		assert!(reattributed > 0, "at least some deposits must re-attribute");
+		let reattributed_hrmp = ReattributedHrmpDeposits::<Ct>::get();
+		let parked_hrmp: u128 = ParkedHrmpShortfalls::<Ct>::iter().map(|(_, v)| v).sum();
+		assert_eq!(
+			reattributed_hrmp + parked_hrmp,
+			recorded_hrmp,
+			"HRMP deposit reconciliation is exact"
+		);
 
-		// Re-attribution must not create RegistrarDeposit holds out of thin air: the sum of all
-		// such holds equals the re-attributed total.
-		let held: u128 = frame_system::Account::<Ct>::iter_keys()
-			.flat_map(|who| pallet_balances::Holds::<Ct>::get(&who))
-			.filter(|h| {
-				h.id ==
-					coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(
-						HoldReason::RegistrarDeposit,
-					)
-			})
-			.map(|h| h.amount)
-			.sum();
-		assert_eq!(held, reattributed, "RegistrarDeposit holds match the re-attributed total");
+		// Re-attribution must not create holds out of thin air: the sum of holds under each
+		// attributed reason equals its re-attributed total.
+		let held_under = |reason: HoldReason| -> u128 {
+			let id = coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(reason);
+			frame_system::Account::<Ct>::iter_keys()
+				.flat_map(|who| pallet_balances::Holds::<Ct>::get(&who))
+				.filter(|h| h.id == id)
+				.map(|h| h.amount)
+				.sum()
+		};
+		assert_eq!(
+			held_under(HoldReason::RegistrarDeposit),
+			reattributed,
+			"RegistrarDeposit holds match the re-attributed total"
+		);
+		assert_eq!(
+			held_under(HoldReason::HrmpDeposit),
+			reattributed_hrmp,
+			"HrmpDeposit holds match the re-attributed total"
+		);
 
-		assert_eq!(CtMintedTotal::<Ct>::get(), migrated, "CT minted exactly what the RC burned");
-		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated);
+		assert_eq!(
+			CtMintedTotal::<Ct>::get(),
+			migrated_ct,
+			"CT minted exactly the CT-bound burn"
+		);
+		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated_ct);
+	});
+
+	// AND Asset Hub received the teleports: issuance unchanged, the checking account (the "DOT
+	// out on the RC" ledger) drained by exactly the teleported total, the sample manager's free
+	// balance arrived, and nothing was trapped (asserted per block in the loop above).
+	let (_, ah_free_exp) = expected_split(sample.1, sample.2);
+	ah.execute_with(|| {
+		assert_eq!(
+			pallet_balances::TotalIssuance::<Ah>::get(),
+			ah_ti_before,
+			"teleports must not change AH issuance"
+		);
+		let checking = pallet_xcm::Pallet::<Ah>::check_account();
+		let checking_now = frame_system::Account::<Ah>::get(&checking).data.free;
+		assert_eq!(
+			ah_checking_before - checking_now,
+			tracker.ah_free,
+			"AH checking account drained by exactly the teleported total"
+		);
+		assert_eq!(
+			frame_system::Account::<Ah>::get(&sample.0).data.free,
+			ah_sample_before + ah_free_exp,
+			"the manager's free balance arrived on AH"
+		);
 	});
 }

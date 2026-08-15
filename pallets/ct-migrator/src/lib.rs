@@ -40,7 +40,8 @@ use frame_support::{
 	},
 };
 use frame_system::pallet_prelude::*;
-use sp_runtime::traits::{Saturating, Zero};
+use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
+use sp_runtime::traits::{AccountIdConversion, Saturating, Zero};
 
 const LOG_TARGET: &str = "runtime::ct-migrator";
 
@@ -205,6 +206,12 @@ pub mod pallet {
 		/// pallet lands on this chain.
 		#[codec(index = 1)]
 		RegistrarDeposit,
+		/// An HRMP channel deposit migrated from the relay chain, held on the sibling sovereign
+		/// account of the depositing para.
+		///
+		/// Placeholder reason like [`Self::RegistrarDeposit`], for the future HRMP pallet.
+		#[codec(index = 2)]
+		HrmpDeposit,
 	}
 
 	#[pallet::pallet]
@@ -251,6 +258,11 @@ pub mod pallet {
 	pub type FailedParas<T: Config> =
 		StorageMap<_, Twox64Concat, u32, PortableParaInfoOf<T>, OptionQuery>;
 
+	/// HRMP channel records that failed to integrate, parked verbatim for manual recovery.
+	#[pallet::storage]
+	pub type FailedHrmpChannels<T: Config> =
+		StorageMap<_, Twox64Concat, (u32, u32), PortableHrmpChannelOf<T>, OptionQuery>;
+
 	/// Per-para shortfall between the registrar-recorded deposit and what actually arrived held.
 	///
 	/// Reconciliation rule: re-attribute `min(recorded, held)`, park the difference here — the
@@ -264,12 +276,25 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type ReattributedDeposits<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
 
+	/// Total re-attributed from `RcMigratedReserve` to `HrmpDeposit` holds.
+	#[pallet::storage]
+	pub type ReattributedHrmpDeposits<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
+
+	/// Per-(channel, side) shortfall between the recorded HRMP deposit and what arrived held on
+	/// the sibling sovereign. Same reconciliation rule as registrar deposits: `min(recorded,
+	/// held)`, difference parked here, never invented.
+	#[pallet::storage]
+	pub type ParkedHrmpShortfalls<T: Config> =
+		StorageMap<_, Twox64Concat, (u32, u32, bool), BalanceOf<T>, OptionQuery>;
+
 	#[pallet::error]
 	pub enum Error<T> {
 		/// Failed to integrate a migrated account.
 		FailedToProcessAccount,
 		/// Failed to integrate a migrated registrar record.
 		FailedToProcessPara,
+		/// Failed to flip a migrated reserve to its attributed hold reason.
+		FailedToReattribute,
 	}
 
 	#[pallet::event]
@@ -297,6 +322,12 @@ pub mod pallet {
 		/// A batch of migrated HRMP channel records was processed.
 		HrmpReceived {
 			count: u32,
+		},
+		/// An HRMP deposit could not be fully re-attributed; the shortfall is parked.
+		HrmpShortfallParked {
+			sender: u32,
+			recipient: u32,
+			shortfall: BalanceOf<T>,
 		},
 		/// The relay chain signalled that all data has been sent.
 		MigrationFinished {
@@ -489,24 +520,36 @@ pub mod pallet {
 			Self::deposit_event(Event::RegistrarReceived { count_good, count_bad });
 		}
 
-		fn do_receive_para(para: &PortableParaInfoOf<T>) -> Result<(), Error<T>> {
-			// Re-attribute the manager's migrated reserve to an explicit registrar reason:
-			// min(recorded, held). A shortfall means the recorded deposit was not (fully) backed
-			// by a live reserve on the relay chain, or the manager's account was kept there; the
-			// difference is parked, never minted.
+		/// Flip `min(wanted, held-as-RcMigratedReserve)` on `who` to the attributed reason `to`.
+		///
+		/// Returns `(attributed, shortfall)`. A shortfall means the recorded deposit was not
+		/// (fully) backed by a live reserve on the relay chain, or the depositor's account was
+		/// kept there; callers park it, it is never minted.
+		fn reattribute_hold(
+			who: &T::AccountId,
+			wanted: BalanceOf<T>,
+			to: HoldReason,
+		) -> Result<(BalanceOf<T>, BalanceOf<T>), Error<T>> {
 			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
-			let held = T::Currency::balance_on_hold(&rc_reason, &para.manager);
-			let attribute = para.deposit.min(held);
+			let held = T::Currency::balance_on_hold(&rc_reason, who);
+			let attribute = wanted.min(held);
 
 			if !attribute.is_zero() {
-				T::Currency::release(&rc_reason, &para.manager, attribute, Precision::Exact)
-					.map_err(|_| Error::<T>::FailedToProcessPara)?;
-				T::Currency::hold(&HoldReason::RegistrarDeposit.into(), &para.manager, attribute)
-					.map_err(|_| Error::<T>::FailedToProcessPara)?;
-				ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(attribute));
+				T::Currency::release(&rc_reason, who, attribute, Precision::Exact)
+					.map_err(|_| Error::<T>::FailedToReattribute)?;
+				T::Currency::hold(&to.into(), who, attribute)
+					.map_err(|_| Error::<T>::FailedToReattribute)?;
 			}
+			Ok((attribute, wanted.saturating_sub(attribute)))
+		}
 
-			let shortfall = para.deposit.saturating_sub(attribute);
+		fn do_receive_para(para: &PortableParaInfoOf<T>) -> Result<(), Error<T>> {
+			let (attributed, shortfall) = Self::reattribute_hold(
+				&para.manager,
+				para.deposit,
+				HoldReason::RegistrarDeposit,
+			)?;
+			ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
 			if !shortfall.is_zero() {
 				ParkedDepositShortfalls::<T>::insert(para.para_id, shortfall);
 				Self::deposit_event(Event::DepositShortfallParked {
@@ -520,11 +563,63 @@ pub mod pallet {
 		}
 
 		fn do_receive_hrmp(channels: Vec<PortableHrmpChannelOf<T>>) {
-			let count = channels.len() as u32;
+			let (mut count_good, mut count_bad) = (0, 0);
 			for channel in channels {
-				RcHrmpChannels::<T>::insert((channel.sender, channel.recipient), channel);
+				// Each channel integrates in its own transaction so one bad record cannot poison
+				// the batch.
+				let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
+					match Self::do_receive_channel(&channel) {
+						Ok(()) => TransactionOutcome::Commit(Ok(())),
+						Err(e) => TransactionOutcome::Rollback(Err(e)),
+					}
+				})
+				.expect("Always returning Ok; qed");
+
+				if let Err(e) = res {
+					count_bad += 1;
+					log::error!(
+						target: LOG_TARGET,
+						"Failed to integrate channel {}->{}: {e:?}; parking it",
+						channel.sender, channel.recipient,
+					);
+					FailedHrmpChannels::<T>::insert((channel.sender, channel.recipient), channel);
+				} else {
+					count_good += 1;
+				}
 			}
-			Self::deposit_event(Event::HrmpReceived { count });
+			Self::deposit_event(Event::HrmpReceived { count: count_good });
+			if count_bad > 0 {
+				log::error!(target: LOG_TARGET, "{count_bad} HRMP channels parked");
+			}
+		}
+
+		fn do_receive_channel(channel: &PortableHrmpChannelOf<T>) -> Result<(), Error<T>> {
+			// The deposits arrived as holds on the *sibling sovereign* accounts of the two paras
+			// (the accounts stage translates child sovereigns); re-attribute each side.
+			for (para, wanted, side) in [
+				(channel.sender, channel.sender_deposit, true),
+				(channel.recipient, channel.recipient_deposit, false),
+			] {
+				let sovereign: T::AccountId =
+					Sibling::from(ParaId::from(para)).into_account_truncating();
+				let (attributed, shortfall) =
+					Self::reattribute_hold(&sovereign, wanted, HoldReason::HrmpDeposit)?;
+				ReattributedHrmpDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
+				if !shortfall.is_zero() {
+					ParkedHrmpShortfalls::<T>::insert(
+						(channel.sender, channel.recipient, side),
+						shortfall,
+					);
+					Self::deposit_event(Event::HrmpShortfallParked {
+						sender: channel.sender,
+						recipient: channel.recipient,
+						shortfall,
+					});
+				}
+			}
+
+			RcHrmpChannels::<T>::insert((channel.sender, channel.recipient), channel.clone());
+			Ok(())
 		}
 
 		fn transition(new: MigrationStage) {
