@@ -13,29 +13,89 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Accounts stage: withdraws account balances on the relay chain and sends them to the Coretime
-//! chain in portable format. Every non-liquid part of a balance is classified into a
-//! [`PortableHoldReason`]; the receiving runtime decides what each becomes locally.
+//! Accounts stage: withdraws account balances on the relay chain and routes the pieces to their
+//! destinations.
+//!
+//! Per account, the balance splits by destination:
+//! - reserved balance, up to what the registrar and HRMP pallets record as this account's
+//!   deposits, goes to the **Coretime chain** as a hold (re-attributed by the later stages);
+//! - a small working buffer of free balance (`CT_FREE_BUFFER`) follows the deposit to Coretime;
+//! - all remaining free balance is **teleported to Asset Hub**, where the owners' phase-1 funds
+//!   already live.
+//!
+//! Accounts whose reserve exceeds their recorded registrar/HRMP deposits (proxy deposits, known
+//! anomalies) are kept whole on the relay chain for a later stage — money whose destination is
+//! not designed yet does not move.
+//!
+//! Para sovereign accounts are included: their child-sovereign id (`para…`) is translated to the
+//! sibling id (`sibl…`) that represents the same para on a parachain.
 
 use crate::*;
 use frame_support::{
 	defensive_assert,
 	traits::tokens::{Fortitude, Precision, Preservation},
 };
-use sp_runtime::traits::Zero;
+use polkadot_parachain_primitives::primitives::Sibling;
+use sp_runtime::traits::{AccountIdConversion, Zero};
 
 pub type AccountInfoFor<T> = frame_system::AccountInfo<
 	<T as frame_system::Config>::Nonce,
 	pallet_balances::AccountData<u128>,
 >;
 
-/// Account-id prefixes whose translation to the destination chain is not designed yet: parachain
-/// sovereign, sibling sovereign and pallet (module) accounts. They are skipped, not migrated.
-const UNTRANSLATED_PREFIXES: [&[u8]; 3] = [b"para", b"sibl", b"modl"];
+/// Account-id prefixes that are never migrated: sibling-format sovereigns (an anomaly on a relay
+/// chain) and pallet (module) accounts. Child sovereigns (`para`) ARE migrated, translated to
+/// their sibling id.
+const UNMIGRATED_PREFIXES: [&[u8]; 2] = [b"sibl", b"modl"];
+
+/// Where the pieces of one withdrawn account go.
+pub struct Withdrawal {
+	/// Deposit hold plus working buffer, minted on the Coretime chain.
+	pub ct: Option<PortableAccount<AccountId32, u128>>,
+	/// Free balance teleported to Asset Hub: (beneficiary, amount).
+	pub ah: Option<(AccountId32, u128)>,
+}
 
 pub struct AccountsMigrator<T>(PhantomData<T>);
 
 impl<T: Config> AccountsMigrator<T> {
+	/// Index every account's expected Coretime-bound reserve from the owning pallets' records:
+	/// registrar deposits per manager, HRMP channel deposits per (child) para sovereign.
+	///
+	/// Called once by `AccountsInit`. Returns the number of records indexed.
+	pub fn build_expected_ct_reserves() -> u32 {
+		let mut records = 0u32;
+		let mut add = |who: T::AccountId, amount: u128| {
+			if !amount.is_zero() {
+				ExpectedCtReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
+			}
+		};
+		for (_, info) in paras_registrar::Paras::<T>::iter() {
+			add(info.manager, info.deposit);
+			records += 1;
+		}
+		for (id, channel) in runtime_parachains::hrmp::HrmpChannels::<T>::iter() {
+			add(id.sender.into_account_truncating(), channel.sender_deposit);
+			add(id.recipient.into_account_truncating(), channel.recipient_deposit);
+			records += 1;
+		}
+		records
+	}
+
+	/// The account id under which `who`'s balances continue on the destination chains.
+	///
+	/// Child para sovereigns become sibling sovereigns (the same para as seen from a sibling
+	/// parachain); everyone else keeps their address.
+	pub fn translate_destination(who: &T::AccountId) -> AccountId32 {
+		let bytes: &[u8] = who.as_ref();
+		if bytes.starts_with(b"para") && bytes[8..].iter().all(|b| *b == 0) {
+			let para_id = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes; qed"));
+			Sibling::from(ParaId::from(para_id)).into_account_truncating()
+		} else {
+			who.clone()
+		}
+	}
+
 	/// Migrate accounts until the per-block limit is reached.
 	///
 	/// Returns the cursor to continue from on the next block, or `None` once the account space is
@@ -47,7 +107,8 @@ impl<T: Config> AccountsMigrator<T> {
 			None => frame_system::Account::<T>::iter(),
 		};
 
-		let mut batch = Vec::new();
+		let mut ct_batch = Vec::new();
+		let mut ah_batch = Vec::new();
 		let mut processed = 0u32;
 		let maybe_last_key = loop {
 			let Some((who, info)) = iter.next() else { break None };
@@ -64,40 +125,70 @@ impl<T: Config> AccountsMigrator<T> {
 			.expect("Always returning Ok; qed");
 
 			match withdrawn {
-				Ok(Some(account)) => batch.push(account),
+				Ok(Some(Withdrawal { ct, ah })) => {
+					if let Some(account) = ct {
+						ct_batch.push(account);
+					}
+					if let Some(beneficiary) = ah {
+						ah_batch.push(beneficiary);
+					}
+				},
 				Ok(None) => (),
 				Err(e) => {
 					log::warn!(target: LOG_TARGET, "Skipping account {who:?}: {e:?}");
 				},
 			}
 
-			if batch.len() >= MAX_ACCOUNTS_PER_XCM as usize {
-				Pallet::<T>::send_accounts(core::mem::take(&mut batch))?;
+			if ct_batch.len() >= MAX_ACCOUNTS_PER_XCM as usize {
+				Pallet::<T>::send_accounts(core::mem::take(&mut ct_batch))?;
+			}
+			if ah_batch.len() >= MAX_TELEPORTS_PER_XCM as usize {
+				Pallet::<T>::send_teleport(core::mem::take(&mut ah_batch))?;
 			}
 			if processed >= MAX_ACCOUNTS_PER_BLOCK {
 				break Some(who);
 			}
 		};
 
-		if !batch.is_empty() {
-			Pallet::<T>::send_accounts(batch)?;
+		if !ct_batch.is_empty() {
+			Pallet::<T>::send_accounts(ct_batch)?;
+		}
+		if !ah_batch.is_empty() {
+			Pallet::<T>::send_teleport(ah_batch)?;
 		}
 		Ok(maybe_last_key)
 	}
 
-	/// Withdraw a single account from the relay chain and return it in portable format.
+	/// Withdraw a single account from the relay chain and split it by destination.
 	///
 	/// `Ok(None)` means the account is deliberately not migrated; `Err` means it should have
 	/// migrated but could not be withdrawn cleanly (the caller rolls it back and skips it).
 	pub fn withdraw_account(
 		who: &T::AccountId,
 		info: AccountInfoFor<T>,
-	) -> Result<Option<PortableAccount<AccountId32, u128>>, Error<T>> {
+	) -> Result<Option<Withdrawal>, Error<T>> {
 		if !Self::can_migrate(who, &info) {
 			return Ok(None);
 		}
 		let free = info.data.free;
 		let reserved = info.data.reserved;
+
+		// Reserved balance is only trusted up to what the registrar and HRMP pallets say this
+		// account deposited. More reserve than that means money whose destination is not designed
+		// yet (proxy deposits, anomalies): the whole account stays on the RC for a later stage.
+		let expected_ct = ExpectedCtReserve::<T>::get(who);
+		if reserved > expected_ct {
+			log::info!(
+				target: LOG_TARGET,
+				"Holding back account {who:?}: reserved {reserved} > attributable {expected_ct}"
+			);
+			Pallet::<T>::deposit_event(Event::AccountHeldBack {
+				who: who.clone(),
+				free,
+				reserved,
+			});
+			return Ok(None);
+		}
 
 		// A reserve is supposed to be backed by a consumer reference; accounts where it is not
 		// have broken refcounts (a known on-chain anomaly). Unreserving them still works, but
@@ -135,31 +226,52 @@ impl<T: Config> AccountsMigrator<T> {
 		.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
 		defensive_assert!(burned == total, "burned the account's whole balance");
 
-		RcMigratedBalance::<T>::try_mutate(|tracker| {
-			tracker.migrated =
-				tracker.migrated.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
-			tracker.kept = tracker.kept.checked_sub(burned).ok_or(Error::<T>::BalanceAccounting)?;
+		// The split: deposit → CT hold; working buffer → CT free; the rest → AH free. Free
+		// balance below AH's ED cannot teleport into a fresh account, so such dust follows the
+		// deposit to CT instead (only deposit holders can be in this situation: everyone else
+		// has free >= the RC ED, which exceeds AH's).
+		let ct_hold = reserved;
+		let mut ct_free = if ct_hold.is_zero() { 0 } else { free.min(CT_FREE_BUFFER) };
+		let mut ah_free = free.saturating_sub(ct_free);
+		if !ah_free.is_zero() && ah_free < AH_EXISTENTIAL_DEPOSIT && !ct_hold.is_zero() {
+			ct_free = ct_free.saturating_add(ah_free);
+			ah_free = 0;
+		}
+
+		RcMigratedBalance::<T>::try_mutate(|t| {
+			t.kept = t.kept.checked_sub(burned).ok_or(Error::<T>::BalanceAccounting)?;
+			t.ct_reserved =
+				t.ct_reserved.checked_add(ct_hold).ok_or(Error::<T>::BalanceAccounting)?;
+			t.ct_free = t.ct_free.checked_add(ct_free).ok_or(Error::<T>::BalanceAccounting)?;
+			t.ah_free = t.ah_free.checked_add(ah_free).ok_or(Error::<T>::BalanceAccounting)?;
 			Ok::<(), Error<T>>(())
 		})?;
 
-		let mut holds = BoundedVec::default();
-		if !reserved.is_zero() {
-			holds
-				.try_push(PortableHold {
-					reason: PortableHoldReason::UnnamedReserve,
-					amount: reserved,
-				})
-				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
-		}
+		let dest = Self::translate_destination(who);
+		let ct = if ct_hold.is_zero() && ct_free.is_zero() {
+			None
+		} else {
+			let mut holds = BoundedVec::default();
+			if !ct_hold.is_zero() {
+				holds
+					.try_push(PortableHold {
+						reason: PortableHoldReason::UnnamedReserve,
+						amount: ct_hold,
+					})
+					.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+			}
+			Some(PortableAccount { who: dest.clone(), free: ct_free, holds })
+		};
+		let ah = (!ah_free.is_zero()).then(|| (dest, ah_free));
 
-		Ok(Some(PortableAccount { who: who.clone(), free, holds }))
+		Ok(Some(Withdrawal { ct, ah }))
 	}
 
 	/// Whether the account migrates at all. The rejections here are deliberate policy, not
 	/// failures.
 	pub fn can_migrate(who: &T::AccountId, info: &AccountInfoFor<T>) -> bool {
 		let bytes: &[u8] = who.as_ref();
-		if UNTRANSLATED_PREFIXES.iter().any(|prefix| bytes.starts_with(prefix)) {
+		if UNMIGRATED_PREFIXES.iter().any(|prefix| bytes.starts_with(prefix)) {
 			log::info!(target: LOG_TARGET, "Keeping sovereign/module account {who:?} on the RC");
 			return false;
 		}
