@@ -301,27 +301,91 @@ async fn balance_census() {
 		// `over` are accounts with additional unattributable reserves (proxy deposits) that the
 		// migration holds back whole.
 		{
+			use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 			type Rc = polkadot_runtime::Runtime;
+			let ss58 = |a: &sp_runtime::AccountId32| {
+				a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
+			};
+			let dot = |v: u128| v as f64 / 1e10;
+
 			let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
-			let mut paras_of = BTreeMap::<sp_runtime::AccountId32, u32>::new();
-			for (_, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+			let mut paras_of = BTreeMap::<sp_runtime::AccountId32, Vec<(u32, u128, Option<bool>)>>::new();
+			for (id, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
 				*recorded.entry(info.manager.clone()).or_default() += info.deposit;
-				*paras_of.entry(info.manager).or_default() += 1;
+				paras_of.entry(info.manager).or_default().push((
+					id.into(),
+					info.deposit,
+					info.locked,
+				));
 			}
 			let mut cls = BTreeMap::<&str, (u32, u32, u128)>::new(); // managers, paras, recorded
+			println!("\n### registrar deposit anomalies (recorded vs live reserve, per manager)");
 			for (manager, expected) in &recorded {
 				let reserved = frame_system::Account::<Rc>::get(manager).data.reserved;
-				let cat = if reserved == 0 { "zero reserve (anomaly)" }
+				let cat = if reserved == *expected { "exact" }
+					else if reserved == 0 { "zero reserve (anomaly)" }
 					else if reserved < *expected { "partial reserve (anomaly)" }
-					else if reserved > *expected { "over-reserved (held back: proxy etc.)" }
-					else { "exact" };
+					else { "over-reserved (held back: proxy etc.)" };
+				if cat != "exact" {
+					println!(
+						"{cat}: {} | paras {:?} | recorded {:.4} DOT, live reserve {:.4} DOT, gap {:.4} DOT",
+						ss58(manager),
+						paras_of[manager],
+						dot(*expected),
+						dot(reserved),
+						dot(expected.saturating_sub(reserved)),
+					);
+				}
 				let e = cls.entry(cat).or_default();
-				e.0 += 1; e.1 += paras_of[manager]; e.2 += expected;
+				e.0 += 1; e.1 += paras_of[manager].len() as u32; e.2 += expected;
 			}
-			println!("\n### registrar deposit reconciliation (recorded vs live reserve, per manager)");
+			println!("\n### registrar reconciliation summary");
 			for (cat, (managers, paras, dep)) in &cls {
-				println!("{cat}: {managers} managers / {paras} paras, recorded {:.4} DOT", *dep as f64 / 1e10);
+				println!("{cat}: {managers} managers / {paras} paras, recorded {:.4} DOT", dot(*dep));
 			}
+
+			// HRMP: per (child) sovereign, channel deposits vs live reserve — including pending
+			// open-channel-request deposits, which are reserved but attached to no channel yet.
+			use sp_runtime::traits::AccountIdConversion;
+			let mut channel_dep = BTreeMap::<sp_runtime::AccountId32, (u128, Vec<u32>)>::new();
+			for (id, ch) in runtime_parachains::hrmp::HrmpChannels::<Rc>::iter() {
+				let s = channel_dep
+					.entry(id.sender.into_account_truncating())
+					.or_insert((0, vec![u32::from(id.sender)]));
+				s.0 += ch.sender_deposit;
+				let r = channel_dep
+					.entry(id.recipient.into_account_truncating())
+					.or_insert((0, vec![u32::from(id.recipient)]));
+				r.0 += ch.recipient_deposit;
+			}
+			let mut request_dep = BTreeMap::<sp_runtime::AccountId32, u128>::new();
+			for (id, req) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter() {
+				*request_dep.entry(id.sender.into_account_truncating()).or_default() +=
+					req.sender_deposit;
+			}
+			println!("\n### hrmp sovereign reconciliation (channel + request deposits vs live reserve)");
+			let (mut exact, mut short, mut over) = (0u32, 0u32, 0u32);
+			for (sov, (chan, paras)) in &channel_dep {
+				let requests = request_dep.get(sov).copied().unwrap_or(0);
+				let reserved = frame_system::Account::<Rc>::get(sov).data.reserved;
+				let full = chan + requests;
+				if reserved == full {
+					exact += 1;
+				} else if reserved < full {
+					short += 1;
+					println!(
+						"short: para {:?} | channels {:.4} + requests {:.4} DOT recorded, live reserve {:.4} DOT",
+						paras, dot(*chan), dot(requests), dot(reserved),
+					);
+				} else {
+					over += 1;
+					println!(
+						"over: para {:?} | channels {:.4} + requests {:.4} DOT recorded, live reserve {:.4} DOT",
+						paras, dot(*chan), dot(requests), dot(reserved),
+					);
+				}
+			}
+			println!("hrmp sovereigns: {exact} exact, {short} short (anomaly), {over} over-reserved");
 		}
 
 		// The Balances pallet's own storage keys: how many are empty leftovers, and how many
@@ -381,6 +445,68 @@ async fn balance_census() {
 			check_data.free as f64 / 1e10,
 			check_data.reserved as f64 / 1e10,
 		);
+	});
+}
+
+/// Dump every proxy entry on the Relay Chain as JSON lines, cross-referenced against registrar
+/// managers and para sovereigns — the data source for the proxy migration report
+/// (`ahm-phase-2/simulation/proxy-report.html`).
+///
+/// Writes to the file named by `AHM_PROXY_DUMP`; without it, prints only aggregates.
+#[tokio::test(flavor = "multi_thread")]
+async fn proxy_census() {
+	use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
+	type Rc = polkadot_runtime::Runtime;
+
+	let mut rc = remote_ext(Chain::Relay).await;
+	rc.execute_with(|| {
+		let ss58 = |a: &sp_runtime::AccountId32| {
+			a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
+		};
+
+		// Registrar managers and what they manage.
+		let mut manages = BTreeMap::<sp_runtime::AccountId32, Vec<u32>>::new();
+		for (id, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+			manages.entry(info.manager).or_default().push(id.into());
+		}
+
+		let mut out = Vec::new();
+		let (mut entries, mut deposit_total) = (0u32, 0u128);
+		for (who, (defs, deposit)) in pallet_proxy::Proxies::<Rc>::iter() {
+			entries += 1;
+			deposit_total += deposit;
+			let account = frame_system::Account::<Rc>::get(&who);
+			let bytes: &[u8] = who.as_ref();
+			let sovereign = bytes.starts_with(b"para") || bytes.starts_with(b"sibl");
+			let delegates: Vec<String> = defs
+				.iter()
+				.map(|d| {
+					format!(
+						r#"{{"delegate":"{}","type":"{:?}","delay":{},"delegate_manages":{:?}}}"#,
+						ss58(&d.delegate),
+						d.proxy_type,
+						d.delay,
+						manages.get(&d.delegate).cloned().unwrap_or_default(),
+					)
+				})
+				.collect();
+			out.push(format!(
+				r#"{{"who":"{}","deposit":"{}","free":"{}","reserved":"{}","nonce":{},"sovereign":{},"manages":{:?},"delegates":[{}]}}"#,
+				ss58(&who),
+				deposit,
+				account.data.free,
+				account.data.reserved,
+				account.nonce,
+				sovereign,
+				manages.get(&who).cloned().unwrap_or_default(),
+				delegates.join(","),
+			));
+		}
+		println!("proxy census: {entries} delegators, {:.2} DOT deposits", deposit_total as f64 / 1e10);
+		if let Ok(path) = std::env::var("AHM_PROXY_DUMP") {
+			std::fs::write(&path, out.join("\n")).expect("can write proxy dump");
+			println!("wrote {path}");
+		}
 	});
 }
 
