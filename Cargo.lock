@@ -12404,6 +12404,7 @@ dependencies = [
  "pallet-balances",
  "pallet-ct-migrator",
  "pallet-message-queue",
+ "pallet-proxy",
  "pallet-rc2-migrator",
  "pallet-xcm",
  "parity-scale-codec",
