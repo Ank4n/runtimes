@@ -716,24 +716,92 @@ async fn full_migration_rc_to_ct() {
 	let recorded_deposits: u128 = paras_before.iter().map(|(_, d)| d).sum();
 	let recorded_hrmp: u128 = hrmp_before.iter().map(|(_, s, r)| s + r).sum();
 
+	// Proxy state before: the manager-linked delegators (whose definitions travel to CT), one
+	// delegator with both an Any and a ParaRegistration delegate for the dispatch checks, and
+	// every never-signed delegator for the funds-follow-control invariant.
+	let (ct_bound_proxies, nonce0_delegators, proxy_dispatch) = rc.execute_with(|| {
+		use migrator_types::PortableProxyType as P;
+		let managers: std::collections::BTreeSet<_> =
+			paras_registrar::Paras::<Rc>::iter().map(|(_, i)| i.manager).collect();
+		let mut ct_bound = Vec::new();
+		let mut nonce0 = Vec::new();
+		let mut dispatch = None;
+		for (who, (defs, _)) in pallet_proxy::Proxies::<Rc>::iter() {
+			if frame_system::Account::<Rc>::get(&who).nonce == 0 {
+				// `had_any` marks a possible v1-era pure (v1 retained `Any` defs for pures).
+				// A nonce-0 delegator WITHOUT `Any` defs necessarily created its entry via
+				// `as_multi` — no other dispatch path exists at nonce 0 with no prior defs and
+				// no post-v1 `create_pure` (verified by events and the spawner-reserve
+				// signature) — so it is a multisig, controllable on every chain by its members.
+				let had_any = defs
+					.iter()
+					.any(|d| P::try_from(d.proxy_type.clone()).ok() == Some(P::Any));
+				let existed = frame_system::Account::<Rc>::contains_key(&who);
+				nonce0.push((who.clone(), had_any, existed));
+			}
+			let linked = managers.contains(&who) ||
+				defs.iter().any(|d| managers.contains(&d.delegate)) ||
+				defs.iter().any(|d| {
+					P::try_from(d.proxy_type.clone()).ok() == Some(P::ParaRegistration)
+				});
+			if linked {
+				let any = defs
+					.iter()
+					.find(|d| P::try_from(d.proxy_type.clone()).ok() == Some(P::Any));
+				let reg = defs.iter().find(|d| {
+					P::try_from(d.proxy_type.clone()).ok() == Some(P::ParaRegistration)
+				});
+				if let (Some(any), Some(reg), None) = (any, reg, dispatch.as_ref()) {
+					dispatch =
+						Some((who.clone(), any.delegate.clone(), reg.delegate.clone()));
+				}
+				ct_bound.push(who.clone());
+			}
+		}
+		let dispatch =
+			dispatch.expect("snapshot has a manager with Any + ParaRegistration proxies");
+		(ct_bound, nonce0, dispatch)
+	});
+	assert!(!ct_bound_proxies.is_empty(), "live snapshot has manager-linked proxies");
+
 	let ct_ti_before = ct.execute_with(|| {
 		crate::events::emit_ct_census("before");
 		pallet_balances::TotalIssuance::<Ct>::get()
 	});
-	let (ah_ti_before, ah_checking_before, ah_sample_before) = ah.execute_with(|| {
+	let (ah_ti_before, ah_checking_before, ah_sample_before, deny_list) = ah.execute_with(|| {
 		// Baseline probe so the event stream carries the checking account's pre-migration
 		// value; the monitor measures the teleport receipts as the drain from this baseline.
 		crate::events::emit_para_block(Chain::AssetHub);
+
+		// The off-chain pre-flight: possible pures (never signed, hold `Any` defs) whose
+		// control on AH cannot be verified must not migrate — their funds would strand.
+		let deny: Vec<_> = nonce0_delegators
+			.iter()
+			.filter(|(who, had_any, _)| {
+				*had_any &&
+					frame_system::Account::<Ah>::get(who).nonce == 0 &&
+					pallet_proxy::Proxies::<Ah>::get(who).0.is_empty()
+			})
+			.map(|(who, ..)| who.clone())
+			.collect();
+
 		let checking = pallet_xcm::Pallet::<Ah>::check_account();
 		(
 			pallet_balances::TotalIssuance::<Ah>::get(),
 			frame_system::Account::<Ah>::get(&checking).data.free,
 			frame_system::Account::<Ah>::get(&sample.0).data.free,
+			deny,
 		)
 	});
 
-	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks.
+	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks. The
+	// pre-flight deny list is pinned first, as governance would ahead of the real run.
 	rc.execute_with(|| {
+		pallet_rc2_migrator::Pallet::<Rc>::hold_back_accounts(
+			polkadot_runtime::RuntimeOrigin::root(),
+			deny_list.clone(),
+		)
+		.expect("root may pin the deny list");
 		let start = frame_system::Pallet::<Rc>::block_number() + 1;
 		pallet_rc2_migrator::Pallet::<Rc>::force_set_stage(
 			polkadot_runtime::RuntimeOrigin::root(),
@@ -742,6 +810,15 @@ async fn full_migration_rc_to_ct() {
 		.expect("root may set the stage");
 	});
 	rc.commit_all().unwrap();
+	// Deny-listed accounts that actually hold funds; the fund-less ones are v1 husks whose
+	// accounts never existed (only their proxy entries do).
+	let deny_funded: Vec<_> = rc.execute_with(|| {
+		deny_list
+			.iter()
+			.filter(|who| frame_system::Account::<Rc>::contains_key(*who))
+			.cloned()
+			.collect()
+	});
 
 	let mut rounds = 0;
 	loop {
@@ -792,7 +869,7 @@ async fn full_migration_rc_to_ct() {
 	}
 
 	// THEN the RC is drained: registrar and HRMP gone, issuance reduced by exactly the burn.
-	let tracker = rc.execute_with(|| {
+	let (tracker, migrated_nonce0) = rc.execute_with(|| {
 		crate::events::emit_rc_census("after");
 		assert!(
 			paras_registrar::Paras::<Rc>::iter().next().is_none(),
@@ -802,6 +879,49 @@ async fn full_migration_rc_to_ct() {
 			HrmpChannels::<Rc>::iter().next().is_none(),
 			"all HRMP channel records must be drained from the RC"
 		);
+		assert!(
+			runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter().next().is_none(),
+			"all pending HRMP requests must be dropped"
+		);
+
+		// No ghost proxy records: every remaining entry's recorded deposit is backed by an
+		// actual reserve, and the dispatch-check manager's translatable defs left for CT.
+		for (who, (_, deposit)) in pallet_proxy::Proxies::<Rc>::iter() {
+			assert!(
+				deposit <= frame_system::Account::<Rc>::get(&who).data.reserved,
+				"proxy entry of {who:?} claims a deposit that is not reserved"
+			);
+		}
+		let residual = pallet_proxy::Proxies::<Rc>::get(&proxy_dispatch.0).0;
+		assert!(
+			residual.iter().all(|d| {
+				migrator_types::PortableProxyType::try_from(d.proxy_type.clone()).is_err()
+			}),
+			"the manager's translatable defs must have left the RC"
+		);
+
+		// The deny-listed possible pures stayed whole: funds (where any existed) and proxy
+		// entries untouched.
+		for who in &deny_funded {
+			assert!(
+				frame_system::Account::<Rc>::contains_key(who),
+				"held-back possible pure {who:?} must keep its funds on the RC"
+			);
+		}
+		for who in &deny_list {
+			assert!(
+				!pallet_proxy::Proxies::<Rc>::get(who).0.is_empty(),
+				"held-back possible pure {who:?} must keep its proxy entry"
+			);
+		}
+
+		// Never-signed delegators whose accounts migrated away (fund-less husks never had an
+		// account to migrate): their AH-side control is asserted below.
+		let migrated_nonce0: Vec<_> = nonce0_delegators
+			.iter()
+			.filter(|(who, _, existed)| *existed && !frame_system::Account::<Rc>::contains_key(who))
+			.cloned()
+			.collect();
 		let tracker = RcMigratedBalance::<Rc>::get();
 		assert_eq!(
 			tracker.kept +
@@ -818,7 +938,7 @@ async fn full_migration_rc_to_ct() {
 			polkadot_runtime::TiCorrection::get(),
 			"TI correction burned exactly the audited amount"
 		);
-		tracker
+		(tracker, migrated_nonce0)
 	});
 	let migrated_ct = tracker.migrated_ct();
 
@@ -892,6 +1012,60 @@ async fn full_migration_rc_to_ct() {
 			"CT minted exactly the CT-bound burn"
 		);
 		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated_ct);
+
+		// AND every manager-linked delegator's definitions were recreated in the REAL proxy
+		// pallet, so keyless (pure) managers can dispatch here from day one.
+		assert!(FailedProxies::<Ct>::iter().next().is_none(), "no proxy set may fail");
+		for who in &ct_bound_proxies {
+			assert!(
+				!pallet_proxy::Proxies::<Ct>::get(who).0.is_empty(),
+				"manager-linked delegator {who:?} must have proxies on CT"
+			);
+		}
+
+		// Dispatch checks through the recreated definitions: the Any delegate acts for the
+		// manager; the ParaRegistration delegate is accepted but its filter allows nothing yet.
+		use sp_runtime::traits::Dispatchable;
+		let (manager, any_delegate, reg_delegate) = proxy_dispatch.clone();
+		let remark = || {
+			Box::new(coretime_polkadot_runtime::RuntimeCall::System(
+				frame_system::Call::remark_with_event { remark: b"via proxy".to_vec() },
+			))
+		};
+		let proxy_call = |force, delegate: &sp_runtime::AccountId32| {
+			coretime_polkadot_runtime::RuntimeCall::Proxy(pallet_proxy::Call::proxy {
+				real: sp_runtime::MultiAddress::Id(manager.clone()),
+				force_proxy_type: force,
+				call: remark(),
+			})
+			.dispatch(coretime_polkadot_runtime::RuntimeOrigin::signed(delegate.clone()))
+		};
+		let executed = |records: &[frame_system::EventRecord<_, _>]| {
+			records.iter().rev().find_map(|r| match &r.event {
+				coretime_polkadot_runtime::RuntimeEvent::Proxy(
+					pallet_proxy::Event::ProxyExecuted { result },
+				) => Some(result.clone()),
+				_ => None,
+			})
+		};
+
+		proxy_call(Some(coretime_polkadot_runtime::ProxyType::Any), &any_delegate)
+			.expect("Any delegate may dispatch for the pure manager");
+		assert_eq!(
+			executed(&frame_system::Pallet::<Ct>::events()),
+			Some(Ok(())),
+			"the Any-proxied call must execute"
+		);
+
+		proxy_call(
+			Some(coretime_polkadot_runtime::ProxyType::ParaRegistration),
+			&reg_delegate,
+		)
+		.expect("ParaRegistration delegate is recognised");
+		assert!(
+			matches!(executed(&frame_system::Pallet::<Ct>::events()), Some(Err(_))),
+			"the ParaRegistration filter must allow nothing until the registrar lands"
+		);
 	});
 
 	// AND Asset Hub received the teleports: issuance unchanged, the checking account (the "DOT
@@ -916,5 +1090,18 @@ async fn full_migration_rc_to_ct() {
 			ah_sample_before + ah_free_exp,
 			"the manager's free balance arrived on AH"
 		);
+
+		// Funds-follow-control invariant: every never-signed delegator whose funds left the RC
+		// must be controllable on AH — a key that signed there, proxy definitions (v1 migrated
+		// them for every possible pure), or the multisig inference from the capture above.
+		// A violation would mean teleporting money to an address nobody can use.
+		for (who, had_any, _) in &migrated_nonce0 {
+			assert!(
+				!had_any ||
+					frame_system::Account::<Ah>::get(who).nonce > 0 ||
+					!pallet_proxy::Proxies::<Ah>::get(who).0.is_empty(),
+				"possible pure {who:?} migrated but is not controllable on AH"
+			);
+		}
 	});
 }

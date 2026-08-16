@@ -14,7 +14,8 @@ frame-support = { workspace = true }
 frame-system = { workspace = true }
 log = { workspace = true }
 pallet-balances = { workspace = true }
-pallet-ct-migrator = { workspace = true }
+migrator-types = { workspace = true }
+pallet-proxy = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
 polkadot-runtime-common = { workspace = true }
 runtime-parachains = { workspace = true }
@@ -29,7 +30,8 @@ std = [
 	"frame-system/std",
 	"log/std",
 	"pallet-balances/std",
-	"pallet-ct-migrator/std",
+	"migrator-types/std",
+	"pallet-proxy/std",
 	"polkadot-parachain-primitives/std",
 	"polkadot-runtime-common/std",
 	"runtime-parachains/std",
@@ -41,7 +43,7 @@ runtime-benchmarks = [
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
 	"pallet-balances/runtime-benchmarks",
-	"pallet-ct-migrator/runtime-benchmarks",
+	"pallet-proxy/runtime-benchmarks",
 	"polkadot-parachain-primitives/runtime-benchmarks",
 	"polkadot-runtime-common/runtime-benchmarks",
 	"runtime-parachains/runtime-benchmarks",
@@ -52,7 +54,7 @@ try-runtime = [
 	"frame-support/try-runtime",
 	"frame-system/try-runtime",
 	"pallet-balances/try-runtime",
-	"pallet-ct-migrator/try-runtime",
+	"pallet-proxy/try-runtime",
 	"polkadot-runtime-common/try-runtime",
 	"runtime-parachains/try-runtime",
 	"sp-runtime/try-runtime",

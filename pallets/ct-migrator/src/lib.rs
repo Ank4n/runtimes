@@ -19,14 +19,15 @@
 //! registrations so that migrated and newly created state are identical. Temporary pallet;
 //! removed once the migration is complete.
 //!
-//! This crate also defines the portable payload types exchanged between the two migrators;
-//! `pallet-rc2-migrator` depends on this crate for them, so the dependency only points from the
-//! relay side to the coretime side.
+//! The portable payload types exchanged between the migrators live in the shared `migrator-types`
+//! crate (re-exported here for convenience), so no runtime depends on another chain's pallets
+//! just to speak the wire format.
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
 extern crate alloc;
 
+pub use migrator_types::*;
 pub use pallet::*;
 
 use alloc::vec::Vec;
@@ -41,7 +42,10 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
-use sp_runtime::traits::{AccountIdConversion, Saturating, Zero};
+use sp_runtime::{
+	traits::{AccountIdConversion, Saturating, Zero},
+	SaturatedConversion,
+};
 
 const LOG_TARGET: &str = "runtime::ct-migrator";
 
@@ -52,94 +56,7 @@ pub type PortableAccountOf<T> =
 pub type PortableParaInfoOf<T> =
 	PortableParaInfo<<T as frame_system::Config>::AccountId, BalanceOf<T>>;
 pub type PortableHrmpChannelOf<T> = PortableHrmpChannel<BalanceOf<T>>;
-
-/// Account balance payload in chain-agnostic ("portable") format.
-///
-/// The relay chain withdraws an account into this shape and the receiving chain integrates it
-/// through its regular fungible APIs, so refcounts and events are indistinguishable from locally
-/// created state.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
-)]
-pub struct PortableAccount<AccountId, Balance> {
-	/// The account address. Sent verbatim; no account-id translation happens for regular
-	/// accounts.
-	pub who: AccountId,
-	/// Balance that stays liquid on the receiving chain.
-	pub free: Balance,
-	/// Balance that was not liquid on the relay chain; re-established as holds on the receiving
-	/// chain, one per entry, translated via `From<PortableHoldReason>`.
-	pub holds: BoundedVec<PortableHold<Balance>, ConstU32<5>>,
-}
-
-/// One non-liquid part of a migrated account's balance.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
-)]
-pub struct PortableHold<Balance> {
-	pub reason: PortableHoldReason,
-	pub amount: Balance,
-}
-
-/// Chain-agnostic identity of balance that was not liquid on the relay chain.
-///
-/// This enum is the wire-level contract for hold translation: the relay-chain migrator classifies
-/// every non-liquid part of an account into one of these variants, and each receiving runtime
-/// declares what the variant becomes locally by implementing `From<PortableHoldReason>` for its
-/// `RuntimeHoldReason`. The mapping is therefore an explicit `match` per runtime, with no
-/// pallet-index coupling on the wire.
-#[derive(
-	Encode,
-	Decode,
-	DecodeWithMemTracking,
-	Copy,
-	Clone,
-	PartialEq,
-	Eq,
-	Debug,
-	TypeInfo,
-	MaxEncodedLen,
-)]
-pub enum PortableHoldReason {
-	/// Reserved on the relay chain without a named reason, via the old `Currency` API — how all
-	/// relay-chain deposits (`paras_registrar`, `hrmp`, `proxy`) are placed. Attribution to the
-	/// pallet owning the deposit happens when that pallet's own state migrates.
-	#[codec(index = 0)]
-	UnnamedReserve,
-}
-
-/// Registrar record (`paras_registrar::ParaInfo`) in portable format.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
-)]
-pub struct PortableParaInfo<AccountId, Balance> {
-	pub para_id: u32,
-	/// The account that placed the registration deposit and manages the para.
-	pub manager: AccountId,
-	/// The deposit as recorded by the registrar. Reconciled against the balance that actually
-	/// arrived held during the accounts stage; never trusted on its own.
-	pub deposit: Balance,
-	/// Whether the para is locked from manager control.
-	pub locked: Option<bool>,
-}
-
-/// HRMP channel record in portable format.
-///
-/// Records only: the channel deposits stay reserved on the para sovereign accounts on the relay
-/// chain because sovereign-account translation is not designed yet, and the dynamic message state
-/// (`msg_count`, `total_size`, `mqc_head`) is deliberately not migrated.
-#[derive(
-	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
-)]
-pub struct PortableHrmpChannel<Balance> {
-	pub sender: u32,
-	pub recipient: u32,
-	pub max_capacity: u32,
-	pub max_total_size: u32,
-	pub max_message_size: u32,
-	pub sender_deposit: Balance,
-	pub recipient_deposit: Balance,
-}
+pub type PortableProxyOf<T> = PortableProxy<<T as frame_system::Config>::AccountId>;
 
 /// Progress of the migration. Advanced by messages from `pallet-rc2-migrator`.
 #[derive(
@@ -176,7 +93,13 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config:
+		frame_system::Config
+		// Migrated proxy delegations are written into the real proxy pallet so keyless (pure)
+		// delegators are dispatchable here from day one. The wire format only carries
+		// permissions this chain represents, hence the total `From` bound.
+		+ pallet_proxy::Config<ProxyType: From<PortableProxyType>>
+	{
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
@@ -263,6 +186,11 @@ pub mod pallet {
 	pub type FailedHrmpChannels<T: Config> =
 		StorageMap<_, Twox64Concat, (u32, u32), PortableHrmpChannelOf<T>, OptionQuery>;
 
+	/// Migrated proxy sets that failed to integrate, parked verbatim for manual recovery.
+	#[pallet::storage]
+	pub type FailedProxies<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, PortableProxyOf<T>, OptionQuery>;
+
 	/// Per-para shortfall between the registrar-recorded deposit and what actually arrived held.
 	///
 	/// Reconciliation rule: re-attribute `min(recorded, held)`, park the difference here — the
@@ -295,6 +223,8 @@ pub mod pallet {
 		FailedToProcessPara,
 		/// Failed to flip a migrated reserve to its attributed hold reason.
 		FailedToReattribute,
+		/// Failed to integrate a migrated proxy set.
+		FailedToProcessProxy,
 	}
 
 	#[pallet::event]
@@ -328,6 +258,11 @@ pub mod pallet {
 			sender: u32,
 			recipient: u32,
 			shortfall: BalanceOf<T>,
+		},
+		/// A batch of migrated proxy sets was processed.
+		ProxiesReceived {
+			count_good: u32,
+			count_bad: u32,
 		},
 		/// The relay chain signalled that all data has been sent.
 		MigrationFinished {
@@ -391,6 +326,27 @@ pub mod pallet {
 			ensure_root(origin)?;
 
 			Self::do_receive_hrmp(channels);
+			Ok(())
+		}
+
+		/// Receive a batch of manager-linked proxy sets migrated from the relay chain.
+		///
+		/// Delegations are written into the real proxy pallet, merged with any existing local
+		/// ones, and backed by a deposit at THIS chain's rates reserved from the delegator's
+		/// local balance (the accounts stage provides the working buffer). If the reserve cannot
+		/// be taken the entry is still written — access for keyless delegators outranks the
+		/// deposit — and the shortfall is logged.
+		#[pallet::call_index(4)]
+		#[pallet::weight(
+			T::DbWeight::get().reads_writes(3, 3).saturating_mul((proxies.len() as u64).max(1))
+		)]
+		pub fn receive_proxies(
+			origin: OriginFor<T>,
+			proxies: Vec<PortableProxyOf<T>>,
+		) -> DispatchResult {
+			ensure_root(origin)?;
+
+			Self::do_receive_proxies(proxies);
 			Ok(())
 		}
 
@@ -468,19 +424,19 @@ pub mod pallet {
 			// Accounts whose incoming free balance cannot provide the existential deposit get a
 			// provider reference so the mint and hold below cannot fail or dust the account.
 			if frame_system::Pallet::<T>::providers(who).is_zero() &&
-				T::Currency::balance(who).saturating_add(account.free) <
-					T::Currency::minimum_balance()
+				<T as Config>::Currency::balance(who).saturating_add(account.free) <
+					<T as Config>::Currency::minimum_balance()
 			{
 				frame_system::Pallet::<T>::inc_providers(who);
 			}
 
-			let minted = T::Currency::mint_into(who, total)
+			let minted = <T as Config>::Currency::mint_into(who, total)
 				.map_err(|_| Error::<T>::FailedToProcessAccount)?;
 			defensive_assert!(minted == total, "minted what the relay chain burned");
 			CtMintedTotal::<T>::mutate(|t| *t = t.saturating_add(minted));
 
 			for hold in &account.holds {
-				T::Currency::hold(&hold.reason.into(), who, hold.amount)
+				<T as Config>::Currency::hold(&hold.reason.into(), who, hold.amount)
 					.map_err(|_| Error::<T>::FailedToProcessAccount)?;
 			}
 
@@ -531,13 +487,13 @@ pub mod pallet {
 			to: HoldReason,
 		) -> Result<(BalanceOf<T>, BalanceOf<T>), Error<T>> {
 			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
-			let held = T::Currency::balance_on_hold(&rc_reason, who);
+			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, who);
 			let attribute = wanted.min(held);
 
 			if !attribute.is_zero() {
-				T::Currency::release(&rc_reason, who, attribute, Precision::Exact)
+				<T as Config>::Currency::release(&rc_reason, who, attribute, Precision::Exact)
 					.map_err(|_| Error::<T>::FailedToReattribute)?;
-				T::Currency::hold(&to.into(), who, attribute)
+				<T as Config>::Currency::hold(&to.into(), who, attribute)
 					.map_err(|_| Error::<T>::FailedToReattribute)?;
 			}
 			Ok((attribute, wanted.saturating_sub(attribute)))
@@ -560,6 +516,76 @@ pub mod pallet {
 
 			RcParas::<T>::insert(para.para_id, para.clone());
 			Ok(())
+		}
+
+		fn do_receive_proxies(proxies: Vec<PortableProxyOf<T>>) {
+			let (mut count_good, mut count_bad) = (0, 0);
+			for proxy in proxies {
+				// Each proxy set integrates in its own transaction so one bad set cannot poison
+				// the batch.
+				let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
+					match Self::do_receive_proxy(&proxy) {
+						Ok(()) => TransactionOutcome::Commit(Ok(())),
+						Err(e) => TransactionOutcome::Rollback(Err(e)),
+					}
+				})
+				.expect("Always returning Ok; qed");
+
+				if let Err(e) = res {
+					count_bad += 1;
+					log::error!(
+						target: LOG_TARGET,
+						"Failed to integrate proxies of {:?}: {e:?}; parking them",
+						proxy.delegator,
+					);
+					FailedProxies::<T>::insert(proxy.delegator.clone(), proxy);
+				} else {
+					count_good += 1;
+				}
+			}
+			Self::deposit_event(Event::ProxiesReceived { count_good, count_bad });
+		}
+
+		fn do_receive_proxy(proxy: &PortableProxyOf<T>) -> Result<(), Error<T>> {
+			use frame_support::traits::ReservableCurrency;
+
+			pallet_proxy::Proxies::<T>::try_mutate(&proxy.delegator, |(defs, deposit)| {
+				for delegate in proxy.delegates.iter() {
+					let def = pallet_proxy::ProxyDefinition {
+						delegate: delegate.delegate.clone(),
+						proxy_type: delegate.proxy_type.into(),
+						// Relay-chain blocks are 6s, this chain's are 12s.
+						delay: (delegate.delay / 2).saturated_into(),
+					};
+					if !defs.contains(&def) {
+						defs.try_push(def).map_err(|_| Error::<T>::FailedToProcessProxy)?;
+					}
+				}
+
+				// Back the entry at this chain's rates from the delegator's local balance,
+				// topping up whatever is already reserved for pre-existing local proxies.
+				let required = <T as pallet_proxy::Config>::ProxyDepositBase::get().saturating_add(
+					<T as pallet_proxy::Config>::ProxyDepositFactor::get()
+						.saturating_mul((defs.len() as u32).into()),
+				);
+				let top_up = required.saturating_sub(*deposit);
+				if !top_up.is_zero() {
+					match <T as pallet_proxy::Config>::Currency::reserve(
+						&proxy.delegator,
+						top_up,
+					) {
+						Ok(()) => *deposit = required,
+						// Access outranks the deposit; the entry stays under-backed until the
+						// owner tops it up.
+						Err(_) => log::warn!(
+							target: LOG_TARGET,
+							"Proxies of {:?} under-backed: could not reserve {top_up:?}",
+							proxy.delegator,
+						),
+					}
+				}
+				Ok(())
+			})
 		}
 
 		fn do_receive_hrmp(channels: Vec<PortableHrmpChannelOf<T>>) {

@@ -170,6 +170,24 @@ pub fn emit_rc_block() {
 				),
 				MigEvent::AccountsBatchSent { count } =>
 					emit("rc", block, "accounts_batch_sent", json!({ "count": count })),
+				MigEvent::DepositRefunded { who, amount } => emit(
+					"rc",
+					block,
+					"deposit_refunded",
+					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
+				),
+				MigEvent::ProxyBatchSent { count } =>
+					emit("rc", block, "proxy_batch_sent", json!({ "count": count })),
+				MigEvent::HrmpRequestDropped { sender, recipient, deposit } => emit(
+					"rc",
+					block,
+					"hrmp_request_dropped",
+					json!({
+						"sender": sender,
+						"recipient": recipient,
+						"deposit": planck(deposit),
+					}),
+				),
 				MigEvent::AccountsTeleported { count, amount } => emit(
 					"rc",
 					block,
@@ -230,6 +248,7 @@ pub fn emit_rc_block() {
 			"ti_corrected": planck(tracker.ti_corrected),
 			"paras": polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter().count(),
 			"hrmp_channels": runtime_parachains::hrmp::HrmpChannels::<Rc>::iter().count(),
+			"proxies": pallet_proxy::Proxies::<Rc>::iter().count(),
 		}),
 	);
 }
@@ -298,6 +317,12 @@ fn emit_ct_block() {
 				),
 				MigEvent::HrmpReceived { count } =>
 					emit("ct", block, "hrmp_received", json!({ "count": count })),
+				MigEvent::ProxiesReceived { count_good, count_bad } => emit(
+					"ct",
+					block,
+					"proxies_received",
+					json!({ "good": count_good, "bad": count_bad }),
+				),
 				MigEvent::HrmpShortfallParked { sender, recipient, shortfall } => emit(
 					"ct",
 					block,
@@ -341,6 +366,7 @@ fn emit_ct_block() {
 			"failed_accounts": pallet_ct_migrator::FailedAccounts::<Ct>::iter().count(),
 			"failed_paras": pallet_ct_migrator::FailedParas::<Ct>::iter().count(),
 			"failed_hrmp": pallet_ct_migrator::FailedHrmpChannels::<Ct>::iter().count(),
+			"failed_proxies": pallet_ct_migrator::FailedProxies::<Ct>::iter().count(),
 			"parked_shortfalls": pallet_ct_migrator::ParkedDepositShortfalls::<Ct>::iter().count(),
 			"parked_hrmp_shortfalls": pallet_ct_migrator::ParkedHrmpShortfalls::<Ct>::iter().count(),
 		}),

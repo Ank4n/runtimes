@@ -8,21 +8,25 @@ authors.workspace = true
 repository.workspace = true
 
 [dependencies]
+migrator-types = { workspace = true }
 codec = { workspace = true, features = ["max-encoded-len"] }
 scale-info = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
 log = { workspace = true }
+pallet-proxy = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
 sp-runtime = { workspace = true }
 
 [features]
 default = ["std"]
 std = [
+	"migrator-types/std",
 	"codec/std",
 	"frame-support/std",
 	"frame-system/std",
 	"log/std",
+	"pallet-proxy/std",
 	"polkadot-parachain-primitives/std",
 	"scale-info/std",
 	"sp-runtime/std",
@@ -30,11 +34,13 @@ std = [
 runtime-benchmarks = [
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
+	"pallet-proxy/runtime-benchmarks",
 	"polkadot-parachain-primitives/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 ]
 try-runtime = [
 	"frame-support/try-runtime",
 	"frame-system/try-runtime",
+	"pallet-proxy/try-runtime",
 	"sp-runtime/try-runtime",
 ]

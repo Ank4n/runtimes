@@ -1166,6 +1166,26 @@ impl From<TransparentProxyType<ProxyType>> for ProxyType {
 	}
 }
 
+/// Which proxy permissions travel to the Coretime chain in the migration. Permissions with no
+/// meaning there (staking, governance, …) return `Err` and their definitions stay on this chain.
+impl TryFrom<TransparentProxyType<ProxyType>> for migrator_types::PortableProxyType {
+	type Error = ();
+
+	fn try_from(t: TransparentProxyType<ProxyType>) -> Result<Self, ()> {
+		use migrator_types::PortableProxyType as P;
+		match t.0 {
+			ProxyType::Any => Ok(P::Any),
+			ProxyType::NonTransfer => Ok(P::NonTransfer),
+			ProxyType::CancelProxy => Ok(P::CancelProxy),
+			ProxyType::ParaRegistration => Ok(P::ParaRegistration),
+			ProxyType::Governance |
+			ProxyType::Staking |
+			ProxyType::Auction |
+			ProxyType::NominationPools => Err(()),
+		}
+	}
+}
+
 impl<T: scale_info::TypeInfo> scale_info::TypeInfo for TransparentProxyType<T> {
 	type Identity = T::Identity;
 

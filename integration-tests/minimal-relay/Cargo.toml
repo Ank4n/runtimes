@@ -8,6 +8,7 @@ description = "Polkadot integration tests for the Minimal Relay migration"
 publish = false
 
 [dependencies]
+migrator-types = { workspace = true, default-features = true }
 codec = { workspace = true, default-features = true }
 cumulus-pallet-parachain-system = { workspace = true, default-features = true }
 cumulus-primitives-core = { workspace = true, default-features = true }

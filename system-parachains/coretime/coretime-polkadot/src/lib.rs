@@ -547,6 +547,25 @@ pub enum ProxyType {
 	OnDemandPurchaser,
 	/// Collator selection proxy. Can execute calls related to collator selection mechanism.
 	Collator,
+	/// Proxy for parachain registration operations.
+	///
+	/// Migrated from the relay chain (AHM v2) ahead of the registrar pallet itself, preserving
+	/// the permission's exact scope; allows nothing until that pallet lands.
+	ParaRegistration,
+}
+
+/// What each migrated relay-chain proxy permission becomes locally. Total by construction: the
+/// relay side only sends permissions this chain represents.
+impl From<pallet_ct_migrator::PortableProxyType> for ProxyType {
+	fn from(portable: pallet_ct_migrator::PortableProxyType) -> Self {
+		use pallet_ct_migrator::PortableProxyType as P;
+		match portable {
+			P::Any => ProxyType::Any,
+			P::NonTransfer => ProxyType::NonTransfer,
+			P::CancelProxy => ProxyType::CancelProxy,
+			P::ParaRegistration => ProxyType::ParaRegistration,
+		}
+	}
 }
 
 impl InstanceFilter<RuntimeCall> for ProxyType {
@@ -608,6 +627,11 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
 					RuntimeCall::Utility { .. } |
 					RuntimeCall::Multisig { .. }
 			),
+			// TODO: allow the registrar calls (+ Utility/Multisig wrappers) once the parachain
+			// registration pallet lands on this chain. Deliberately allows nothing until then so
+			// migrated `ParaRegistration` proxies keep their exact scope instead of being
+			// escalated.
+			ProxyType::ParaRegistration => false,
 		}
 	}
 
