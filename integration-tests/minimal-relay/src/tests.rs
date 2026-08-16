@@ -388,6 +388,57 @@ async fn balance_census() {
 			println!("hrmp sovereigns: {exact} exact, {short} short (anomaly), {over} over-reserved");
 		}
 
+		// Who would remain on the RC after the migration and why — the "RC → 0" gap list.
+		{
+			use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
+			type Rc = polkadot_runtime::Runtime;
+			let ss58 = |a: &sp_runtime::AccountId32| {
+				a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
+			};
+			let dot = |v: u128| v as f64 / 1e10;
+			let ed = <pallet_balances::Pallet<Rc> as frame_support::traits::fungible::Inspect<
+				sp_runtime::AccountId32,
+			>>::minimum_balance();
+
+			println!("\n### remaining-on-RC gap list (accounts the migration cannot move)");
+			let (mut dust_n, mut dust_amt) = (0u32, 0u128);
+			for (who, info) in frame_system::Account::<Rc>::iter() {
+				let d = &info.data;
+				let total = d.free + d.reserved;
+				let bytes: &[u8] = who.as_ref();
+				if bytes.starts_with(b"modl") {
+					let name = String::from_utf8_lossy(&bytes[4..12]);
+					println!(
+						"module `{}`: {} | free {:.4} reserved {:.4}",
+						name.trim_end_matches('\0'), ss58(&who), dot(d.free), dot(d.reserved),
+					);
+				} else if bytes.starts_with(b"sibl") {
+					let para = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+					println!(
+						"sibl sovereign of para {para}: {} | free {:.4} reserved {:.4}",
+						ss58(&who), dot(d.free), dot(d.reserved),
+					);
+				} else if total < ed {
+					dust_n += 1;
+					dust_amt += total;
+				} else {
+					// Would this account fail withdrawal? Consumer refs beyond the one its
+					// reserve accounts for mean some pallet still references it.
+					let expected = u32::from(d.reserved > 0);
+					if info.consumers > expected {
+						let keys =
+							pallet_session::NextKeys::<Rc>::get(&who).is_some();
+						println!(
+							"referenced: {} | free {:.4} reserved {:.4} consumers {} \
+							 session-keys {}",
+							ss58(&who), dot(d.free), dot(d.reserved), info.consumers, keys,
+						);
+					}
+				}
+			}
+			println!("below-ED dust: {dust_n} accounts, {:.4} DOT", dot(dust_amt));
+		}
+
 		// The Balances pallet's own storage keys: how many are empty leftovers, and how many
 		// belong to accounts that no longer exist (v1 reaped the account, the key survived).
 		{
