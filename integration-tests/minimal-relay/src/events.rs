@@ -178,6 +178,18 @@ pub fn emit_rc_block() {
 				),
 				MigEvent::ProxyBatchSent { count } =>
 					emit("rc", block, "proxy_batch_sent", json!({ "count": count })),
+				MigEvent::AccountSwept { who, amount } => emit(
+					"rc",
+					block,
+					"account_swept",
+					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
+				),
+				MigEvent::DustSwept { count, amount } => emit(
+					"rc",
+					block,
+					"dust_swept",
+					json!({ "count": count, "amount": planck(amount) }),
+				),
 				MigEvent::HrmpRequestsSent { count } =>
 					emit("rc", block, "hrmp_requests_sent", json!({ "count": count })),
 				MigEvent::AccountsTeleported { count, amount } => emit(
