@@ -42,8 +42,8 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 use migrator_types::{
-	PortableAccount, PortableHold, PortableHoldReason, PortableHrmpChannel, PortableParaInfo,
-	PortableProxy, PortableProxyType,
+	PortableAccount, PortableHold, PortableHoldReason, PortableHrmpChannel, PortableHrmpRequest,
+	PortableParaInfo, PortableProxy, PortableProxyType,
 };
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
 use polkadot_runtime_common::paras_registrar;
@@ -165,6 +165,8 @@ pub enum CtMigratorCall {
 	FinishMigration { rc_kept: u128, rc_migrated: u128 },
 	#[codec(index = 4)]
 	ReceiveProxies { proxies: Vec<PortableProxy<AccountId32>> },
+	#[codec(index = 5)]
+	ReceiveHrmpRequests { requests: Vec<PortableHrmpRequest<u128>> },
 }
 
 /// Balance conservation bookkeeping for the migration.
@@ -272,9 +274,8 @@ pub mod pallet {
 		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
 
 	/// How much reserved balance each account gets *refunded* (released and teleported to Asset
-	/// Hub as free): proxy deposits and pending HRMP open-channel-request deposits — deposits
-	/// whose purpose does not continue anywhere. Built by `AccountsInit` like
-	/// [`ExpectedCtReserve`].
+	/// Hub as free): proxy deposits, whose entries are recreated deposit-free or backed at the
+	/// destination's own rates. Built by `AccountsInit` like [`ExpectedCtReserve`].
 	#[pallet::storage]
 	pub type ExpectedRefundReserve<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
@@ -325,8 +326,7 @@ pub mod pallet {
 			free: u128,
 			reserved: u128,
 		},
-		/// A reserve whose purpose does not continue (proxy deposit, pending HRMP request
-		/// deposit) was released and refunded: it travels to Asset Hub as free balance.
+		/// A proxy deposit was released and refunded: it travels to Asset Hub as free balance.
 		DepositRefunded {
 			who: AccountId32,
 			amount: u128,
@@ -335,12 +335,9 @@ pub mod pallet {
 		ProxyBatchSent {
 			count: u32,
 		},
-		/// A pending HRMP open-channel request was dropped; its deposit is refunded via the
-		/// accounts stage. Requests cannot complete once HRMP has left this chain.
-		HrmpRequestDropped {
-			sender: u32,
-			recipient: u32,
-			deposit: u128,
+		/// Pending HRMP open-channel requests were sent to the Coretime chain.
+		HrmpRequestsSent {
+			count: u32,
 		},
 		/// Phantom issuance burned: `burned = min(expected, unaccounted)`. Any
 		/// `unaccounted - burned` remainder is left on the books for investigation.
@@ -497,10 +494,26 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::HrmpInit => {
-					let dropped = hrmp::HrmpMigrator::<T>::drop_open_requests();
-					log::info!(target: LOG_TARGET, "Dropped {dropped} pending HRMP requests");
-					Self::transition(MigrationStage::HrmpOngoing { last_key: None });
-					T::DbWeight::get().reads_writes(2, 2)
+					// Drain, send and record-removal commit or roll back together so a failed
+					// send retries whole next block.
+					let res = with_transaction_opaque_err::<u32, Error<T>, _>(|| {
+						match hrmp::HrmpMigrator::<T>::drain_open_requests() {
+							Ok(count) => TransactionOutcome::Commit(Ok(count)),
+							Err(e) => TransactionOutcome::Rollback(Err(e)),
+						}
+					})
+					.expect("Always returning Ok; qed");
+
+					match res {
+						Ok(count) => {
+							Self::deposit_event(Event::HrmpRequestsSent { count });
+							Self::transition(MigrationStage::HrmpOngoing { last_key: None });
+						},
+						Err(e) => {
+							defensive!("HRMP request drain failed, retrying: {:?}", e);
+						},
+					}
+					T::DbWeight::get().reads_writes(200, 200)
 				},
 				MigrationStage::HrmpOngoing { last_key } => {
 					Self::migrate_stage_step(
@@ -609,6 +622,13 @@ pub mod pallet {
 			Self::send_to_ct(CtMigratorCall::ReceiveProxies { proxies })?;
 			Self::deposit_event(Event::ProxyBatchSent { count });
 			Ok(())
+		}
+
+		/// Send a batch of pending HRMP open-channel requests to the Coretime chain.
+		pub(crate) fn send_hrmp_requests(
+			requests: Vec<PortableHrmpRequest<u128>>,
+		) -> Result<(), Error<T>> {
+			Self::send_to_ct(CtMigratorCall::ReceiveHrmpRequests { requests })
 		}
 
 		/// Send a batch of drained HRMP channel records to the Coretime chain.

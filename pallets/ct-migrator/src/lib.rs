@@ -56,6 +56,7 @@ pub type PortableAccountOf<T> =
 pub type PortableParaInfoOf<T> =
 	PortableParaInfo<<T as frame_system::Config>::AccountId, BalanceOf<T>>;
 pub type PortableHrmpChannelOf<T> = PortableHrmpChannel<BalanceOf<T>>;
+pub type PortableHrmpRequestOf<T> = PortableHrmpRequest<BalanceOf<T>>;
 pub type PortableProxyOf<T> = PortableProxy<<T as frame_system::Config>::AccountId>;
 
 /// Progress of the migration. Advanced by messages from `pallet-rc2-migrator`.
@@ -113,6 +114,11 @@ pub mod pallet {
 		/// The `From<PortableHoldReason>` bound is where the runtime declares what each migrated
 		/// relay-chain hold becomes locally.
 		type RuntimeHoldReason: From<HoldReason> + From<PortableHoldReason>;
+
+		/// How many of this chain's blocks fit in one relay-chain block's time. Used to convert
+		/// migrated proxy delays (relay: 6s blocks; this chain: 12s → ratio 2).
+		#[pallet::constant]
+		type RcBlockTimeRatio: Get<u32>;
 	}
 
 	#[pallet::composite_enum]
@@ -175,6 +181,12 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type RcHrmpChannels<T: Config> =
 		StorageMap<_, Twox64Concat, (u32, u32), PortableHrmpChannelOf<T>, OptionQuery>;
+
+	/// Dummy stand-in for the future HRMP pallet's pending open-channel requests, keyed by
+	/// `(sender, recipient)`. The future system decides whether these handshakes can finish.
+	#[pallet::storage]
+	pub type RcHrmpOpenRequests<T: Config> =
+		StorageMap<_, Twox64Concat, (u32, u32), PortableHrmpRequestOf<T>, OptionQuery>;
 
 	/// Registrar records that failed to integrate, parked verbatim for manual recovery.
 	#[pallet::storage]
@@ -264,6 +276,10 @@ pub mod pallet {
 			count_good: u32,
 			count_bad: u32,
 		},
+		/// A batch of pending HRMP open-channel requests was processed.
+		HrmpRequestsReceived {
+			count: u32,
+		},
 		/// The relay chain signalled that all data has been sent.
 		MigrationFinished {
 			rc_kept: BalanceOf<T>,
@@ -347,6 +363,25 @@ pub mod pallet {
 			ensure_root(origin)?;
 
 			Self::do_receive_proxies(proxies);
+			Ok(())
+		}
+
+		/// Receive a batch of pending HRMP open-channel requests migrated from the relay chain.
+		///
+		/// Each record is stored verbatim and the sender's deposit — which arrived as an
+		/// `RcMigratedReserve` hold on the sibling sovereign during the accounts stage — is
+		/// re-labelled `HrmpDeposit`, same rule as channel deposits.
+		#[pallet::call_index(5)]
+		#[pallet::weight(
+			T::DbWeight::get().reads_writes(4, 4).saturating_mul((requests.len() as u64).max(1))
+		)]
+		pub fn receive_hrmp_requests(
+			origin: OriginFor<T>,
+			requests: Vec<PortableHrmpRequestOf<T>>,
+		) -> DispatchResult {
+			ensure_root(origin)?;
+
+			Self::do_receive_hrmp_requests(requests);
 			Ok(())
 		}
 
@@ -554,8 +589,8 @@ pub mod pallet {
 					let def = pallet_proxy::ProxyDefinition {
 						delegate: delegate.delegate.clone(),
 						proxy_type: delegate.proxy_type.into(),
-						// Relay-chain blocks are 6s, this chain's are 12s.
-						delay: (delegate.delay / 2).saturated_into(),
+						delay: (delegate.delay / T::RcBlockTimeRatio::get().max(1))
+							.saturated_into(),
 					};
 					if !defs.contains(&def) {
 						defs.try_push(def).map_err(|_| Error::<T>::FailedToProcessProxy)?;
@@ -617,6 +652,47 @@ pub mod pallet {
 			if count_bad > 0 {
 				log::error!(target: LOG_TARGET, "{count_bad} HRMP channels parked");
 			}
+		}
+
+		fn do_receive_hrmp_requests(requests: Vec<PortableHrmpRequestOf<T>>) {
+			let mut count = 0;
+			for request in requests {
+				// Same per-item transaction pattern as everything else; a failed re-label parks
+				// nothing here because the record itself always stores fine — the deposit simply
+				// stays under `RcMigratedReserve` and shows up in the parked-shortfall checks.
+				let sovereign: T::AccountId =
+					Sibling::from(ParaId::from(request.sender)).into_account_truncating();
+				match Self::reattribute_hold(
+					&sovereign,
+					request.sender_deposit,
+					HoldReason::HrmpDeposit,
+				) {
+					Ok((attributed, shortfall)) => {
+						ReattributedHrmpDeposits::<T>::mutate(|t| {
+							*t = t.saturating_add(attributed)
+						});
+						if !shortfall.is_zero() {
+							ParkedHrmpShortfalls::<T>::insert(
+								(request.sender, request.recipient, true),
+								shortfall,
+							);
+							Self::deposit_event(Event::HrmpShortfallParked {
+								sender: request.sender,
+								recipient: request.recipient,
+								shortfall,
+							});
+						}
+					},
+					Err(e) => log::error!(
+						target: LOG_TARGET,
+						"Failed to re-label request deposit {}->{}: {e:?}",
+						request.sender, request.recipient,
+					),
+				}
+				RcHrmpOpenRequests::<T>::insert((request.sender, request.recipient), request);
+				count += 1;
+			}
+			Self::deposit_event(Event::HrmpRequestsReceived { count });
 		}
 
 		fn do_receive_channel(channel: &PortableHrmpChannelOf<T>) -> Result<(), Error<T>> {

@@ -178,16 +178,8 @@ pub fn emit_rc_block() {
 				),
 				MigEvent::ProxyBatchSent { count } =>
 					emit("rc", block, "proxy_batch_sent", json!({ "count": count })),
-				MigEvent::HrmpRequestDropped { sender, recipient, deposit } => emit(
-					"rc",
-					block,
-					"hrmp_request_dropped",
-					json!({
-						"sender": sender,
-						"recipient": recipient,
-						"deposit": planck(deposit),
-					}),
-				),
+				MigEvent::HrmpRequestsSent { count } =>
+					emit("rc", block, "hrmp_requests_sent", json!({ "count": count })),
 				MigEvent::AccountsTeleported { count, amount } => emit(
 					"rc",
 					block,
@@ -323,6 +315,8 @@ fn emit_ct_block() {
 					"proxies_received",
 					json!({ "good": count_good, "bad": count_bad }),
 				),
+				MigEvent::HrmpRequestsReceived { count } =>
+					emit("ct", block, "hrmp_requests_received", json!({ "count": count })),
 				MigEvent::HrmpShortfallParked { sender, recipient, shortfall } => emit(
 					"ct",
 					block,
@@ -363,6 +357,7 @@ fn emit_ct_block() {
 			"reattributed_hrmp": planck(pallet_ct_migrator::ReattributedHrmpDeposits::<Ct>::get()),
 			"paras": pallet_ct_migrator::RcParas::<Ct>::iter().count(),
 			"hrmp_channels": pallet_ct_migrator::RcHrmpChannels::<Ct>::iter().count(),
+			"hrmp_requests": pallet_ct_migrator::RcHrmpOpenRequests::<Ct>::iter().count(),
 			"failed_accounts": pallet_ct_migrator::FailedAccounts::<Ct>::iter().count(),
 			"failed_paras": pallet_ct_migrator::FailedParas::<Ct>::iter().count(),
 			"failed_hrmp": pallet_ct_migrator::FailedHrmpChannels::<Ct>::iter().count(),
