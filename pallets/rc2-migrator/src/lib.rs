@@ -119,6 +119,9 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 		last_key: Option<HrmpChannelId>,
 	},
 	HrmpDone,
+	/// Empty the configured leftover pots (old treasury, …) and reap below-ED dust; everything
+	/// teleports to `Config::SweepBeneficiary` on Asset Hub.
+	Sweep,
 	/// Burn the audited amount of issuance that no account holds (see `Config::TiCorrection`).
 	TiCorrection,
 	/// All data sent; waiting for manual verification before finishing.
@@ -242,6 +245,14 @@ pub mod pallet {
 		/// Para id of Asset Hub, the destination of teleported free balances.
 		type AhParaId: Get<u32>;
 
+		/// Leftover module pots to empty in the `Sweep` stage (e.g. the old treasury pot).
+		/// Their full balance teleports to `SweepBeneficiary`.
+		type SweepAccounts: Get<Vec<AccountId32>>;
+
+		/// Where swept pots and dust land on Asset Hub — the treasury / DAP buffer account
+		/// designated by governance.
+		type SweepBeneficiary: Get<AccountId32>;
+
 		/// The audited amount of total issuance that no account holds ("phantom issuance"),
 		/// burned by the `TiCorrection` stage at the end of the migration.
 		///
@@ -338,6 +349,16 @@ pub mod pallet {
 		/// Pending HRMP open-channel requests were sent to the Coretime chain.
 		HrmpRequestsSent {
 			count: u32,
+		},
+		/// A leftover pot was emptied; its balance teleports to the sweep beneficiary on AH.
+		AccountSwept {
+			who: AccountId32,
+			amount: u128,
+		},
+		/// Below-ED dust accounts were reaped; the sum teleports to the sweep beneficiary.
+		DustSwept {
+			count: u32,
+			amount: u128,
 		},
 		/// Phantom issuance burned: `burned = min(expected, unaccounted)`. Any
 		/// `unaccounted - burned` remainder is left on the books for investigation.
@@ -527,8 +548,28 @@ pub mod pallet {
 					)
 				},
 				MigrationStage::HrmpDone => {
-					Self::transition(MigrationStage::TiCorrection);
+					Self::transition(MigrationStage::Sweep);
 					T::DbWeight::get().reads_writes(1, 1)
+				},
+				MigrationStage::Sweep => {
+					// Sweep, dust reaping and the teleport commit or roll back together so a
+					// failed send retries whole next block.
+					let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
+						match Self::sweep_leftovers() {
+							Ok(()) => TransactionOutcome::Commit(Ok(())),
+							Err(e) => TransactionOutcome::Rollback(Err(e)),
+						}
+					})
+					.expect("Always returning Ok; qed");
+
+					match res {
+						Ok(()) => Self::transition(MigrationStage::TiCorrection),
+						Err(e) => {
+							defensive!("Sweep failed, retrying: {:?}", e);
+						},
+					}
+					// Placeholder: iterates every remaining account once for the dust pass.
+					T::DbWeight::get().reads_writes(10_000, 500)
 				},
 				MigrationStage::TiCorrection => {
 					// Correction, bookkeeping and the finish signal commit or roll back together:
@@ -644,6 +685,75 @@ pub mod pallet {
 		/// Signal to the Coretime chain that all data has been sent.
 		pub(crate) fn send_finish(rc_kept: u128, rc_migrated: u128) -> Result<(), Error<T>> {
 			Self::send_to_ct(CtMigratorCall::FinishMigration { rc_kept, rc_migrated })
+		}
+
+		/// Empty the configured leftover pots and reap below-ED dust; teleport the proceeds to
+		/// the sweep beneficiary on Asset Hub.
+		fn sweep_leftovers() -> Result<(), Error<T>> {
+			use frame_support::traits::tokens::{Fortitude, Precision, Preservation};
+			let mut total: u128 = 0;
+
+			// The configured pots (old treasury etc.): full free balance, no reserves expected.
+			for who in T::SweepAccounts::get() {
+				let amount = frame_system::Account::<T>::get(&who).data.free;
+				if amount == 0 {
+					continue;
+				}
+				let burned = <T as Config>::Currency::burn_from(
+					&who,
+					amount,
+					Preservation::Expendable,
+					Precision::Exact,
+					Fortitude::Polite,
+				)
+				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+				// The treasury pot was book-kept as inactive issuance; reactivate what leaves so
+				// the issuance accounting stays consistent.
+				pallet_balances::InactiveIssuance::<T>::mutate(|i| {
+					*i = i.saturating_sub(burned)
+				});
+				total = total.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
+				Self::deposit_event(Event::AccountSwept { who, amount: burned });
+			}
+
+			// Below-ED dust: reap accounts that nothing references and no hold complicates.
+			let (mut dust_count, mut dust_amount) = (0u32, 0u128);
+			let ed = <T as Config>::Currency::minimum_balance();
+			for (who, info) in frame_system::Account::<T>::iter() {
+				let d = &info.data;
+				if d.free.saturating_add(d.reserved) >= ed ||
+					d.free == 0 || d.reserved != 0 ||
+					info.consumers != 0 ||
+					!pallet_balances::Holds::<T>::get(&who).is_empty()
+				{
+					continue;
+				}
+				let burned = <T as Config>::Currency::burn_from(
+					&who,
+					d.free,
+					Preservation::Expendable,
+					Precision::Exact,
+					Fortitude::Polite,
+				)
+				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+				dust_count += 1;
+				dust_amount =
+					dust_amount.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
+			}
+			if dust_count > 0 {
+				total = total.checked_add(dust_amount).ok_or(Error::<T>::BalanceAccounting)?;
+				Self::deposit_event(Event::DustSwept { count: dust_count, amount: dust_amount });
+			}
+
+			if total == 0 {
+				return Ok(());
+			}
+			RcMigratedBalance::<T>::try_mutate(|t| {
+				t.kept = t.kept.checked_sub(total).ok_or(Error::<T>::BalanceAccounting)?;
+				t.ah_free = t.ah_free.checked_add(total).ok_or(Error::<T>::BalanceAccounting)?;
+				Ok::<(), Error<T>>(())
+			})?;
+			Self::send_teleport(vec![(T::SweepBeneficiary::get(), total)])
 		}
 
 		/// Burn the audited phantom issuance and send the finish signal.

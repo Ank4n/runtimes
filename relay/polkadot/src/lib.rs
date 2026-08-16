@@ -1859,6 +1859,13 @@ impl pallet_rc_migrator::Config for Runtime {
 
 parameter_types! {
 	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
+	/// Leftover pots emptied by the migration's `Sweep` stage.
+	pub SweepAccounts: Vec<AccountId> =
+		vec![TreasuryPalletId::get().into_account_truncating()];
+	/// Where swept pots and dust land on Asset Hub: the AH treasury account (same `PalletId`
+	/// derivation, so the same address). TODO: point at the DAP buffer account once governance
+	/// designates it.
+	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
 	/// Audited issuance held by no account ("phantom issuance"), burned at the end of the
 	/// migration. Measured at RC block #32,378,714 (`balance_census` prints the exact value);
 	/// re-measure and update ahead of the real run.
@@ -1871,6 +1878,8 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type SendXcm = xcm_config::XcmRouter;
 	type CtParaId = BrokerId;
 	type AhParaId = AssetHubId;
+	type SweepAccounts = SweepAccounts;
+	type SweepBeneficiary = SweepBeneficiary;
 	type TiCorrection = TiCorrection;
 }
 

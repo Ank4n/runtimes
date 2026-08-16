@@ -765,6 +765,28 @@ async fn full_migration_rc_to_ct() {
 
 		(paras, channels, requests, pallet_balances::TotalIssuance::<Rc>::get(), sample)
 	});
+
+	// The sweep stage's inputs: the old treasury pot plus reapable below-ED dust.
+	let (treasury, sweep_expected) = rc.execute_with(|| {
+		use frame_support::traits::fungible::Inspect;
+		use sp_runtime::traits::AccountIdConversion;
+		let treasury: sp_runtime::AccountId32 =
+			polkadot_runtime::TreasuryPalletId::get().into_account_truncating();
+		let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
+		let mut expected = frame_system::Account::<Rc>::get(&treasury).data.free;
+		for (who, info) in frame_system::Account::<Rc>::iter() {
+			let d = &info.data;
+			if d.free + d.reserved < ed &&
+				d.free > 0 && d.reserved == 0 &&
+				info.consumers == 0 &&
+				pallet_balances::Holds::<Rc>::get(&who).is_empty()
+			{
+				expected += d.free;
+			}
+		}
+		(treasury, expected)
+	});
+	assert!(sweep_expected > 0, "the snapshot has a treasury pot to sweep");
 	assert!(!paras_before.is_empty(), "live RC snapshot has registered paras");
 	assert!(!hrmp_before.is_empty(), "live RC snapshot has HRMP channels");
 	let recorded_deposits: u128 = paras_before.iter().map(|(_, d)| d).sum();
@@ -848,6 +870,8 @@ async fn full_migration_rc_to_ct() {
 			deny,
 		)
 	});
+	let ah_treasury_before =
+		ah.execute_with(|| frame_system::Account::<Ah>::get(&treasury).data.free);
 
 	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks. The
 	// pre-flight deny list is pinned first, as governance would ahead of the real run.
@@ -957,6 +981,12 @@ async fn full_migration_rc_to_ct() {
 				migrator_types::PortableProxyType::try_from(d.proxy_type.clone()).is_err()
 			}),
 			"the manager's translatable defs must have left the RC"
+		);
+
+		// The treasury pot is gone; its funds (plus dust) teleported to the same address on AH.
+		assert!(
+			!frame_system::Account::<Rc>::contains_key(&treasury),
+			"the treasury pot must be swept"
 		);
 
 		// The deny-listed possible pures stayed whole: funds (where any existed) and proxy
@@ -1153,6 +1183,13 @@ async fn full_migration_rc_to_ct() {
 			frame_system::Account::<Ah>::get(&sample.0).data.free,
 			ah_sample_before + ah_free_exp,
 			"the manager's free balance arrived on AH"
+		);
+
+		// The swept pots and dust landed on the AH treasury account, exactly.
+		assert_eq!(
+			frame_system::Account::<Ah>::get(&treasury).data.free,
+			ah_treasury_before + sweep_expected,
+			"sweep must arrive on the AH treasury account"
 		);
 
 		// Funds-follow-control invariant: every never-signed delegator whose funds left the RC
