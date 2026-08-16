@@ -12419,6 +12419,7 @@ dependencies = [
  "pallet-message-queue",
  "pallet-proxy",
  "pallet-rc2-migrator",
+ "pallet-session",
  "pallet-xcm",
  "parity-scale-codec",
  "polkadot-primitives",
