@@ -30,31 +30,40 @@ use runtime_parachains::hrmp::HrmpChannels;
 pub struct HrmpMigrator<T>(PhantomData<T>);
 
 impl<T: Config> HrmpMigrator<T> {
-	/// Drop all pending open-channel requests: they cannot complete once HRMP has left this
-	/// chain. Their sender deposits are refunded by the accounts stage (indexed as
-	/// [`ExpectedRefundReserve`]); this only removes the records.
+	/// Drain all pending open-channel requests and send them to the Coretime chain, where the
+	/// future HRMP system decides whether the handshakes can finish. Their sender deposits
+	/// travel via the accounts stage (indexed as CT-bound) and are re-labelled on arrival.
 	///
-	/// One-shot, called by `HrmpInit`; the request count is small (dozens).
-	pub fn drop_open_requests() -> u32 {
+	/// One-shot, called by `HrmpInit`; the request count is small (dozens). The caller wraps
+	/// this in a storage transaction so a failed send rolls everything back for a retry.
+	pub fn drain_open_requests() -> Result<u32, Error<T>> {
 		use runtime_parachains::hrmp::{
 			HrmpAcceptedChannelRequestCount, HrmpOpenChannelRequestCount,
 			HrmpOpenChannelRequests, HrmpOpenChannelRequestsList,
 		};
 
-		let mut dropped = 0u32;
+		let mut batch = Vec::new();
 		for id in HrmpOpenChannelRequestsList::<T>::take() {
 			if let Some(request) = HrmpOpenChannelRequests::<T>::take(&id) {
-				dropped += 1;
-				Pallet::<T>::deposit_event(Event::HrmpRequestDropped {
+				batch.push(migrator_types::PortableHrmpRequest {
 					sender: id.sender.into(),
 					recipient: id.recipient.into(),
-					deposit: request.sender_deposit,
+					confirmed: request.confirmed,
+					sender_deposit: request.sender_deposit,
+					max_message_size: request.max_message_size,
+					max_capacity: request.max_capacity,
+					max_total_size: request.max_total_size,
 				});
 			}
 		}
 		let _ = HrmpOpenChannelRequestCount::<T>::clear(u32::MAX, None);
 		let _ = HrmpAcceptedChannelRequestCount::<T>::clear(u32::MAX, None);
-		dropped
+
+		let count = batch.len() as u32;
+		for chunk in batch.chunks(MAX_RECORDS_PER_XCM as usize) {
+			Pallet::<T>::send_hrmp_requests(chunk.to_vec())?;
+		}
+		Ok(count)
 	}
 	/// Drain HRMP channel records until the per-block limit is reached.
 	///

@@ -691,6 +691,8 @@ impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
+	// Relay blocks are 6s, this chain's are 12s: migrated proxy delays halve.
+	type RcBlockTimeRatio = ConstU32<2>;
 }
 
 /// What each hold migrated from the relay chain becomes on this chain.

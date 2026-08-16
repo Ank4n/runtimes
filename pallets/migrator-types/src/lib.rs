@@ -114,6 +114,23 @@ pub struct PortableHrmpChannel<Balance> {
 	pub recipient_deposit: Balance,
 }
 
+/// A pending HRMP open-channel request in portable format: para `sender` asked to open a
+/// channel to `recipient` and reserved `sender_deposit`; the handshake finishes (or not) on the
+/// destination chain under its future HRMP system.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableHrmpRequest<Balance> {
+	pub sender: u32,
+	pub recipient: u32,
+	/// Whether the recipient had already accepted.
+	pub confirmed: bool,
+	pub sender_deposit: Balance,
+	pub max_message_size: u32,
+	pub max_capacity: u32,
+	pub max_total_size: u32,
+}
+
 /// Relay-chain proxy permission in portable format.
 ///
 /// Deliberately carries ONLY the permissions the destination represents: the relay side filters

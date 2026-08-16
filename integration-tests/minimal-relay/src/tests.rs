@@ -684,13 +684,16 @@ async fn full_migration_rc_to_ct() {
 
 	// GIVEN the live registrar and HRMP state of the snapshot, and one cleanly migrating
 	// manager to spot-check the AH teleport leg with.
-	let (paras_before, hrmp_before, rc_ti_before, sample) = rc.execute_with(|| {
+	let (paras_before, hrmp_before, requests_before, rc_ti_before, sample) = rc.execute_with(|| {
 		crate::events::emit_rc_census("before");
 		let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
 			.map(|(id, info)| (id.into(), info.deposit))
 			.collect();
 		let channels: Vec<(_, u128, u128)> = HrmpChannels::<Rc>::iter()
 			.map(|(id, ch)| (id, ch.sender_deposit, ch.recipient_deposit))
+			.collect();
+		let requests: Vec<u128> = runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter()
+			.map(|(_, r)| r.sender_deposit)
 			.collect();
 
 		let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
@@ -709,12 +712,13 @@ async fn full_migration_rc_to_ct() {
 			})
 			.expect("live RC snapshot has a cleanly migrating manager");
 
-		(paras, channels, pallet_balances::TotalIssuance::<Rc>::get(), sample)
+		(paras, channels, requests, pallet_balances::TotalIssuance::<Rc>::get(), sample)
 	});
 	assert!(!paras_before.is_empty(), "live RC snapshot has registered paras");
 	assert!(!hrmp_before.is_empty(), "live RC snapshot has HRMP channels");
 	let recorded_deposits: u128 = paras_before.iter().map(|(_, d)| d).sum();
-	let recorded_hrmp: u128 = hrmp_before.iter().map(|(_, s, r)| s + r).sum();
+	let recorded_hrmp: u128 = hrmp_before.iter().map(|(_, s, r)| s + r).sum::<u128>() +
+		requests_before.iter().sum::<u128>();
 
 	// Proxy state before: the manager-linked delegators (whose definitions travel to CT), one
 	// delegator with both an Any and a ParaRegistration delegate for the dispatch checks, and
@@ -777,8 +781,8 @@ async fn full_migration_rc_to_ct() {
 		// control on AH cannot be verified must not migrate — their funds would strand.
 		let deny: Vec<_> = nonce0_delegators
 			.iter()
-			.filter(|(who, had_any, _)| {
-				*had_any &&
+			.filter(|(who, had_any, existed)| {
+				*existed && *had_any &&
 					frame_system::Account::<Ah>::get(who).nonce == 0 &&
 					pallet_proxy::Proxies::<Ah>::get(who).0.is_empty()
 			})
@@ -891,6 +895,10 @@ async fn full_migration_rc_to_ct() {
 				deposit <= frame_system::Account::<Rc>::get(&who).data.reserved,
 				"proxy entry of {who:?} claims a deposit that is not reserved"
 			);
+			assert!(
+				frame_system::Account::<Rc>::contains_key(&who),
+				"fund-less proxy entries (v1 husks) must be deleted, found {who:?}"
+			);
 		}
 		let residual = pallet_proxy::Proxies::<Rc>::get(&proxy_dispatch.0).0;
 		assert!(
@@ -960,6 +968,11 @@ async fn full_migration_rc_to_ct() {
 			RcHrmpChannels::<Ct>::iter().count(),
 			hrmp_before.len(),
 			"every HRMP channel landed"
+		);
+		assert_eq!(
+			RcHrmpOpenRequests::<Ct>::iter().count(),
+			requests_before.len(),
+			"every pending HRMP request landed"
 		);
 		for (id, _, _) in &hrmp_before {
 			assert!(

@@ -92,8 +92,10 @@ impl<T: Config> AccountsMigrator<T> {
 			add_refund(who, deposit);
 			records += 1;
 		}
+		// Pending open-channel requests migrate to the Coretime chain with their deposits, so
+		// the sender sovereigns' request deposits are CT-bound like channel deposits.
 		for (id, request) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<T>::iter() {
-			add_refund(id.sender.into_account_truncating(), request.sender_deposit);
+			add_ct(id.sender.into_account_truncating(), request.sender_deposit);
 			records += 1;
 		}
 		records

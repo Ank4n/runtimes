@@ -67,6 +67,11 @@ impl<T: Config> ProxyMigrator<T> {
 				continue;
 			}
 
+			// A delegator with no funds has nothing that could strand: send its manager-linked
+			// definitions (below) and delete the rest of the entry — this cleans the ~424
+			// zero-balance husks v1 left behind.
+			let funded = frame_system::Account::<T>::contains_key(&who);
+
 			// Split the definitions into what travels and what stays.
 			let manager_linked = managers.contains(&who) ||
 				defs.iter().any(|def| managers.contains(&def.delegate)) ||
@@ -106,7 +111,7 @@ impl<T: Config> ProxyMigrator<T> {
 			// The deposit was refunded by the accounts stage; clamp the recorded field to what
 			// is still actually reserved so the entry never claims money that is gone.
 			let backed = deposit.min(frame_system::Account::<T>::get(&who).data.reserved);
-			if stay.is_empty() {
+			if stay.is_empty() || !funded {
 				pallet_proxy::Proxies::<T>::remove(&who);
 			} else {
 				let stay: BoundedVec<_, <T as pallet_proxy::Config>::MaxProxies> =
