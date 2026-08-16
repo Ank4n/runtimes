@@ -30,6 +30,32 @@ use runtime_parachains::hrmp::HrmpChannels;
 pub struct HrmpMigrator<T>(PhantomData<T>);
 
 impl<T: Config> HrmpMigrator<T> {
+	/// Drop all pending open-channel requests: they cannot complete once HRMP has left this
+	/// chain. Their sender deposits are refunded by the accounts stage (indexed as
+	/// [`ExpectedRefundReserve`]); this only removes the records.
+	///
+	/// One-shot, called by `HrmpInit`; the request count is small (dozens).
+	pub fn drop_open_requests() -> u32 {
+		use runtime_parachains::hrmp::{
+			HrmpAcceptedChannelRequestCount, HrmpOpenChannelRequestCount,
+			HrmpOpenChannelRequests, HrmpOpenChannelRequestsList,
+		};
+
+		let mut dropped = 0u32;
+		for id in HrmpOpenChannelRequestsList::<T>::take() {
+			if let Some(request) = HrmpOpenChannelRequests::<T>::take(&id) {
+				dropped += 1;
+				Pallet::<T>::deposit_event(Event::HrmpRequestDropped {
+					sender: id.sender.into(),
+					recipient: id.recipient.into(),
+					deposit: request.sender_deposit,
+				});
+			}
+		}
+		let _ = HrmpOpenChannelRequestCount::<T>::clear(u32::MAX, None);
+		let _ = HrmpAcceptedChannelRequestCount::<T>::clear(u32::MAX, None);
+		dropped
+	}
 	/// Drain HRMP channel records until the per-block limit is reached.
 	///
 	/// Returns the cursor to continue from on the next block, or `None` once the map is

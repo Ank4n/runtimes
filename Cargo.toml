@@ -8,6 +8,7 @@ license = "GPL-3.0-only"                                        # TODO <https://
 [workspace.dependencies]
 pallet-rc-migrator = { path = "pallets/rc-migrator", default-features = false }
 pallet-ah-ops = { path = "pallets/ah-ops", default-features = false }
+migrator-types = { path = "pallets/migrator-types", default-features = false }
 pallet-ct-migrator = { path = "pallets/ct-migrator", default-features = false }
 pallet-rc2-migrator = { path = "pallets/rc2-migrator", default-features = false }
 pallet-election-provider-multi-block = { version = "0.10.0", default-features = false }
@@ -331,6 +332,7 @@ members = [
 	"integration-tests/emulated/tests/people/people-polkadot",
 	"integration-tests/zombienet",
 	"pallets/ah-ops",
+	"pallets/migrator-types",
 	"pallets/ct-migrator",
 	"pallets/rc-migrator",
 	"pallets/rc2-migrator",

@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub mod accounts;
 pub mod hrmp;
+pub mod proxy;
 pub mod registrar;
 
 pub use pallet::*;
@@ -40,8 +41,9 @@ use frame_support::{
 	},
 };
 use frame_system::pallet_prelude::*;
-use pallet_ct_migrator::{
+use migrator_types::{
 	PortableAccount, PortableHold, PortableHoldReason, PortableHrmpChannel, PortableParaInfo,
+	PortableProxy, PortableProxyType,
 };
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
 use polkadot_runtime_common::paras_registrar;
@@ -100,6 +102,13 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 		last_key: Option<AccountId>,
 	},
 	AccountsDone,
+	/// Migrates manager-linked proxy definitions to the Coretime chain. Runs before the
+	/// registrar stage so classification can read the (not yet drained) `Paras` map.
+	ProxyInit,
+	ProxyOngoing {
+		last_key: Option<AccountId>,
+	},
+	ProxyDone,
 	RegistrarInit,
 	RegistrarOngoing {
 		last_key: Option<ParaId>,
@@ -110,13 +119,6 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 		last_key: Option<HrmpChannelId>,
 	},
 	HrmpDone,
-	/// Placeholder stages: the proxy migration is analysed but not designed yet
-	/// (`migration-poc/report.md` §5); the machine passes straight through.
-	ProxyInit,
-	ProxyOngoing {
-		last_key: Option<AccountId>,
-	},
-	ProxyDone,
 	/// Burn the audited amount of issuance that no account holds (see `Config::TiCorrection`).
 	TiCorrection,
 	/// All data sent; waiting for manual verification before finishing.
@@ -161,6 +163,8 @@ pub enum CtMigratorCall {
 	ReceiveHrmp { channels: Vec<PortableHrmpChannel<u128>> },
 	#[codec(index = 3)]
 	FinishMigration { rc_kept: u128, rc_migrated: u128 },
+	#[codec(index = 4)]
+	ReceiveProxies { proxies: Vec<PortableProxy<AccountId32>> },
 }
 
 /// Balance conservation bookkeeping for the migration.
@@ -209,9 +213,15 @@ pub mod pallet {
 			AccountId = AccountId32,
 			AccountData = pallet_balances::AccountData<u128>,
 		> + pallet_balances::Config<Balance = u128>
-		// The `Currency` equality pins the registrar's deposit balance type to u128.
+		// The `Currency` equalities pin the deposit balance types to u128; the `ProxyType`
+		// bound is where the runtime declares which proxy permissions travel to the Coretime
+		// chain (untranslatable ones stay here).
 		+ paras_registrar::Config<Currency = pallet_balances::Pallet<Self>>
 		+ runtime_parachains::hrmp::Config
+		+ pallet_proxy::Config<
+			Currency = pallet_balances::Pallet<Self>,
+			ProxyType: TryInto<PortableProxyType>,
+		>
 	{
 		/// The overarching event type.
 		#[allow(deprecated)]
@@ -261,6 +271,24 @@ pub mod pallet {
 	pub type ExpectedCtReserve<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
 
+	/// How much reserved balance each account gets *refunded* (released and teleported to Asset
+	/// Hub as free): proxy deposits and pending HRMP open-channel-request deposits — deposits
+	/// whose purpose does not continue anywhere. Built by `AccountsInit` like
+	/// [`ExpectedCtReserve`].
+	#[pallet::storage]
+	pub type ExpectedRefundReserve<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
+
+	/// Accounts that must not be migrated, set by governance before the migration starts.
+	///
+	/// The off-chain pre-flight populates this with accounts whose funds would strand at the
+	/// destination — e.g. possible pure proxies without verifiable control on Asset Hub. The
+	/// chain cannot check another chain's state, so the verification result is pinned here
+	/// (v1's `preserve_accounts` pattern).
+	#[pallet::storage]
+	pub type HeldBackAccounts<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, (), OptionQuery>;
+
 	#[pallet::error]
 	pub enum Error<T> {
 		/// Sending an XCM message to the Coretime chain failed.
@@ -296,6 +324,23 @@ pub mod pallet {
 			who: AccountId32,
 			free: u128,
 			reserved: u128,
+		},
+		/// A reserve whose purpose does not continue (proxy deposit, pending HRMP request
+		/// deposit) was released and refunded: it travels to Asset Hub as free balance.
+		DepositRefunded {
+			who: AccountId32,
+			amount: u128,
+		},
+		/// A batch of manager-linked proxy sets was sent to the Coretime chain.
+		ProxyBatchSent {
+			count: u32,
+		},
+		/// A pending HRMP open-channel request was dropped; its deposit is refunded via the
+		/// accounts stage. Requests cannot complete once HRMP has left this chain.
+		HrmpRequestDropped {
+			sender: u32,
+			recipient: u32,
+			deposit: u128,
 		},
 		/// Phantom issuance burned: `burned = min(expected, unaccounted)`. Any
 		/// `unaccounted - burned` remainder is left on the books for investigation.
@@ -342,6 +387,21 @@ pub mod pallet {
 			Self::transition(stage);
 			Ok(())
 		}
+
+		/// Pin accounts that must stay on the relay chain untouched (see [`HeldBackAccounts`]).
+		#[pallet::call_index(1)]
+		#[pallet::weight(T::DbWeight::get().writes(accounts.len() as u64))]
+		pub fn hold_back_accounts(
+			origin: OriginFor<T>,
+			accounts: Vec<AccountId32>,
+		) -> DispatchResult {
+			ensure_root(origin)?;
+
+			for who in accounts {
+				HeldBackAccounts::<T>::insert(who, ());
+			}
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -359,10 +419,10 @@ pub mod pallet {
 						kept: total_issuance,
 						..Default::default()
 					});
-					let indexed = accounts::AccountsMigrator::<T>::build_expected_ct_reserves();
+					let indexed = accounts::AccountsMigrator::<T>::build_expected_reserves();
 					log::info!(
 						target: LOG_TARGET,
-						"Indexed expected CT reserves for {indexed} accounts"
+						"Indexed expected reserves from {indexed} records"
 					);
 					Self::transition(MigrationStage::AccountsOngoing { last_key: None });
 					T::DbWeight::get().reads_writes(2, 2)
@@ -383,6 +443,25 @@ pub mod pallet {
 					)
 				},
 				MigrationStage::AccountsDone => {
+					Self::transition(MigrationStage::ProxyInit);
+					T::DbWeight::get().reads_writes(1, 1)
+				},
+				MigrationStage::ProxyInit => {
+					Self::transition(MigrationStage::ProxyOngoing { last_key: None });
+					T::DbWeight::get().reads_writes(1, 1)
+				},
+				MigrationStage::ProxyOngoing { last_key } => {
+					Self::migrate_stage_step(
+						|| proxy::ProxyMigrator::<T>::migrate_many(last_key),
+						MigrationStage::ProxyDone,
+						|last_key| MigrationStage::ProxyOngoing { last_key: Some(last_key) },
+					);
+					T::DbWeight::get().reads_writes(
+						(MAX_RECORDS_PER_BLOCK * 4) as u64,
+						(MAX_RECORDS_PER_BLOCK * 4) as u64,
+					)
+				},
+				MigrationStage::ProxyDone => {
 					Self::transition(MigrationStage::RegistrarInit);
 					T::DbWeight::get().reads_writes(1, 1)
 				},
@@ -418,10 +497,10 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::HrmpInit => {
-					// Records only: open-channel requests and the deposits on the para sovereign
-					// accounts stay on the RC (sovereign translation is not designed yet).
+					let dropped = hrmp::HrmpMigrator::<T>::drop_open_requests();
+					log::info!(target: LOG_TARGET, "Dropped {dropped} pending HRMP requests");
 					Self::transition(MigrationStage::HrmpOngoing { last_key: None });
-					T::DbWeight::get().reads_writes(1, 1)
+					T::DbWeight::get().reads_writes(2, 2)
 				},
 				MigrationStage::HrmpOngoing { last_key } => {
 					Self::migrate_stage_step(
@@ -435,22 +514,6 @@ pub mod pallet {
 					)
 				},
 				MigrationStage::HrmpDone => {
-					Self::transition(MigrationStage::ProxyInit);
-					T::DbWeight::get().reads_writes(1, 1)
-				},
-				// Dummy pass-through: proxy migration is analysed but not designed yet
-				// (`migration-poc/report.md` §5). The stages exist so the machine shape (and the
-				// monitor) is final; the migrator lands here later.
-				MigrationStage::ProxyInit => {
-					log::info!(target: LOG_TARGET, "Proxy stage not implemented; passing through");
-					Self::transition(MigrationStage::ProxyOngoing { last_key: None });
-					T::DbWeight::get().reads_writes(1, 1)
-				},
-				MigrationStage::ProxyOngoing { .. } => {
-					Self::transition(MigrationStage::ProxyDone);
-					T::DbWeight::get().reads_writes(1, 1)
-				},
-				MigrationStage::ProxyDone => {
 					Self::transition(MigrationStage::TiCorrection);
 					T::DbWeight::get().reads_writes(1, 1)
 				},
@@ -535,6 +598,16 @@ pub mod pallet {
 			let count = paras.len() as u32;
 			Self::send_to_ct(CtMigratorCall::ReceiveRegistrar { paras, next_free_para_id })?;
 			Self::deposit_event(Event::RegistrarBatchSent { count });
+			Ok(())
+		}
+
+		/// Send a batch of manager-linked proxy sets to the Coretime chain.
+		pub(crate) fn send_proxies(
+			proxies: Vec<PortableProxy<AccountId32>>,
+		) -> Result<(), Error<T>> {
+			let count = proxies.len() as u32;
+			Self::send_to_ct(CtMigratorCall::ReceiveProxies { proxies })?;
+			Self::deposit_event(Event::ProxyBatchSent { count });
 			Ok(())
 		}
 

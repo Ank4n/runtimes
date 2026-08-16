@@ -59,24 +59,41 @@ pub struct Withdrawal {
 pub struct AccountsMigrator<T>(PhantomData<T>);
 
 impl<T: Config> AccountsMigrator<T> {
-	/// Index every account's expected Coretime-bound reserve from the owning pallets' records:
-	/// registrar deposits per manager, HRMP channel deposits per (child) para sovereign.
+	/// Index every account's expected reserves from the owning pallets' records:
+	/// - Coretime-bound ([`ExpectedCtReserve`]): registrar deposits per manager, HRMP channel
+	///   deposits per (child) para sovereign;
+	/// - refunded ([`ExpectedRefundReserve`]): proxy deposits per delegator and pending HRMP
+	///   open-channel-request deposits per sovereign — deposits whose purpose does not continue.
 	///
 	/// Called once by `AccountsInit`. Returns the number of records indexed.
-	pub fn build_expected_ct_reserves() -> u32 {
+	pub fn build_expected_reserves() -> u32 {
 		let mut records = 0u32;
-		let mut add = |who: T::AccountId, amount: u128| {
+		let add_ct = |who: T::AccountId, amount: u128| {
 			if !amount.is_zero() {
 				ExpectedCtReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
 			}
 		};
+		let add_refund = |who: T::AccountId, amount: u128| {
+			if !amount.is_zero() {
+				ExpectedRefundReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
+			}
+		};
+
 		for (_, info) in paras_registrar::Paras::<T>::iter() {
-			add(info.manager, info.deposit);
+			add_ct(info.manager, info.deposit);
 			records += 1;
 		}
 		for (id, channel) in runtime_parachains::hrmp::HrmpChannels::<T>::iter() {
-			add(id.sender.into_account_truncating(), channel.sender_deposit);
-			add(id.recipient.into_account_truncating(), channel.recipient_deposit);
+			add_ct(id.sender.into_account_truncating(), channel.sender_deposit);
+			add_ct(id.recipient.into_account_truncating(), channel.recipient_deposit);
+			records += 1;
+		}
+		for (who, (_, deposit)) in pallet_proxy::Proxies::<T>::iter() {
+			add_refund(who, deposit);
+			records += 1;
+		}
+		for (id, request) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<T>::iter() {
+			add_refund(id.sender.into_account_truncating(), request.sender_deposit);
 			records += 1;
 		}
 		records
@@ -173,14 +190,29 @@ impl<T: Config> AccountsMigrator<T> {
 		let free = info.data.free;
 		let reserved = info.data.reserved;
 
-		// Reserved balance is only trusted up to what the registrar and HRMP pallets say this
-		// account deposited. More reserve than that means money whose destination is not designed
-		// yet (proxy deposits, anomalies): the whole account stays on the RC for a later stage.
+		// Pinned by governance after the off-chain pre-flight (e.g. a possible pure proxy whose
+		// control at the destination could not be verified): nothing of it moves.
+		if HeldBackAccounts::<T>::contains_key(who) {
+			log::info!(target: LOG_TARGET, "Holding back pinned account {who:?}");
+			Pallet::<T>::deposit_event(Event::AccountHeldBack {
+				who: who.clone(),
+				free,
+				reserved,
+			});
+			return Ok(None);
+		}
+
+		// Reserved balance is only trusted up to what the owning pallets say this account
+		// deposited: registrar/HRMP deposits continue on the Coretime chain, proxy and pending
+		// HRMP-request deposits are refunded. More reserve than the two together is money whose
+		// origin is unknown (a true anomaly): the whole account stays on the RC.
 		let expected_ct = ExpectedCtReserve::<T>::get(who);
-		if reserved > expected_ct {
+		let expected_refund = ExpectedRefundReserve::<T>::get(who);
+		if reserved > expected_ct.saturating_add(expected_refund) {
 			log::info!(
 				target: LOG_TARGET,
-				"Holding back account {who:?}: reserved {reserved} > attributable {expected_ct}"
+				"Holding back account {who:?}: reserved {reserved} > attributable \
+				 {expected_ct} + {expected_refund}"
 			);
 			Pallet::<T>::deposit_event(Event::AccountHeldBack {
 				who: who.clone(),
@@ -226,13 +258,21 @@ impl<T: Config> AccountsMigrator<T> {
 		.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
 		defensive_assert!(burned == total, "burned the account's whole balance");
 
-		// The split: deposit → CT hold; working buffer → CT free; the rest → AH free. Free
-		// balance below AH's ED cannot teleport into a fresh account, so such dust follows the
-		// deposit to CT instead (only deposit holders can be in this situation: everyone else
-		// has free >= the RC ED, which exceeds AH's).
-		let ct_hold = reserved;
-		let mut ct_free = if ct_hold.is_zero() { 0 } else { free.min(CT_FREE_BUFFER) };
-		let mut ah_free = free.saturating_sub(ct_free);
+		// The split: CT-bound deposits → CT hold; refunded deposits become liquid; working
+		// buffer → CT free; the rest → AH free. Free balance below AH's ED cannot teleport into
+		// a fresh account, so such dust follows the deposit to CT instead (only deposit holders
+		// can be in this situation: everyone else has free >= the RC ED, which exceeds AH's).
+		let ct_hold = reserved.min(expected_ct);
+		let refunded = reserved.saturating_sub(ct_hold);
+		if !refunded.is_zero() {
+			Pallet::<T>::deposit_event(Event::DepositRefunded {
+				who: who.clone(),
+				amount: refunded,
+			});
+		}
+		let liquid = free.saturating_add(refunded);
+		let mut ct_free = if ct_hold.is_zero() { 0 } else { liquid.min(CT_FREE_BUFFER) };
+		let mut ah_free = liquid.saturating_sub(ct_free);
 		if !ah_free.is_zero() && ah_free < AH_EXISTENTIAL_DEPOSIT && !ct_hold.is_zero() {
 			ct_free = ct_free.saturating_add(ah_free);
 			ah_free = 0;
