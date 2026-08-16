@@ -34,7 +34,6 @@ use alloc::{vec, vec::Vec};
 use frame_support::{
 	defensive,
 	pallet_prelude::*,
-	storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
 	traits::{
 		fungible::{Inspect, Mutate},
 		ReservableCurrency,
@@ -42,8 +41,8 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::*;
 use migrator_types::{
-	PortableAccount, PortableHold, PortableHoldReason, PortableHrmpChannel, PortableHrmpRequest,
-	PortableParaInfo, PortableProxy, PortableProxyType,
+	with_rollback, PortableAccount, PortableHold, PortableHoldReason, PortableHrmpChannel,
+	PortableHrmpRequest, PortableParaInfo, PortableProxy, PortableProxyType,
 };
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
 use polkadot_runtime_common::paras_registrar;
@@ -75,14 +74,6 @@ pub const MAX_RECORDS_PER_BLOCK: u32 = 100;
 /// each, and an XCM message decodes at most 100 instructions.
 pub const MAX_TELEPORTS_PER_XCM: u32 = 40;
 
-/// Working buffer of free balance that follows a migrated deposit to the Coretime chain, so
-/// deposit owners can pay fees and future deposits there without a teleport first.
-pub const CT_FREE_BUFFER: u128 = 10_000_000_000; // 1 DOT
-
-/// Asset Hub's existential deposit (relay ED / 10). Free balance below this cannot be teleported
-/// into a fresh account; such dust follows the deposit to the Coretime chain instead.
-pub const AH_EXISTENTIAL_DEPOSIT: u128 = 1_000_000_000; // 0.1 DOT
-
 /// How long the migration parks in `CoolOff` for manual verification before finishing.
 pub const COOL_OFF_BLOCKS: u32 = 10;
 
@@ -94,6 +85,8 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 	Scheduled {
 		start: BlockNumber,
 	},
+	/// Halts the machine while keeping the migration "ongoing" (call filters stay engaged).
+	/// Entered and left only via `force_set_stage`.
 	Paused,
 	/// Waiting for the Coretime chain to confirm that it is ready to receive data.
 	WaitingForCt,
@@ -245,6 +238,14 @@ pub mod pallet {
 		/// Para id of Asset Hub, the destination of teleported free balances.
 		type AhParaId: Get<u32>;
 
+		/// Working buffer of free balance that follows a migrated deposit to the Coretime chain,
+		/// so deposit owners can pay fees and future deposits there without a teleport first.
+		type CtFreeBuffer: Get<u128>;
+
+		/// Asset Hub's existential deposit. Free balance below this cannot be teleported into a
+		/// fresh account; such dust follows the deposit to the Coretime chain instead.
+		type AhExistentialDeposit: Get<u128>;
+
 		/// Leftover module pots to empty in the `Sweep` stage (e.g. the old treasury pot).
 		/// Their full balance teleports to `SweepBeneficiary`.
 		type SweepAccounts: Get<Vec<AccountId32>>;
@@ -329,9 +330,9 @@ pub mod pallet {
 			count: u32,
 			amount: u128,
 		},
-		/// An account was kept whole on the relay chain because part of its reserve cannot be
-		/// attributed to a registrar or HRMP deposit (e.g. proxy deposits). Migrated by a later
-		/// stage.
+		/// An account was kept whole on the relay chain: pinned by governance, or carrying
+		/// reserve that no pallet's deposit records account for. Money whose destination is
+		/// unknown does not move.
 		AccountHeldBack {
 			who: AccountId32,
 			free: u128,
@@ -453,12 +454,7 @@ pub mod pallet {
 						MigrationStage::AccountsDone,
 						|last_key| MigrationStage::AccountsOngoing { last_key: Some(last_key) },
 					);
-					// Placeholder until the migrator gets benchmarks: a deliberate overestimate
-					// of one block's account withdrawals.
-					T::DbWeight::get().reads_writes(
-						(MAX_ACCOUNTS_PER_BLOCK * 4) as u64,
-						(MAX_ACCOUNTS_PER_BLOCK * 4) as u64,
-					)
+					Self::placeholder_weight(MAX_ACCOUNTS_PER_BLOCK)
 				},
 				MigrationStage::AccountsDone => {
 					Self::transition(MigrationStage::ProxyInit);
@@ -474,29 +470,17 @@ pub mod pallet {
 						MigrationStage::ProxyDone,
 						|last_key| MigrationStage::ProxyOngoing { last_key: Some(last_key) },
 					);
-					T::DbWeight::get().reads_writes(
-						(MAX_RECORDS_PER_BLOCK * 4) as u64,
-						(MAX_RECORDS_PER_BLOCK * 4) as u64,
-					)
+					Self::placeholder_weight(MAX_RECORDS_PER_BLOCK)
 				},
 				MigrationStage::ProxyDone => {
 					Self::transition(MigrationStage::RegistrarInit);
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::RegistrarInit => {
-					// `NextFreeParaId` moves whole in the init message; `PendingSwap` is
-					// deliberately left behind (`pub(super)` storage, ephemeral swap intent).
-					let next_free: u32 = paras_registrar::NextFreeParaId::<T>::get().into();
-					match Self::send_registrar(Vec::new(), Some(next_free)) {
-						Ok(()) => {
-							paras_registrar::NextFreeParaId::<T>::kill();
-							Self::transition(MigrationStage::RegistrarOngoing { last_key: None });
-						},
-						// Stage unchanged: retried next block.
-						Err(e) => {
-							defensive!("Registrar init failed, retrying: {:?}", e);
-						},
-					}
+					Self::migrate_stage_once(
+						registrar::RegistrarMigrator::<T>::migrate_init,
+						MigrationStage::RegistrarOngoing { last_key: None },
+					);
 					T::DbWeight::get().reads_writes(2, 2)
 				},
 				MigrationStage::RegistrarOngoing { last_key } => {
@@ -505,35 +489,17 @@ pub mod pallet {
 						MigrationStage::RegistrarDone,
 						|last_key| MigrationStage::RegistrarOngoing { last_key: Some(last_key) },
 					);
-					T::DbWeight::get().reads_writes(
-						(MAX_RECORDS_PER_BLOCK * 4) as u64,
-						(MAX_RECORDS_PER_BLOCK * 4) as u64,
-					)
+					Self::placeholder_weight(MAX_RECORDS_PER_BLOCK)
 				},
 				MigrationStage::RegistrarDone => {
 					Self::transition(MigrationStage::HrmpInit);
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::HrmpInit => {
-					// Drain, send and record-removal commit or roll back together so a failed
-					// send retries whole next block.
-					let res = with_transaction_opaque_err::<u32, Error<T>, _>(|| {
-						match hrmp::HrmpMigrator::<T>::drain_open_requests() {
-							Ok(count) => TransactionOutcome::Commit(Ok(count)),
-							Err(e) => TransactionOutcome::Rollback(Err(e)),
-						}
-					})
-					.expect("Always returning Ok; qed");
-
-					match res {
-						Ok(count) => {
-							Self::deposit_event(Event::HrmpRequestsSent { count });
-							Self::transition(MigrationStage::HrmpOngoing { last_key: None });
-						},
-						Err(e) => {
-							defensive!("HRMP request drain failed, retrying: {:?}", e);
-						},
-					}
+					Self::migrate_stage_once(
+						hrmp::HrmpMigrator::<T>::drain_open_requests,
+						MigrationStage::HrmpOngoing { last_key: None },
+					);
 					T::DbWeight::get().reads_writes(200, 200)
 				},
 				MigrationStage::HrmpOngoing { last_key } => {
@@ -542,54 +508,22 @@ pub mod pallet {
 						MigrationStage::HrmpDone,
 						|last_key| MigrationStage::HrmpOngoing { last_key: Some(last_key) },
 					);
-					T::DbWeight::get().reads_writes(
-						(MAX_RECORDS_PER_BLOCK * 4) as u64,
-						(MAX_RECORDS_PER_BLOCK * 4) as u64,
-					)
+					Self::placeholder_weight(MAX_RECORDS_PER_BLOCK)
 				},
 				MigrationStage::HrmpDone => {
 					Self::transition(MigrationStage::Sweep);
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::Sweep => {
-					// Sweep, dust reaping and the teleport commit or roll back together so a
-					// failed send retries whole next block.
-					let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
-						match Self::sweep_leftovers() {
-							Ok(()) => TransactionOutcome::Commit(Ok(())),
-							Err(e) => TransactionOutcome::Rollback(Err(e)),
-						}
-					})
-					.expect("Always returning Ok; qed");
-
-					match res {
-						Ok(()) => Self::transition(MigrationStage::TiCorrection),
-						Err(e) => {
-							defensive!("Sweep failed, retrying: {:?}", e);
-						},
-					}
+					Self::migrate_stage_once(Self::sweep_leftovers, MigrationStage::TiCorrection);
 					// Placeholder: iterates every remaining account once for the dust pass.
 					T::DbWeight::get().reads_writes(10_000, 500)
 				},
 				MigrationStage::TiCorrection => {
-					// Correction, bookkeeping and the finish signal commit or roll back together:
-					// a failed send retries the whole arm next block without double-burning.
-					let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
-						match Self::correct_total_issuance() {
-							Ok(()) => TransactionOutcome::Commit(Ok(())),
-							Err(e) => TransactionOutcome::Rollback(Err(e)),
-						}
-					})
-					.expect("Always returning Ok; qed");
-
-					match res {
-						Ok(()) => Self::transition(MigrationStage::CoolOff {
-							end_at: now + COOL_OFF_BLOCKS.into(),
-						}),
-						Err(e) => {
-							defensive!("TI correction failed, retrying: {:?}", e);
-						},
-					}
+					Self::migrate_stage_once(
+						Self::correct_total_issuance,
+						MigrationStage::CoolOff { end_at: now + COOL_OFF_BLOCKS.into() },
+					);
 					// Placeholder: the unaccounted-issuance measurement iterates every remaining
 					// account once.
 					T::DbWeight::get().reads_writes(10_000, 10)
@@ -611,13 +545,7 @@ pub mod pallet {
 			done: MigrationStageOf<T>,
 			ongoing: impl FnOnce(K) -> MigrationStageOf<T>,
 		) {
-			let res = with_transaction_opaque_err::<Option<K>, Error<T>, _>(|| match migrate() {
-				Ok(last_key) => TransactionOutcome::Commit(Ok(last_key)),
-				Err(e) => TransactionOutcome::Rollback(Err(e)),
-			})
-			.expect("Always returning Ok; qed");
-
-			match res {
+			match with_rollback(migrate) {
 				Ok(None) => Self::transition(done),
 				Ok(Some(last_key)) => Self::transition(ongoing(last_key)),
 				Err(e) => {
@@ -625,6 +553,56 @@ pub mod pallet {
 					defensive!("Data stage failed, retrying: {:?}", e);
 				},
 			}
+		}
+
+		/// Run a one-shot stage inside a storage transaction and advance to `next` on success.
+		/// An `Err` rolls all of the stage's writes back and retries it whole next block.
+		fn migrate_stage_once(
+			work: impl FnOnce() -> Result<(), Error<T>>,
+			next: MigrationStageOf<T>,
+		) {
+			match with_rollback(work) {
+				Ok(()) => Self::transition(next),
+				Err(e) => {
+					defensive!("Stage failed, retrying: {:?}", e);
+				},
+			}
+		}
+
+		/// One block of a record-drain stage: pull `(key, record)` pairs from `iter`, convert and
+		/// remove each via `drain`, flush batches of [`MAX_RECORDS_PER_XCM`] through `send`, and
+		/// stop after [`MAX_RECORDS_PER_BLOCK`] records. Returns the cursor to continue from, or
+		/// `None` once the map is exhausted.
+		pub(crate) fn drain_records<K, V, P>(
+			mut iter: impl Iterator<Item = (K, V)>,
+			mut drain: impl FnMut(&K, V) -> P,
+			send: impl Fn(Vec<P>) -> Result<(), Error<T>>,
+		) -> Result<Option<K>, Error<T>> {
+			let mut batch = Vec::new();
+			let mut processed = 0u32;
+			let maybe_last_key = loop {
+				let Some((key, record)) = iter.next() else { break None };
+				processed += 1;
+				batch.push(drain(&key, record));
+
+				if batch.len() >= MAX_RECORDS_PER_XCM as usize {
+					send(core::mem::take(&mut batch))?;
+				}
+				if processed >= MAX_RECORDS_PER_BLOCK {
+					break Some(key);
+				}
+			};
+
+			if !batch.is_empty() {
+				send(batch)?;
+			}
+			Ok(maybe_last_key)
+		}
+
+		/// Placeholder until the migrator gets benchmarks: a deliberate overestimate of one
+		/// block's work on up to `n` items.
+		fn placeholder_weight(n: u32) -> Weight {
+			T::DbWeight::get().reads_writes((n * 4) as u64, (n * 4) as u64)
 		}
 
 		pub(crate) fn transition(new: MigrationStageOf<T>) {
@@ -673,9 +651,7 @@ pub mod pallet {
 		}
 
 		/// Send a batch of drained HRMP channel records to the Coretime chain.
-		pub(crate) fn send_hrmp(
-			channels: Vec<PortableHrmpChannel<u128>>,
-		) -> Result<(), Error<T>> {
+		pub(crate) fn send_hrmp(channels: Vec<PortableHrmpChannel<u128>>) -> Result<(), Error<T>> {
 			let count = channels.len() as u32;
 			Self::send_to_ct(CtMigratorCall::ReceiveHrmp { channels })?;
 			Self::deposit_event(Event::HrmpBatchSent { count });
@@ -709,9 +685,7 @@ pub mod pallet {
 				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
 				// The treasury pot was book-kept as inactive issuance; reactivate what leaves so
 				// the issuance accounting stays consistent.
-				pallet_balances::InactiveIssuance::<T>::mutate(|i| {
-					*i = i.saturating_sub(burned)
-				});
+				pallet_balances::InactiveIssuance::<T>::mutate(|i| *i = i.saturating_sub(burned));
 				total = total.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
 				Self::deposit_event(Event::AccountSwept { who, amount: burned });
 			}

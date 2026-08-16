@@ -17,9 +17,10 @@
 //! destinations.
 //!
 //! Per account, the balance splits by destination:
-//! - reserved balance, up to what the registrar and HRMP pallets record as this account's
-//!   deposits, goes to the **Coretime chain** as a hold (re-attributed by the later stages);
-//! - a small working buffer of free balance (`CT_FREE_BUFFER`) follows the deposit to Coretime;
+//! - reserved balance, up to what the registrar and HRMP pallets record as this account's deposits,
+//!   goes to the **Coretime chain** as a hold (re-attributed by the later stages);
+//! - a small working buffer of free balance (`Config::CtFreeBuffer`) follows the deposit to
+//!   Coretime;
 //! - all remaining free balance is **teleported to Asset Hub**, where the owners' phase-1 funds
 //!   already live.
 //!
@@ -35,7 +36,6 @@ use frame_support::{
 	defensive_assert,
 	traits::tokens::{Fortitude, Precision, Preservation},
 };
-use polkadot_parachain_primitives::primitives::Sibling;
 use sp_runtime::traits::{AccountIdConversion, Zero};
 
 pub type AccountInfoFor<T> = frame_system::AccountInfo<
@@ -106,12 +106,9 @@ impl<T: Config> AccountsMigrator<T> {
 	/// Child para sovereigns become sibling sovereigns (the same para as seen from a sibling
 	/// parachain); everyone else keeps their address.
 	pub fn translate_destination(who: &T::AccountId) -> AccountId32 {
-		let bytes: &[u8] = who.as_ref();
-		if bytes.starts_with(b"para") && bytes[8..].iter().all(|b| *b == 0) {
-			let para_id = u32::from_le_bytes(bytes[4..8].try_into().expect("4 bytes; qed"));
-			Sibling::from(ParaId::from(para_id)).into_account_truncating()
-		} else {
-			who.clone()
+		match ParaId::try_from_account(who) {
+			Some(para_id) => migrator_types::sibling_account(para_id.into()),
+			None => who.clone(),
 		}
 	}
 
@@ -128,6 +125,9 @@ impl<T: Config> AccountsMigrator<T> {
 
 		let mut ct_batch = Vec::new();
 		let mut ah_batch = Vec::new();
+		// Balance-tracker deltas of this block's successful withdrawals; applied in one write at
+		// the end instead of one storage mutation per account.
+		let (mut ct_hold_sum, mut ct_free_sum, mut ah_free_sum) = (0u128, 0u128, 0u128);
 		let mut processed = 0u32;
 		let maybe_last_key = loop {
 			let Some((who, info)) = iter.next() else { break None };
@@ -135,21 +135,17 @@ impl<T: Config> AccountsMigrator<T> {
 
 			// Each account is withdrawn in its own transaction: a failure rolls back that
 			// account only, so it is skipped whole, never half-withdrawn.
-			let withdrawn = with_transaction_opaque_err::<_, Error<T>, _>(|| {
-				match Self::withdraw_account(&who, info) {
-					Ok(ok) => TransactionOutcome::Commit(Ok(ok)),
-					Err(e) => TransactionOutcome::Rollback(Err(e)),
-				}
-			})
-			.expect("Always returning Ok; qed");
-
-			match withdrawn {
+			match with_rollback(|| Self::withdraw_account(&who, info)) {
 				Ok(Some(Withdrawal { ct, ah })) => {
 					if let Some(account) = ct {
+						ct_hold_sum = ct_hold_sum
+							.saturating_add(account.holds.iter().map(|h| h.amount).sum());
+						ct_free_sum = ct_free_sum.saturating_add(account.free);
 						ct_batch.push(account);
 					}
-					if let Some(beneficiary) = ah {
-						ah_batch.push(beneficiary);
+					if let Some((who, amount)) = ah {
+						ah_free_sum = ah_free_sum.saturating_add(amount);
+						ah_batch.push((who, amount));
 					}
 				},
 				Ok(None) => (),
@@ -175,6 +171,20 @@ impl<T: Config> AccountsMigrator<T> {
 		if !ah_batch.is_empty() {
 			Pallet::<T>::send_teleport(ah_batch)?;
 		}
+
+		let burned = ct_hold_sum.saturating_add(ct_free_sum).saturating_add(ah_free_sum);
+		if burned > 0 {
+			RcMigratedBalance::<T>::try_mutate(|t| {
+				t.kept = t.kept.checked_sub(burned).ok_or(Error::<T>::BalanceAccounting)?;
+				t.ct_reserved =
+					t.ct_reserved.checked_add(ct_hold_sum).ok_or(Error::<T>::BalanceAccounting)?;
+				t.ct_free =
+					t.ct_free.checked_add(ct_free_sum).ok_or(Error::<T>::BalanceAccounting)?;
+				t.ah_free =
+					t.ah_free.checked_add(ah_free_sum).ok_or(Error::<T>::BalanceAccounting)?;
+				Ok::<(), Error<T>>(())
+			})?;
+		}
 		Ok(maybe_last_key)
 	}
 
@@ -191,44 +201,36 @@ impl<T: Config> AccountsMigrator<T> {
 		}
 		let free = info.data.free;
 		let reserved = info.data.reserved;
+		let held_back = |reason: &str| {
+			log::info!(target: LOG_TARGET, "Holding back account {who:?}: {reason}");
+			Pallet::<T>::deposit_event(Event::AccountHeldBack { who: who.clone(), free, reserved });
+			Ok(None)
+		};
 
 		// Pinned by governance after the off-chain pre-flight (e.g. a possible pure proxy whose
 		// control at the destination could not be verified): nothing of it moves.
 		if HeldBackAccounts::<T>::contains_key(who) {
-			log::info!(target: LOG_TARGET, "Holding back pinned account {who:?}");
-			Pallet::<T>::deposit_event(Event::AccountHeldBack {
-				who: who.clone(),
-				free,
-				reserved,
-			});
-			return Ok(None);
+			return held_back("pinned by governance");
 		}
 
 		// Reserved balance is only trusted up to what the owning pallets say this account
 		// deposited: registrar/HRMP deposits continue on the Coretime chain, proxy and pending
 		// HRMP-request deposits are refunded. More reserve than the two together is money whose
 		// origin is unknown (a true anomaly): the whole account stays on the RC.
-		let expected_ct = ExpectedCtReserve::<T>::get(who);
-		let expected_refund = ExpectedRefundReserve::<T>::get(who);
+		let (expected_ct, expected_refund) = if reserved.is_zero() {
+			(0, 0)
+		} else {
+			(ExpectedCtReserve::<T>::get(who), ExpectedRefundReserve::<T>::get(who))
+		};
 		if reserved > expected_ct.saturating_add(expected_refund) {
-			log::info!(
-				target: LOG_TARGET,
-				"Holding back account {who:?}: reserved {reserved} > attributable \
-				 {expected_ct} + {expected_refund}"
-			);
-			Pallet::<T>::deposit_event(Event::AccountHeldBack {
-				who: who.clone(),
-				free,
-				reserved,
-			});
-			return Ok(None);
+			return held_back("unattributable reserve");
 		}
 
 		// A reserve is supposed to be backed by a consumer reference; accounts where it is not
 		// have broken refcounts (a known on-chain anomaly). Unreserving them still works, but
 		// makes `frame_system` log an anonymous "underflow in reducing consumer" error — name
 		// the account here so the anomaly is attributable.
-		if !reserved.is_zero() && frame_system::Pallet::<T>::consumers(who) == 0 {
+		if !reserved.is_zero() && info.consumers == 0 {
 			log::warn!(
 				target: LOG_TARGET,
 				"Account {who:?} has reserved balance but no consumer reference"
@@ -273,21 +275,12 @@ impl<T: Config> AccountsMigrator<T> {
 			});
 		}
 		let liquid = free.saturating_add(refunded);
-		let mut ct_free = if ct_hold.is_zero() { 0 } else { liquid.min(CT_FREE_BUFFER) };
+		let mut ct_free = if ct_hold.is_zero() { 0 } else { liquid.min(T::CtFreeBuffer::get()) };
 		let mut ah_free = liquid.saturating_sub(ct_free);
-		if !ah_free.is_zero() && ah_free < AH_EXISTENTIAL_DEPOSIT && !ct_hold.is_zero() {
+		if !ah_free.is_zero() && ah_free < T::AhExistentialDeposit::get() && !ct_hold.is_zero() {
 			ct_free = ct_free.saturating_add(ah_free);
 			ah_free = 0;
 		}
-
-		RcMigratedBalance::<T>::try_mutate(|t| {
-			t.kept = t.kept.checked_sub(burned).ok_or(Error::<T>::BalanceAccounting)?;
-			t.ct_reserved =
-				t.ct_reserved.checked_add(ct_hold).ok_or(Error::<T>::BalanceAccounting)?;
-			t.ct_free = t.ct_free.checked_add(ct_free).ok_or(Error::<T>::BalanceAccounting)?;
-			t.ah_free = t.ah_free.checked_add(ah_free).ok_or(Error::<T>::BalanceAccounting)?;
-			Ok::<(), Error<T>>(())
-		})?;
 
 		let dest = Self::translate_destination(who);
 		let ct = if ct_hold.is_zero() && ct_free.is_zero() {

@@ -17,6 +17,16 @@
 
 use crate::mock::*;
 use codec::{Decode, Encode};
+use frame_support::traits::fungible::Inspect;
+use migrator_types::PortableProxyType;
+use pallet_rc2_migrator::{RcMigratedBalance, RcMigrationStage};
+use polkadot_runtime_common::paras_registrar;
+use runtime_parachains::hrmp::HrmpChannels;
+use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
+use sp_runtime::{
+	traits::{AccountIdConversion, Dispatchable},
+	AccountId32,
+};
 use std::collections::BTreeMap;
 use xcm::latest::prelude::*;
 
@@ -35,16 +45,49 @@ fn unpaid_transact<Call: Encode>(call: Call) -> Xcm<()> {
 }
 
 /// Mirror of the accounts-stage split rule, for assertions: how much of an account's free
-/// balance goes to the Coretime chain (working buffer) versus Asset Hub (teleport).
+/// balance goes to the Coretime chain (working buffer) versus Asset Hub (teleport). Valid for
+/// accounts whose reserve is fully CT-bound (which is what [`find_clean_manager`] selects).
 fn expected_split(free: u128, reserved: u128) -> (u128, u128) {
-	use pallet_rc2_migrator::{AH_EXISTENTIAL_DEPOSIT, CT_FREE_BUFFER};
-	let mut ct_free = if reserved == 0 { 0 } else { free.min(CT_FREE_BUFFER) };
+	let buffer: u128 = polkadot_runtime::CtFreeBuffer::get();
+	let ah_ed: u128 = polkadot_runtime::AhExistentialDeposit::get();
+	let mut ct_free = if reserved == 0 { 0 } else { free.min(buffer) };
 	let mut ah_free = free - ct_free;
-	if ah_free > 0 && ah_free < AH_EXISTENTIAL_DEPOSIT && reserved > 0 {
+	if ah_free > 0 && ah_free < ah_ed && reserved > 0 {
 		ct_free += ah_free;
 		ah_free = 0;
 	}
 	(ct_free, ah_free)
+}
+
+/// Polkadot-format SS58 of an account, for census output.
+fn ss58(a: &AccountId32) -> String {
+	a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
+}
+
+fn dot(v: u128) -> f64 {
+	v as f64 / 1e10
+}
+
+/// Find a parachain manager that migrates cleanly: a live registrar deposit that fully accounts
+/// for the account's reserve, and nothing else attached. Returns `(manager, free, reserved)`.
+/// Must run inside the RC externalities.
+fn find_clean_manager() -> (AccountId32, u128, u128) {
+	type Rc = polkadot_runtime::Runtime;
+	let mut recorded = BTreeMap::<AccountId32, u128>::new();
+	for (_, info) in paras_registrar::Paras::<Rc>::iter() {
+		*recorded.entry(info.manager).or_default() += info.deposit;
+	}
+	paras_registrar::Paras::<Rc>::iter()
+		.find_map(|(_, info)| {
+			let account = frame_system::Account::<Rc>::get(&info.manager);
+			(account.data.reserved > 0 &&
+				account.data.reserved <= *recorded.get(&info.manager).unwrap_or(&0) &&
+				account.data.frozen == 0 &&
+				pallet_balances::Holds::<Rc>::get(&info.manager).is_empty() &&
+				pallet_balances::Locks::<Rc>::get(&info.manager).is_empty())
+			.then(|| (info.manager, account.data.free, account.data.reserved))
+		})
+		.expect("live RC snapshot has a cleanly migrating parachain manager")
 }
 
 // Multi-thread runtimes so snapshot loading/hydration actually runs in parallel; the default
@@ -102,10 +145,7 @@ async fn message_round_trip<P: Para>()
 where
 	RuntimeCallFor<P>: From<frame_system::Call<P::Runtime>>,
 {
-	let (rc, para) =
-		tokio::join!(tokio::spawn(remote_ext(Chain::Relay)), tokio::spawn(remote_ext(P::CHAIN)),);
-	let mut rc = rc.expect("failed to load the Relay Chain snapshot");
-	let mut para = para.unwrap_or_else(|_| panic!("failed to load the {} snapshot", P::NAME));
+	let (mut rc, mut para) = tokio::join!(load(Chain::Relay), load(P::CHAIN));
 
 	// RC -> para.
 	let dmp = rc.execute_with(|| {
@@ -171,7 +211,6 @@ where
 	<T as pallet_balances::Config>::FreezeIdentifier: std::fmt::Debug,
 	<T as pallet_balances::Config>::ReserveIdentifier: std::fmt::Debug,
 {
-	let dot = |v: u128| v as f64 / 1e10;
 	let mut accounts = 0u32;
 	let (mut free, mut reserved, mut frozen, mut unnamed_reserve) =
 		(CensusRow::default(), CensusRow::default(), CensusRow::default(), CensusRow::default());
@@ -268,23 +307,32 @@ async fn balance_census() {
 		// direct answer to "where does the kept balance sit".
 		{
 			type Rc = polkadot_runtime::Runtime;
-			let ed = <pallet_balances::Pallet<Rc> as frame_support::traits::fungible::Inspect<_>>::minimum_balance();
+			let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
 			let mut cats: BTreeMap<&str, (u32, u128)> = BTreeMap::new();
 			for (who, info) in frame_system::Account::<Rc>::iter() {
 				let d = &info.data;
 				let total = d.free + d.reserved;
 				let bytes: &[u8] = who.as_ref();
-				let cat = if bytes.starts_with(b"para") { "para sovereign" }
-					else if bytes.starts_with(b"sibl") { "sibl sovereign" }
-					else if bytes.starts_with(b"modl") { "module account" }
-					else if total < ed { "below-ED" }
-					else if d.frozen > 0 ||
-						!pallet_balances::Locks::<Rc>::get(&who).is_empty() ||
-						!pallet_balances::Freezes::<Rc>::get(&who).is_empty() ||
-						!pallet_balances::Holds::<Rc>::get(&who).is_empty() { "locks/freezes/holds" }
-					else { continue };
+				let cat = if bytes.starts_with(b"para") {
+					"para sovereign"
+				} else if bytes.starts_with(b"sibl") {
+					"sibl sovereign"
+				} else if bytes.starts_with(b"modl") {
+					"module account"
+				} else if total < ed {
+					"below-ED"
+				} else if d.frozen > 0 ||
+					!pallet_balances::Locks::<Rc>::get(&who).is_empty() ||
+					!pallet_balances::Freezes::<Rc>::get(&who).is_empty() ||
+					!pallet_balances::Holds::<Rc>::get(&who).is_empty()
+				{
+					"locks/freezes/holds"
+				} else {
+					continue
+				};
 				let e = cats.entry(cat).or_default();
-				e.0 += 1; e.1 += total;
+				e.0 += 1;
+				e.1 += total;
 			}
 			println!("\n### kept-account decomposition (accounts the migrator skips)");
 			let mut sum = 0u128;
@@ -301,16 +349,10 @@ async fn balance_census() {
 		// `over` are accounts with additional unattributable reserves (proxy deposits) that the
 		// migration holds back whole.
 		{
-			use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 			type Rc = polkadot_runtime::Runtime;
-			let ss58 = |a: &sp_runtime::AccountId32| {
-				a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
-			};
-			let dot = |v: u128| v as f64 / 1e10;
-
-			let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
-			let mut paras_of = BTreeMap::<sp_runtime::AccountId32, Vec<(u32, u128, Option<bool>)>>::new();
-			for (id, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+			let mut recorded = BTreeMap::<AccountId32, u128>::new();
+			let mut paras_of = BTreeMap::<AccountId32, Vec<(u32, u128, Option<bool>)>>::new();
+			for (id, info) in paras_registrar::Paras::<Rc>::iter() {
 				*recorded.entry(info.manager.clone()).or_default() += info.deposit;
 				paras_of.entry(info.manager).or_default().push((
 					id.into(),
@@ -322,10 +364,15 @@ async fn balance_census() {
 			println!("\n### registrar deposit anomalies (recorded vs live reserve, per manager)");
 			for (manager, expected) in &recorded {
 				let reserved = frame_system::Account::<Rc>::get(manager).data.reserved;
-				let cat = if reserved == *expected { "exact" }
-					else if reserved == 0 { "zero reserve (anomaly)" }
-					else if reserved < *expected { "partial reserve (anomaly)" }
-					else { "over-reserved (held back: proxy etc.)" };
+				let cat = if reserved == *expected {
+					"exact"
+				} else if reserved == 0 {
+					"zero reserve (anomaly)"
+				} else if reserved < *expected {
+					"partial reserve (anomaly)"
+				} else {
+					"over-reserved (held back: proxy etc.)"
+				};
 				if cat != "exact" {
 					println!(
 						"{cat}: {} | paras {:?} | recorded {:.4} DOT, live reserve {:.4} DOT, gap {:.4} DOT",
@@ -337,18 +384,22 @@ async fn balance_census() {
 					);
 				}
 				let e = cls.entry(cat).or_default();
-				e.0 += 1; e.1 += paras_of[manager].len() as u32; e.2 += expected;
+				e.0 += 1;
+				e.1 += paras_of[manager].len() as u32;
+				e.2 += expected;
 			}
 			println!("\n### registrar reconciliation summary");
 			for (cat, (managers, paras, dep)) in &cls {
-				println!("{cat}: {managers} managers / {paras} paras, recorded {:.4} DOT", dot(*dep));
+				println!(
+					"{cat}: {managers} managers / {paras} paras, recorded {:.4} DOT",
+					dot(*dep)
+				);
 			}
 
 			// HRMP: per (child) sovereign, channel deposits vs live reserve — including pending
 			// open-channel-request deposits, which are reserved but attached to no channel yet.
-			use sp_runtime::traits::AccountIdConversion;
-			let mut channel_dep = BTreeMap::<sp_runtime::AccountId32, (u128, Vec<u32>)>::new();
-			for (id, ch) in runtime_parachains::hrmp::HrmpChannels::<Rc>::iter() {
+			let mut channel_dep = BTreeMap::<AccountId32, (u128, Vec<u32>)>::new();
+			for (id, ch) in HrmpChannels::<Rc>::iter() {
 				let s = channel_dep
 					.entry(id.sender.into_account_truncating())
 					.or_insert((0, vec![u32::from(id.sender)]));
@@ -358,12 +409,14 @@ async fn balance_census() {
 					.or_insert((0, vec![u32::from(id.recipient)]));
 				r.0 += ch.recipient_deposit;
 			}
-			let mut request_dep = BTreeMap::<sp_runtime::AccountId32, u128>::new();
+			let mut request_dep = BTreeMap::<AccountId32, u128>::new();
 			for (id, req) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter() {
 				*request_dep.entry(id.sender.into_account_truncating()).or_default() +=
 					req.sender_deposit;
 			}
-			println!("\n### hrmp sovereign reconciliation (channel + request deposits vs live reserve)");
+			println!(
+				"\n### hrmp sovereign reconciliation (channel + request deposits vs live reserve)"
+			);
 			let (mut exact, mut short, mut over) = (0u32, 0u32, 0u32);
 			for (sov, (chan, paras)) in &channel_dep {
 				let requests = request_dep.get(sov).copied().unwrap_or(0);
@@ -385,20 +438,15 @@ async fn balance_census() {
 					);
 				}
 			}
-			println!("hrmp sovereigns: {exact} exact, {short} short (anomaly), {over} over-reserved");
+			println!(
+				"hrmp sovereigns: {exact} exact, {short} short (anomaly), {over} over-reserved"
+			);
 		}
 
 		// Who would remain on the RC after the migration and why — the "RC → 0" gap list.
 		{
-			use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 			type Rc = polkadot_runtime::Runtime;
-			let ss58 = |a: &sp_runtime::AccountId32| {
-				a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
-			};
-			let dot = |v: u128| v as f64 / 1e10;
-			let ed = <pallet_balances::Pallet<Rc> as frame_support::traits::fungible::Inspect<
-				sp_runtime::AccountId32,
-			>>::minimum_balance();
+			let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
 
 			println!("\n### remaining-on-RC gap list (accounts the migration cannot move)");
 			let (mut dust_n, mut dust_amt) = (0u32, 0u128);
@@ -410,13 +458,18 @@ async fn balance_census() {
 					let name = String::from_utf8_lossy(&bytes[4..12]);
 					println!(
 						"module `{}`: {} | free {:.4} reserved {:.4}",
-						name.trim_end_matches('\0'), ss58(&who), dot(d.free), dot(d.reserved),
+						name.trim_end_matches('\0'),
+						ss58(&who),
+						dot(d.free),
+						dot(d.reserved),
 					);
 				} else if bytes.starts_with(b"sibl") {
 					let para = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
 					println!(
 						"sibl sovereign of para {para}: {} | free {:.4} reserved {:.4}",
-						ss58(&who), dot(d.free), dot(d.reserved),
+						ss58(&who),
+						dot(d.free),
+						dot(d.reserved),
 					);
 				} else if total < ed {
 					dust_n += 1;
@@ -426,12 +479,15 @@ async fn balance_census() {
 					// reserve accounts for mean some pallet still references it.
 					let expected = u32::from(d.reserved > 0);
 					if info.consumers > expected {
-						let keys =
-							pallet_session::NextKeys::<Rc>::get(&who).is_some();
+						let keys = pallet_session::NextKeys::<Rc>::get(&who).is_some();
 						println!(
 							"referenced: {} | free {:.4} reserved {:.4} consumers {} \
 							 session-keys {}",
-							ss58(&who), dot(d.free), dot(d.reserved), info.consumers, keys,
+							ss58(&who),
+							dot(d.free),
+							dot(d.reserved),
+							info.consumers,
+							keys,
 						);
 					}
 				}
@@ -443,30 +499,45 @@ async fn balance_census() {
 		// belong to accounts that no longer exist (v1 reaped the account, the key survived).
 		{
 			type Rc = polkadot_runtime::Runtime;
-			let mut report = |name: &str, entries: Vec<(sp_runtime::AccountId32, bool)>| {
+			let report = |name: &str, entries: Vec<(AccountId32, bool)>| {
 				let n = entries.len();
 				let empty = entries.iter().filter(|(_, e)| *e).count();
-				let orphan = entries.iter()
+				let orphan = entries
+					.iter()
 					.filter(|(who, _)| !frame_system::Account::<Rc>::contains_key(who))
 					.count();
-				println!("{name}: {n} keys, {empty} empty-value, {orphan} for nonexistent accounts");
+				println!(
+					"{name}: {n} keys, {empty} empty-value, {orphan} for nonexistent accounts"
+				);
 			};
-			report("Balances::Locks", pallet_balances::Locks::<Rc>::iter()
-				.map(|(w, v)| (w, v.is_empty())).collect());
-			report("Balances::Reserves", pallet_balances::Reserves::<Rc>::iter()
-				.map(|(w, v)| (w, v.is_empty())).collect());
-			report("Balances::Freezes", pallet_balances::Freezes::<Rc>::iter()
-				.map(|(w, v)| (w, v.is_empty())).collect());
-			report("Balances::Holds", pallet_balances::Holds::<Rc>::iter()
-				.map(|(w, v)| (w, v.is_empty())).collect());
+			report(
+				"Balances::Locks",
+				pallet_balances::Locks::<Rc>::iter().map(|(w, v)| (w, v.is_empty())).collect(),
+			);
+			report(
+				"Balances::Reserves",
+				pallet_balances::Reserves::<Rc>::iter()
+					.map(|(w, v)| (w, v.is_empty()))
+					.collect(),
+			);
+			report(
+				"Balances::Freezes",
+				pallet_balances::Freezes::<Rc>::iter().map(|(w, v)| (w, v.is_empty())).collect(),
+			);
+			report(
+				"Balances::Holds",
+				pallet_balances::Holds::<Rc>::iter().map(|(w, v)| (w, v.is_empty())).collect(),
+			);
 		}
 
 		// Unclaimed pre-genesis claims are part of total issuance but sit in no account — the
 		// prime suspect for the "not held by any account" row above.
-		let unclaimed =
-			polkadot_runtime_common::claims::Total::<polkadot_runtime::Runtime>::get();
+		let unclaimed = polkadot_runtime_common::claims::Total::<polkadot_runtime::Runtime>::get();
 		println!();
-		println!("claims::Total (unclaimed pre-genesis claims): {:.4} DOT", unclaimed as f64 / 1e10);
+		println!(
+			"claims::Total (unclaimed pre-genesis claims): {:.4} DOT",
+			unclaimed as f64 / 1e10
+		);
 
 		// AHM v1's final balance bookkeeping, for provenance of the issuance numbers. Read via
 		// raw key to avoid depending on pallet-rc-migrator just for one probe.
@@ -506,18 +577,13 @@ async fn balance_census() {
 /// Writes to the file named by `AHM_PROXY_DUMP`; without it, prints only aggregates.
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_census() {
-	use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 	type Rc = polkadot_runtime::Runtime;
 
 	let mut rc = remote_ext(Chain::Relay).await;
 	rc.execute_with(|| {
-		let ss58 = |a: &sp_runtime::AccountId32| {
-			a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
-		};
-
 		// Registrar managers and what they manage.
-		let mut manages = BTreeMap::<sp_runtime::AccountId32, Vec<u32>>::new();
-		for (id, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+		let mut manages = BTreeMap::<AccountId32, Vec<u32>>::new();
+		for (id, info) in paras_registrar::Paras::<Rc>::iter() {
 			manages.entry(info.manager).or_default().push(id.into());
 		}
 
@@ -578,42 +644,13 @@ async fn accounts_migrate_rc_to_ct() {
 	type Rc = polkadot_runtime::Runtime;
 	type Ct = coretime_polkadot_runtime::Runtime;
 	type RcStage = pallet_rc2_migrator::MigrationStageOf<Rc>;
-	use pallet_rc2_migrator::{RcMigratedBalance, RcMigrationStage};
 
-	let (rc, ct) = tokio::join!(
-		tokio::spawn(remote_ext(Chain::Relay)),
-		tokio::spawn(remote_ext(Chain::Coretime)),
-	);
-	let mut rc = rc.expect("failed to load the Relay Chain snapshot");
-	let mut ct = ct.expect("failed to load the Coretime snapshot");
+	let (mut rc, mut ct) = tokio::join!(load(Chain::Relay), load(Chain::Coretime));
 
 	// GIVEN a parachain manager holding a live registrar deposit (reserved balance) on the RC.
 	let (manager, rc_free, rc_reserved, rc_issuance_before) = rc.execute_with(|| {
-		// Recorded registrar deposits per manager: only accounts whose whole reserve is
-		// attributable migrate; the rest are held back for the proxy stage.
-		let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
-		for (_, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
-			*recorded.entry(info.manager).or_default() += info.deposit;
-		}
-		let (manager, account) = polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter()
-			.find_map(|(_para, info)| {
-				let account = frame_system::Account::<Rc>::get(&info.manager);
-				// A cleanly migratable manager: a real, fully attributable reserve and nothing
-				// else attached.
-				(account.data.reserved > 0 &&
-					account.data.reserved <= *recorded.get(&info.manager).unwrap_or(&0) &&
-					account.data.frozen == 0 &&
-					pallet_balances::Holds::<Rc>::get(&info.manager).is_empty() &&
-					pallet_balances::Locks::<Rc>::get(&info.manager).is_empty())
-				.then(|| (info.manager, account))
-			})
-			.expect("live RC snapshot has a parachain manager with a registrar deposit");
-		(
-			manager,
-			account.data.free,
-			account.data.reserved,
-			pallet_balances::TotalIssuance::<Rc>::get(),
-		)
+		let (manager, free, reserved) = find_clean_manager();
+		(manager, free, reserved, pallet_balances::TotalIssuance::<Rc>::get())
 	});
 	// What the split rule should do with this manager.
 	let (ct_free_exp, _ah_free_exp) = expected_split(rc_free, rc_reserved);
@@ -718,59 +755,39 @@ async fn full_migration_rc_to_ct() {
 	type Rc = polkadot_runtime::Runtime;
 	type Ct = coretime_polkadot_runtime::Runtime;
 	type RcStage = pallet_rc2_migrator::MigrationStageOf<Rc>;
-	use pallet_rc2_migrator::{RcMigratedBalance, RcMigrationStage};
-	use polkadot_runtime_common::paras_registrar;
-	use runtime_parachains::hrmp::HrmpChannels;
-
 	type Ah = asset_hub_polkadot_runtime::Runtime;
 
-	let (rc, ct, ah) = tokio::join!(
-		tokio::spawn(remote_ext(Chain::Relay)),
-		tokio::spawn(remote_ext(Chain::Coretime)),
-		tokio::spawn(remote_ext(Chain::AssetHub)),
-	);
-	let mut rc = rc.expect("failed to load the Relay Chain snapshot");
-	let mut ct = ct.expect("failed to load the Coretime snapshot");
-	let mut ah = ah.expect("failed to load the Asset Hub snapshot");
+	let (mut rc, mut ct, mut ah) =
+		tokio::join!(load(Chain::Relay), load(Chain::Coretime), load(Chain::AssetHub));
 
 	// GIVEN the live registrar and HRMP state of the snapshot, and one cleanly migrating
 	// manager to spot-check the AH teleport leg with.
-	let (paras_before, hrmp_before, requests_before, rc_ti_before, sample) = rc.execute_with(|| {
-		crate::events::emit_rc_census("before");
-		let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
-			.map(|(id, info)| (id.into(), info.deposit))
-			.collect();
-		let channels: Vec<(_, u128, u128)> = HrmpChannels::<Rc>::iter()
-			.map(|(id, ch)| (id, ch.sender_deposit, ch.recipient_deposit))
-			.collect();
-		let requests: Vec<u128> = runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter()
-			.map(|(_, r)| r.sender_deposit)
-			.collect();
+	let (paras_before, hrmp_before, requests_before, rc_ti_before, sample) =
+		rc.execute_with(|| {
+			crate::events::emit_rc_census("before");
+			let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
+				.map(|(id, info)| (id.into(), info.deposit))
+				.collect();
+			let channels: Vec<(_, u128, u128)> = HrmpChannels::<Rc>::iter()
+				.map(|(id, ch)| (id, ch.sender_deposit, ch.recipient_deposit))
+				.collect();
+			let requests: Vec<u128> =
+				runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter()
+					.map(|(_, r)| r.sender_deposit)
+					.collect();
 
-		let mut recorded = BTreeMap::<sp_runtime::AccountId32, u128>::new();
-		for (_, info) in paras_registrar::Paras::<Rc>::iter() {
-			*recorded.entry(info.manager).or_default() += info.deposit;
-		}
-		let sample = paras_registrar::Paras::<Rc>::iter()
-			.find_map(|(_, info)| {
-				let account = frame_system::Account::<Rc>::get(&info.manager);
-				(account.data.reserved > 0 &&
-					account.data.reserved <= *recorded.get(&info.manager).unwrap_or(&0) &&
-					account.data.frozen == 0 &&
-					pallet_balances::Holds::<Rc>::get(&info.manager).is_empty() &&
-					pallet_balances::Locks::<Rc>::get(&info.manager).is_empty())
-				.then(|| (info.manager, account.data.free, account.data.reserved))
-			})
-			.expect("live RC snapshot has a cleanly migrating manager");
-
-		(paras, channels, requests, pallet_balances::TotalIssuance::<Rc>::get(), sample)
-	});
+			(
+				paras,
+				channels,
+				requests,
+				pallet_balances::TotalIssuance::<Rc>::get(),
+				find_clean_manager(),
+			)
+		});
 
 	// The sweep stage's inputs: the old treasury pot plus reapable below-ED dust.
 	let (treasury, sweep_expected) = rc.execute_with(|| {
-		use frame_support::traits::fungible::Inspect;
-		use sp_runtime::traits::AccountIdConversion;
-		let treasury: sp_runtime::AccountId32 =
+		let treasury: AccountId32 =
 			polkadot_runtime::TreasuryPalletId::get().into_account_truncating();
 		let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
 		let mut expected = frame_system::Account::<Rc>::get(&treasury).data.free;
@@ -797,7 +814,10 @@ async fn full_migration_rc_to_ct() {
 	// delegator with both an Any and a ParaRegistration delegate for the dispatch checks, and
 	// every never-signed delegator for the funds-follow-control invariant.
 	let (ct_bound_proxies, nonce0_delegators, proxy_dispatch) = rc.execute_with(|| {
-		use migrator_types::PortableProxyType as P;
+		// The portable type a definition translates to, if the CT chain represents it.
+		let portable = |t: &<Rc as pallet_proxy::Config>::ProxyType| {
+			PortableProxyType::try_from(t.clone()).ok()
+		};
 		let managers: std::collections::BTreeSet<_> =
 			paras_registrar::Paras::<Rc>::iter().map(|(_, i)| i.manager).collect();
 		let mut ct_bound = Vec::new();
@@ -810,27 +830,24 @@ async fn full_migration_rc_to_ct() {
 				// `as_multi` — no other dispatch path exists at nonce 0 with no prior defs and
 				// no post-v1 `create_pure` (verified by events and the spawner-reserve
 				// signature) — so it is a multisig, controllable on every chain by its members.
-				let had_any = defs
-					.iter()
-					.any(|d| P::try_from(d.proxy_type.clone()).ok() == Some(P::Any));
+				let had_any =
+					defs.iter().any(|d| portable(&d.proxy_type) == Some(PortableProxyType::Any));
 				let existed = frame_system::Account::<Rc>::contains_key(&who);
 				nonce0.push((who.clone(), had_any, existed));
 			}
 			let linked = managers.contains(&who) ||
 				defs.iter().any(|d| managers.contains(&d.delegate)) ||
 				defs.iter().any(|d| {
-					P::try_from(d.proxy_type.clone()).ok() == Some(P::ParaRegistration)
+					portable(&d.proxy_type) == Some(PortableProxyType::ParaRegistration)
 				});
 			if linked {
-				let any = defs
+				let any =
+					defs.iter().find(|d| portable(&d.proxy_type) == Some(PortableProxyType::Any));
+				let reg = defs
 					.iter()
-					.find(|d| P::try_from(d.proxy_type.clone()).ok() == Some(P::Any));
-				let reg = defs.iter().find(|d| {
-					P::try_from(d.proxy_type.clone()).ok() == Some(P::ParaRegistration)
-				});
+					.find(|d| portable(&d.proxy_type) == Some(PortableProxyType::ParaRegistration));
 				if let (Some(any), Some(reg), None) = (any, reg, dispatch.as_ref()) {
-					dispatch =
-						Some((who.clone(), any.delegate.clone(), reg.delegate.clone()));
+					dispatch = Some((who.clone(), any.delegate.clone(), reg.delegate.clone()));
 				}
 				ct_bound.push(who.clone());
 			}
@@ -855,8 +872,8 @@ async fn full_migration_rc_to_ct() {
 		let deny: Vec<_> = nonce0_delegators
 			.iter()
 			.filter(|(who, had_any, existed)| {
-				*existed && *had_any &&
-					frame_system::Account::<Ah>::get(who).nonce == 0 &&
+				*existed &&
+					*had_any && frame_system::Account::<Ah>::get(who).nonce == 0 &&
 					pallet_proxy::Proxies::<Ah>::get(who).0.is_empty()
 			})
 			.map(|(who, ..)| who.clone())
@@ -977,9 +994,9 @@ async fn full_migration_rc_to_ct() {
 		}
 		let residual = pallet_proxy::Proxies::<Rc>::get(&proxy_dispatch.0).0;
 		assert!(
-			residual.iter().all(|d| {
-				migrator_types::PortableProxyType::try_from(d.proxy_type.clone()).is_err()
-			}),
+			residual
+				.iter()
+				.all(|d| PortableProxyType::try_from(d.proxy_type.clone()).is_err()),
 			"the manager's translatable defs must have left the RC"
 		);
 
@@ -1014,8 +1031,10 @@ async fn full_migration_rc_to_ct() {
 		let tracker = RcMigratedBalance::<Rc>::get();
 		assert_eq!(
 			tracker.kept +
-				tracker.ct_reserved + tracker.ct_free +
-				tracker.ah_free + tracker.ti_corrected,
+				tracker.ct_reserved +
+				tracker.ct_free +
+				tracker.ah_free +
+				tracker.ti_corrected,
 			rc_ti_before,
 			"balance bookkeeping is exact"
 		);
@@ -1057,10 +1076,7 @@ async fn full_migration_rc_to_ct() {
 		);
 		for (id, _, _) in &hrmp_before {
 			assert!(
-				RcHrmpChannels::<Ct>::contains_key((
-					u32::from(id.sender),
-					u32::from(id.recipient)
-				)),
+				RcHrmpChannels::<Ct>::contains_key((u32::from(id.sender), u32::from(id.recipient))),
 				"channel {id:?} must land under its (sender, recipient) key"
 			);
 		}
@@ -1081,30 +1097,24 @@ async fn full_migration_rc_to_ct() {
 
 		// Re-attribution must not create holds out of thin air: the sum of holds under each
 		// attributed reason equals its re-attributed total.
-		let held_under = |reason: HoldReason| -> u128 {
-			let id = coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(reason);
-			frame_system::Account::<Ct>::iter_keys()
-				.flat_map(|who| pallet_balances::Holds::<Ct>::get(&who))
-				.filter(|h| h.id == id)
-				.map(|h| h.amount)
-				.sum()
-		};
-		assert_eq!(
-			held_under(HoldReason::RegistrarDeposit),
-			reattributed,
-			"RegistrarDeposit holds match the re-attributed total"
-		);
-		assert_eq!(
-			held_under(HoldReason::HrmpDeposit),
-			reattributed_hrmp,
-			"HrmpDeposit holds match the re-attributed total"
-		);
+		let reg_id =
+			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::RegistrarDeposit);
+		let hrmp_id =
+			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::HrmpDeposit);
+		let (mut reg_held, mut hrmp_held) = (0u128, 0u128);
+		for who in frame_system::Account::<Ct>::iter_keys() {
+			for hold in pallet_balances::Holds::<Ct>::get(&who) {
+				if hold.id == reg_id {
+					reg_held += hold.amount;
+				} else if hold.id == hrmp_id {
+					hrmp_held += hold.amount;
+				}
+			}
+		}
+		assert_eq!(reg_held, reattributed, "RegistrarDeposit holds match the re-attributed total");
+		assert_eq!(hrmp_held, reattributed_hrmp, "HrmpDeposit holds match the re-attributed total");
 
-		assert_eq!(
-			CtMintedTotal::<Ct>::get(),
-			migrated_ct,
-			"CT minted exactly the CT-bound burn"
-		);
+		assert_eq!(CtMintedTotal::<Ct>::get(), migrated_ct, "CT minted exactly the CT-bound burn");
 		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated_ct);
 
 		// AND every manager-linked delegator's definitions were recreated in the REAL proxy
@@ -1119,14 +1129,13 @@ async fn full_migration_rc_to_ct() {
 
 		// Dispatch checks through the recreated definitions: the Any delegate acts for the
 		// manager; the ParaRegistration delegate is accepted but its filter allows nothing yet.
-		use sp_runtime::traits::Dispatchable;
 		let (manager, any_delegate, reg_delegate) = proxy_dispatch.clone();
 		let remark = || {
 			Box::new(coretime_polkadot_runtime::RuntimeCall::System(
 				frame_system::Call::remark_with_event { remark: b"via proxy".to_vec() },
 			))
 		};
-		let proxy_call = |force, delegate: &sp_runtime::AccountId32| {
+		let proxy_call = |force, delegate: &AccountId32| {
 			coretime_polkadot_runtime::RuntimeCall::Proxy(pallet_proxy::Call::proxy {
 				real: sp_runtime::MultiAddress::Id(manager.clone()),
 				force_proxy_type: force,
@@ -1151,11 +1160,8 @@ async fn full_migration_rc_to_ct() {
 			"the Any-proxied call must execute"
 		);
 
-		proxy_call(
-			Some(coretime_polkadot_runtime::ProxyType::ParaRegistration),
-			&reg_delegate,
-		)
-		.expect("ParaRegistration delegate is recognised");
+		proxy_call(Some(coretime_polkadot_runtime::ProxyType::ParaRegistration), &reg_delegate)
+			.expect("ParaRegistration delegate is recognised");
 		assert!(
 			matches!(executed(&frame_system::Pallet::<Ct>::events()), Some(Err(_))),
 			"the ParaRegistration filter must allow nothing until the registrar lands"
