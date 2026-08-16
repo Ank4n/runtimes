@@ -159,48 +159,31 @@ pub fn emit_rc_block() {
 	use pallet_rc2_migrator::Event as MigEvent;
 
 	let block = frame_system::Pallet::<Rc>::block_number();
+	let e = |kind: &str, payload: Value| emit("rc", block, kind, payload);
 	for record in frame_system::Pallet::<Rc>::events() {
 		match record.event {
-			polkadot_runtime::RuntimeEvent::Rc2Migrator(e) => match e {
-				MigEvent::StageTransition { old, new } => emit(
-					"rc",
-					block,
-					"stage",
-					json!({ "old": stage_str(&old), "new": stage_str(&new) }),
-				),
+			polkadot_runtime::RuntimeEvent::Rc2Migrator(ev) => match ev {
+				MigEvent::StageTransition { old, new } =>
+					e("stage", json!({ "old": stage_str(&old), "new": stage_str(&new) })),
 				MigEvent::AccountsBatchSent { count } =>
-					emit("rc", block, "accounts_batch_sent", json!({ "count": count })),
-				MigEvent::DepositRefunded { who, amount } => emit(
-					"rc",
-					block,
+					e("accounts_batch_sent", json!({ "count": count })),
+				MigEvent::DepositRefunded { who, amount } => e(
 					"deposit_refunded",
 					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
 				),
 				MigEvent::ProxyBatchSent { count } =>
-					emit("rc", block, "proxy_batch_sent", json!({ "count": count })),
-				MigEvent::AccountSwept { who, amount } => emit(
-					"rc",
-					block,
+					e("proxy_batch_sent", json!({ "count": count })),
+				MigEvent::AccountSwept { who, amount } => e(
 					"account_swept",
 					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
 				),
-				MigEvent::DustSwept { count, amount } => emit(
-					"rc",
-					block,
-					"dust_swept",
-					json!({ "count": count, "amount": planck(amount) }),
-				),
+				MigEvent::DustSwept { count, amount } =>
+					e("dust_swept", json!({ "count": count, "amount": planck(amount) })),
 				MigEvent::HrmpRequestsSent { count } =>
-					emit("rc", block, "hrmp_requests_sent", json!({ "count": count })),
-				MigEvent::AccountsTeleported { count, amount } => emit(
-					"rc",
-					block,
-					"accounts_teleported",
-					json!({ "count": count, "amount": planck(amount) }),
-				),
-				MigEvent::AccountHeldBack { who, free, reserved } => emit(
-					"rc",
-					block,
+					e("hrmp_requests_sent", json!({ "count": count })),
+				MigEvent::AccountsTeleported { count, amount } =>
+					e("accounts_teleported", json!({ "count": count, "amount": planck(amount) })),
+				MigEvent::AccountHeldBack { who, free, reserved } => e(
 					"account_held_back",
 					json!({
 						"who": format!("{who:?}"),
@@ -208,9 +191,7 @@ pub fn emit_rc_block() {
 						"reserved": planck(reserved),
 					}),
 				),
-				MigEvent::TiCorrected { expected, unaccounted, burned } => emit(
-					"rc",
-					block,
+				MigEvent::TiCorrected { expected, unaccounted, burned } => e(
 					"ti_corrected",
 					json!({
 						"expected": planck(expected),
@@ -218,29 +199,25 @@ pub fn emit_rc_block() {
 						"burned": planck(burned),
 					}),
 				),
-				MigEvent::TiCorrectionAnomaly { expected, unaccounted } => emit(
-					"rc",
-					block,
+				MigEvent::TiCorrectionAnomaly { expected, unaccounted } => e(
 					"ti_correction_anomaly",
 					json!({ "expected": planck(expected), "unaccounted": planck(unaccounted) }),
 				),
 				MigEvent::RegistrarBatchSent { count } =>
-					emit("rc", block, "registrar_batch_sent", json!({ "count": count })),
+					e("registrar_batch_sent", json!({ "count": count })),
 				MigEvent::HrmpBatchSent { count } =>
-					emit("rc", block, "hrmp_batch_sent", json!({ "count": count })),
+					e("hrmp_batch_sent", json!({ "count": count })),
 				_ => (),
 			},
 			polkadot_runtime::RuntimeEvent::MessageQueue(
 				pallet_message_queue::Event::Processed { success, .. },
-			) if !success => emit("rc", block, "mq_failed", json!({})),
+			) if !success => e("mq_failed", json!({})),
 			_ => (),
 		}
 	}
 
 	let tracker = pallet_rc2_migrator::RcMigratedBalance::<Rc>::get();
-	emit(
-		"rc",
-		block,
+	e(
 		"state",
 		json!({
 			"stage": stage_str(&pallet_rc2_migrator::RcMigrationStage::<Rc>::get()),
@@ -250,9 +227,9 @@ pub fn emit_rc_block() {
 			"ct_free": planck(tracker.ct_free),
 			"ah_free": planck(tracker.ah_free),
 			"ti_corrected": planck(tracker.ti_corrected),
-			"paras": polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter().count(),
-			"hrmp_channels": runtime_parachains::hrmp::HrmpChannels::<Rc>::iter().count(),
-			"proxies": pallet_proxy::Proxies::<Rc>::iter().count(),
+			"paras": polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter_keys().count(),
+			"hrmp_channels": runtime_parachains::hrmp::HrmpChannels::<Rc>::iter_keys().count(),
+			"proxies": pallet_proxy::Proxies::<Rc>::iter_keys().count(),
 		}),
 	);
 }
@@ -292,46 +269,27 @@ fn emit_ct_block() {
 	use pallet_ct_migrator::Event as MigEvent;
 
 	let block = frame_system::Pallet::<Ct>::block_number();
+	let e = |kind: &str, payload: Value| emit("ct", block, kind, payload);
 	for record in frame_system::Pallet::<Ct>::events() {
 		match record.event {
-			coretime_polkadot_runtime::RuntimeEvent::CtMigrator(e) => match e {
-				MigEvent::StageTransition { old, new } => emit(
-					"ct",
-					block,
-					"stage",
-					json!({ "old": stage_str(&old), "new": stage_str(&new) }),
-				),
-				MigEvent::AccountsReceived { count_good, count_bad } => emit(
-					"ct",
-					block,
-					"accounts_received",
-					json!({ "good": count_good, "bad": count_bad }),
-				),
-				MigEvent::RegistrarReceived { count_good, count_bad } => emit(
-					"ct",
-					block,
-					"registrar_received",
-					json!({ "good": count_good, "bad": count_bad }),
-				),
-				MigEvent::DepositShortfallParked { para_id, shortfall } => emit(
-					"ct",
-					block,
+			coretime_polkadot_runtime::RuntimeEvent::CtMigrator(ev) => match ev {
+				MigEvent::StageTransition { old, new } =>
+					e("stage", json!({ "old": stage_str(&old), "new": stage_str(&new) })),
+				MigEvent::AccountsReceived { count_good, count_bad } =>
+					e("accounts_received", json!({ "good": count_good, "bad": count_bad })),
+				MigEvent::RegistrarReceived { count_good, count_bad } =>
+					e("registrar_received", json!({ "good": count_good, "bad": count_bad })),
+				MigEvent::DepositShortfallParked { para_id, shortfall } => e(
 					"deposit_shortfall_parked",
 					json!({ "para_id": para_id, "shortfall": planck(shortfall) }),
 				),
-				MigEvent::HrmpReceived { count } =>
-					emit("ct", block, "hrmp_received", json!({ "count": count })),
-				MigEvent::ProxiesReceived { count_good, count_bad } => emit(
-					"ct",
-					block,
-					"proxies_received",
-					json!({ "good": count_good, "bad": count_bad }),
-				),
+				MigEvent::HrmpReceived { count_good, count_bad } =>
+					e("hrmp_received", json!({ "good": count_good, "bad": count_bad })),
+				MigEvent::ProxiesReceived { count_good, count_bad } =>
+					e("proxies_received", json!({ "good": count_good, "bad": count_bad })),
 				MigEvent::HrmpRequestsReceived { count } =>
-					emit("ct", block, "hrmp_requests_received", json!({ "count": count })),
-				MigEvent::HrmpShortfallParked { sender, recipient, shortfall } => emit(
-					"ct",
-					block,
+					e("hrmp_requests_received", json!({ "count": count })),
+				MigEvent::HrmpShortfallParked { sender, recipient, shortfall } => e(
 					"hrmp_shortfall_parked",
 					json!({
 						"sender": sender,
@@ -339,9 +297,7 @@ fn emit_ct_block() {
 						"shortfall": planck(shortfall),
 					}),
 				),
-				MigEvent::MigrationFinished { rc_kept, rc_migrated, ct_minted } => emit(
-					"ct",
-					block,
+				MigEvent::MigrationFinished { rc_kept, rc_migrated, ct_minted } => e(
 					"migration_finished",
 					json!({
 						"rc_kept": planck(rc_kept),
@@ -352,14 +308,12 @@ fn emit_ct_block() {
 			},
 			coretime_polkadot_runtime::RuntimeEvent::MessageQueue(
 				pallet_message_queue::Event::Processed { success, .. },
-			) if !success => emit("ct", block, "mq_failed", json!({})),
+			) if !success => e("mq_failed", json!({})),
 			_ => (),
 		}
 	}
 
-	emit(
-		"ct",
-		block,
+	e(
 		"state",
 		json!({
 			"stage": stage_str(&pallet_ct_migrator::CtMigrationStage::<Ct>::get()),
@@ -367,15 +321,17 @@ fn emit_ct_block() {
 			"minted": planck(pallet_ct_migrator::CtMintedTotal::<Ct>::get()),
 			"reattributed": planck(pallet_ct_migrator::ReattributedDeposits::<Ct>::get()),
 			"reattributed_hrmp": planck(pallet_ct_migrator::ReattributedHrmpDeposits::<Ct>::get()),
-			"paras": pallet_ct_migrator::RcParas::<Ct>::iter().count(),
-			"hrmp_channels": pallet_ct_migrator::RcHrmpChannels::<Ct>::iter().count(),
-			"hrmp_requests": pallet_ct_migrator::RcHrmpOpenRequests::<Ct>::iter().count(),
-			"failed_accounts": pallet_ct_migrator::FailedAccounts::<Ct>::iter().count(),
-			"failed_paras": pallet_ct_migrator::FailedParas::<Ct>::iter().count(),
-			"failed_hrmp": pallet_ct_migrator::FailedHrmpChannels::<Ct>::iter().count(),
-			"failed_proxies": pallet_ct_migrator::FailedProxies::<Ct>::iter().count(),
-			"parked_shortfalls": pallet_ct_migrator::ParkedDepositShortfalls::<Ct>::iter().count(),
-			"parked_hrmp_shortfalls": pallet_ct_migrator::ParkedHrmpShortfalls::<Ct>::iter().count(),
+			"paras": pallet_ct_migrator::RcParas::<Ct>::iter_keys().count(),
+			"hrmp_channels": pallet_ct_migrator::RcHrmpChannels::<Ct>::iter_keys().count(),
+			"hrmp_requests": pallet_ct_migrator::RcHrmpOpenRequests::<Ct>::iter_keys().count(),
+			"failed_accounts": pallet_ct_migrator::FailedAccounts::<Ct>::iter_keys().count(),
+			"failed_paras": pallet_ct_migrator::FailedParas::<Ct>::iter_keys().count(),
+			"failed_hrmp": pallet_ct_migrator::FailedHrmpChannels::<Ct>::iter_keys().count(),
+			"failed_proxies": pallet_ct_migrator::FailedProxies::<Ct>::iter_keys().count(),
+			"parked_shortfalls":
+				pallet_ct_migrator::ParkedDepositShortfalls::<Ct>::iter_keys().count(),
+			"parked_hrmp_shortfalls":
+				pallet_ct_migrator::ParkedHrmpShortfalls::<Ct>::iter_keys().count(),
 		}),
 	);
 }

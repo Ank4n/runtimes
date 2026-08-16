@@ -13,16 +13,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HRMP stage: drains `hrmp::HrmpChannels` records from the relay chain and sends them to the
-//! Coretime chain in portable format.
+//! HRMP stage: drains the `hrmp` pallet's channel records and pending open-channel requests from
+//! the relay chain and sends them to the Coretime chain in portable format.
 //!
 //! Records only, deliberately:
-//! - The channel deposits stay reserved on the para *sovereign* accounts on the RC — those
-//!   accounts are skipped by the accounts stage because sovereign-account translation to the
-//!   destination chain is not designed yet.
+//! - The channel and request deposits travel via the accounts stage: they arrive as holds on the
+//!   paras' *sibling sovereign* accounts and are re-attributed by the receiving side as each record
+//!   lands.
 //! - The dynamic message state (`msg_count`, `total_size`, `mqc_head`) is not migrated; channels
 //!   are expected to be drained of messages before the migration runs.
-//! - Open-channel requests and the ingress/egress indexes are not migrated.
+//! - The ingress/egress indexes are not migrated.
 
 use crate::*;
 use runtime_parachains::hrmp::HrmpChannels;
@@ -31,15 +31,14 @@ pub struct HrmpMigrator<T>(PhantomData<T>);
 
 impl<T: Config> HrmpMigrator<T> {
 	/// Drain all pending open-channel requests and send them to the Coretime chain, where the
-	/// future HRMP system decides whether the handshakes can finish. Their sender deposits
-	/// travel via the accounts stage (indexed as CT-bound) and are re-labelled on arrival.
+	/// future HRMP system decides whether the handshakes can finish.
 	///
 	/// One-shot, called by `HrmpInit`; the request count is small (dozens). The caller wraps
 	/// this in a storage transaction so a failed send rolls everything back for a retry.
-	pub fn drain_open_requests() -> Result<u32, Error<T>> {
+	pub fn drain_open_requests() -> Result<(), Error<T>> {
 		use runtime_parachains::hrmp::{
-			HrmpAcceptedChannelRequestCount, HrmpOpenChannelRequestCount,
-			HrmpOpenChannelRequests, HrmpOpenChannelRequestsList,
+			HrmpAcceptedChannelRequestCount, HrmpOpenChannelRequestCount, HrmpOpenChannelRequests,
+			HrmpOpenChannelRequestsList,
 		};
 
 		let mut batch = Vec::new();
@@ -63,8 +62,10 @@ impl<T: Config> HrmpMigrator<T> {
 		for chunk in batch.chunks(MAX_RECORDS_PER_XCM as usize) {
 			Pallet::<T>::send_hrmp_requests(chunk.to_vec())?;
 		}
-		Ok(count)
+		Pallet::<T>::deposit_event(Event::HrmpRequestsSent { count });
+		Ok(())
 	}
+
 	/// Drain HRMP channel records until the per-block limit is reached.
 	///
 	/// Returns the cursor to continue from on the next block, or `None` once the map is
@@ -73,40 +74,27 @@ impl<T: Config> HrmpMigrator<T> {
 	pub fn migrate_many(
 		last_key: Option<HrmpChannelId>,
 	) -> Result<Option<HrmpChannelId>, Error<T>> {
-		let mut iter = match &last_key {
+		let iter = match &last_key {
 			Some(last_key) =>
 				HrmpChannels::<T>::iter_from(HrmpChannels::<T>::hashed_key_for(last_key)),
 			None => HrmpChannels::<T>::iter(),
 		};
 
-		let mut batch = Vec::new();
-		let mut processed = 0u32;
-		let maybe_last_key = loop {
-			let Some((channel_id, channel)) = iter.next() else { break None };
-			processed += 1;
-
-			HrmpChannels::<T>::remove(&channel_id);
-			batch.push(PortableHrmpChannel {
-				sender: channel_id.sender.into(),
-				recipient: channel_id.recipient.into(),
-				max_capacity: channel.max_capacity,
-				max_total_size: channel.max_total_size,
-				max_message_size: channel.max_message_size,
-				sender_deposit: channel.sender_deposit,
-				recipient_deposit: channel.recipient_deposit,
-			});
-
-			if batch.len() >= MAX_RECORDS_PER_XCM as usize {
-				Pallet::<T>::send_hrmp(core::mem::take(&mut batch))?;
-			}
-			if processed >= MAX_RECORDS_PER_BLOCK {
-				break Some(channel_id);
-			}
-		};
-
-		if !batch.is_empty() {
-			Pallet::<T>::send_hrmp(batch)?;
-		}
-		Ok(maybe_last_key)
+		Pallet::<T>::drain_records(
+			iter,
+			|channel_id, channel| {
+				HrmpChannels::<T>::remove(channel_id);
+				PortableHrmpChannel {
+					sender: channel_id.sender.into(),
+					recipient: channel_id.recipient.into(),
+					max_capacity: channel.max_capacity,
+					max_total_size: channel.max_total_size,
+					max_message_size: channel.max_message_size,
+					sender_deposit: channel.sender_deposit,
+					recipient_deposit: channel.recipient_deposit,
+				}
+			},
+			Pallet::<T>::send_hrmp,
+		)
 	}
 }

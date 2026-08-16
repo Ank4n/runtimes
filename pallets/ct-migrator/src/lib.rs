@@ -34,16 +34,14 @@ use alloc::vec::Vec;
 use frame_support::{
 	defensive_assert,
 	pallet_prelude::*,
-	storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
 	traits::{
 		fungible::{Inspect, InspectHold, Mutate, MutateHold},
 		tokens::Precision,
 	},
 };
 use frame_system::pallet_prelude::*;
-use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use sp_runtime::{
-	traits::{AccountIdConversion, Saturating, Zero},
+	traits::{Saturating, Zero},
 	SaturatedConversion,
 };
 
@@ -263,7 +261,8 @@ pub mod pallet {
 		},
 		/// A batch of migrated HRMP channel records was processed.
 		HrmpReceived {
-			count: u32,
+			count_good: u32,
+			count_bad: u32,
 		},
 		/// An HRMP deposit could not be fully re-attributed; the shortfall is parked.
 		HrmpShortfallParked {
@@ -413,42 +412,60 @@ pub mod pallet {
 	}
 
 	impl<T: Config> Pallet<T> {
+		/// Integrate a batch item-by-item, each in its own transaction so one bad item cannot
+		/// poison the batch: a failed item is rolled back whole and handed to `park` (which logs
+		/// it and stores it verbatim for manual recovery). `on_good` folds the successes.
+		/// Returns `(count_good, count_bad)`.
+		fn receive_batch<I, R>(
+			items: Vec<I>,
+			integrate: impl Fn(&I) -> Result<R, Error<T>>,
+			mut on_good: impl FnMut(R),
+			park: impl Fn(I, Error<T>),
+		) -> (u32, u32) {
+			let (mut count_good, mut count_bad) = (0, 0);
+			for item in items {
+				match with_rollback(|| integrate(&item)) {
+					Ok(r) => {
+						count_good += 1;
+						on_good(r);
+					},
+					Err(e) => {
+						count_bad += 1;
+						park(item, e);
+					},
+				}
+			}
+			(count_good, count_bad)
+		}
+
 		fn do_receive_accounts(accounts: Vec<PortableAccountOf<T>>) {
 			let stage = CtMigrationStage::<T>::get();
 			if stage == MigrationStage::Pending {
 				Self::transition(MigrationStage::DataMigrationOngoing);
 			}
 
-			let (mut count_good, mut count_bad) = (0, 0);
-			for account in accounts {
-				// Each account integrates in its own transaction so one bad account cannot
-				// poison the batch.
-				let res =
-					with_transaction_opaque_err::<(), Error<T>, _>(
-						|| match Self::do_receive_account(&account) {
-							Ok(()) => TransactionOutcome::Commit(Ok(())),
-							Err(e) => TransactionOutcome::Rollback(Err(e)),
-						},
-					)
-					.expect("Always returning Ok; qed");
-
-				if let Err(e) = res {
-					count_bad += 1;
+			let mut minted: BalanceOf<T> = Zero::zero();
+			let (count_good, count_bad) = Self::receive_batch(
+				accounts,
+				Self::do_receive_account,
+				|amount| minted = minted.saturating_add(amount),
+				|account, e| {
 					log::error!(
 						target: LOG_TARGET,
 						"Failed to integrate account {:?}: {e:?}; parking it",
 						account.who,
 					);
 					FailedAccounts::<T>::insert(account.who.clone(), account);
-				} else {
-					count_good += 1;
-				}
+				},
+			);
+			if !minted.is_zero() {
+				CtMintedTotal::<T>::mutate(|t| *t = t.saturating_add(minted));
 			}
-
 			Self::deposit_event(Event::AccountsReceived { count_good, count_bad });
 		}
 
-		fn do_receive_account(account: &PortableAccountOf<T>) -> Result<(), Error<T>> {
+		/// Returns the amount minted for this account; the caller tracks the batch total.
+		fn do_receive_account(account: &PortableAccountOf<T>) -> Result<BalanceOf<T>, Error<T>> {
 			let who = &account.who;
 			let held: BalanceOf<T> = account
 				.holds
@@ -468,14 +485,13 @@ pub mod pallet {
 			let minted = <T as Config>::Currency::mint_into(who, total)
 				.map_err(|_| Error::<T>::FailedToProcessAccount)?;
 			defensive_assert!(minted == total, "minted what the relay chain burned");
-			CtMintedTotal::<T>::mutate(|t| *t = t.saturating_add(minted));
 
 			for hold in &account.holds {
 				<T as Config>::Currency::hold(&hold.reason.into(), who, hold.amount)
 					.map_err(|_| Error::<T>::FailedToProcessAccount)?;
 			}
 
-			Ok(())
+			Ok(minted)
 		}
 
 		fn do_receive_registrar(paras: Vec<PortableParaInfoOf<T>>, next_free: Option<u32>) {
@@ -483,31 +499,19 @@ pub mod pallet {
 				RcNextFreeParaId::<T>::put(id);
 			}
 
-			let (mut count_good, mut count_bad) = (0, 0);
-			for para in paras {
-				// Each record integrates in its own transaction so one bad record cannot poison
-				// the batch.
-				let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
-					match Self::do_receive_para(&para) {
-						Ok(()) => TransactionOutcome::Commit(Ok(())),
-						Err(e) => TransactionOutcome::Rollback(Err(e)),
-					}
-				})
-				.expect("Always returning Ok; qed");
-
-				if let Err(e) = res {
-					count_bad += 1;
+			let (count_good, count_bad) = Self::receive_batch(
+				paras,
+				Self::do_receive_para,
+				|()| (),
+				|para, e| {
 					log::error!(
 						target: LOG_TARGET,
 						"Failed to integrate para {}: {e:?}; parking it",
 						para.para_id,
 					);
 					FailedParas::<T>::insert(para.para_id, para);
-				} else {
-					count_good += 1;
-				}
-			}
-
+				},
+			);
 			Self::deposit_event(Event::RegistrarReceived { count_good, count_bad });
 		}
 
@@ -535,11 +539,8 @@ pub mod pallet {
 		}
 
 		fn do_receive_para(para: &PortableParaInfoOf<T>) -> Result<(), Error<T>> {
-			let (attributed, shortfall) = Self::reattribute_hold(
-				&para.manager,
-				para.deposit,
-				HoldReason::RegistrarDeposit,
-			)?;
+			let (attributed, shortfall) =
+				Self::reattribute_hold(&para.manager, para.deposit, HoldReason::RegistrarDeposit)?;
 			ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
 			if !shortfall.is_zero() {
 				ParkedDepositShortfalls::<T>::insert(para.para_id, shortfall);
@@ -554,30 +555,19 @@ pub mod pallet {
 		}
 
 		fn do_receive_proxies(proxies: Vec<PortableProxyOf<T>>) {
-			let (mut count_good, mut count_bad) = (0, 0);
-			for proxy in proxies {
-				// Each proxy set integrates in its own transaction so one bad set cannot poison
-				// the batch.
-				let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
-					match Self::do_receive_proxy(&proxy) {
-						Ok(()) => TransactionOutcome::Commit(Ok(())),
-						Err(e) => TransactionOutcome::Rollback(Err(e)),
-					}
-				})
-				.expect("Always returning Ok; qed");
-
-				if let Err(e) = res {
-					count_bad += 1;
+			let (count_good, count_bad) = Self::receive_batch(
+				proxies,
+				Self::do_receive_proxy,
+				|()| (),
+				|proxy, e| {
 					log::error!(
 						target: LOG_TARGET,
 						"Failed to integrate proxies of {:?}: {e:?}; parking them",
 						proxy.delegator,
 					);
 					FailedProxies::<T>::insert(proxy.delegator.clone(), proxy);
-				} else {
-					count_good += 1;
-				}
-			}
+				},
+			);
 			Self::deposit_event(Event::ProxiesReceived { count_good, count_bad });
 		}
 
@@ -605,10 +595,7 @@ pub mod pallet {
 				);
 				let top_up = required.saturating_sub(*deposit);
 				if !top_up.is_zero() {
-					match <T as pallet_proxy::Config>::Currency::reserve(
-						&proxy.delegator,
-						top_up,
-					) {
+					match <T as pallet_proxy::Config>::Currency::reserve(&proxy.delegator, top_up) {
 						Ok(()) => *deposit = required,
 						// Access outranks the deposit; the entry stays under-backed until the
 						// owner tops it up.
@@ -624,100 +611,76 @@ pub mod pallet {
 		}
 
 		fn do_receive_hrmp(channels: Vec<PortableHrmpChannelOf<T>>) {
-			let (mut count_good, mut count_bad) = (0, 0);
-			for channel in channels {
-				// Each channel integrates in its own transaction so one bad record cannot poison
-				// the batch.
-				let res = with_transaction_opaque_err::<(), Error<T>, _>(|| {
-					match Self::do_receive_channel(&channel) {
-						Ok(()) => TransactionOutcome::Commit(Ok(())),
-						Err(e) => TransactionOutcome::Rollback(Err(e)),
-					}
-				})
-				.expect("Always returning Ok; qed");
-
-				if let Err(e) = res {
-					count_bad += 1;
+			let (count_good, count_bad) = Self::receive_batch(
+				channels,
+				Self::do_receive_channel,
+				|()| (),
+				|channel, e| {
 					log::error!(
 						target: LOG_TARGET,
 						"Failed to integrate channel {}->{}: {e:?}; parking it",
 						channel.sender, channel.recipient,
 					);
 					FailedHrmpChannels::<T>::insert((channel.sender, channel.recipient), channel);
-				} else {
-					count_good += 1;
-				}
-			}
-			Self::deposit_event(Event::HrmpReceived { count: count_good });
-			if count_bad > 0 {
-				log::error!(target: LOG_TARGET, "{count_bad} HRMP channels parked");
-			}
+				},
+			);
+			Self::deposit_event(Event::HrmpReceived { count_good, count_bad });
 		}
 
 		fn do_receive_hrmp_requests(requests: Vec<PortableHrmpRequestOf<T>>) {
-			let mut count = 0;
+			let count = requests.len() as u32;
 			for request in requests {
-				// Same per-item transaction pattern as everything else; a failed re-label parks
-				// nothing here because the record itself always stores fine — the deposit simply
-				// stays under `RcMigratedReserve` and shows up in the parked-shortfall checks.
-				let sovereign: T::AccountId =
-					Sibling::from(ParaId::from(request.sender)).into_account_truncating();
-				match Self::reattribute_hold(
-					&sovereign,
+				// A failed re-label parks nothing: the record always stores, the deposit simply
+				// stays under `RcMigratedReserve` and surfaces in the parked-shortfall checks.
+				if let Err(e) = Self::reattribute_hrmp_deposit(
+					request.sender,
+					(request.sender, request.recipient, true),
 					request.sender_deposit,
-					HoldReason::HrmpDeposit,
 				) {
-					Ok((attributed, shortfall)) => {
-						ReattributedHrmpDeposits::<T>::mutate(|t| {
-							*t = t.saturating_add(attributed)
-						});
-						if !shortfall.is_zero() {
-							ParkedHrmpShortfalls::<T>::insert(
-								(request.sender, request.recipient, true),
-								shortfall,
-							);
-							Self::deposit_event(Event::HrmpShortfallParked {
-								sender: request.sender,
-								recipient: request.recipient,
-								shortfall,
-							});
-						}
-					},
-					Err(e) => log::error!(
+					log::error!(
 						target: LOG_TARGET,
 						"Failed to re-label request deposit {}->{}: {e:?}",
 						request.sender, request.recipient,
-					),
+					);
 				}
 				RcHrmpOpenRequests::<T>::insert((request.sender, request.recipient), request);
-				count += 1;
 			}
 			Self::deposit_event(Event::HrmpRequestsReceived { count });
 		}
 
+		/// Re-attribute the HRMP deposit that arrived held on `para`'s sibling sovereign (the
+		/// accounts stage translates child sovereigns) to a `HrmpDeposit` hold, tracking the
+		/// total and parking any shortfall under `key` (`(sender, recipient, is_sender_side)`).
+		fn reattribute_hrmp_deposit(
+			para: u32,
+			key: (u32, u32, bool),
+			wanted: BalanceOf<T>,
+		) -> Result<(), Error<T>> {
+			let sovereign: T::AccountId = sibling_account(para);
+			let (attributed, shortfall) =
+				Self::reattribute_hold(&sovereign, wanted, HoldReason::HrmpDeposit)?;
+			ReattributedHrmpDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
+			if !shortfall.is_zero() {
+				ParkedHrmpShortfalls::<T>::insert(key, shortfall);
+				Self::deposit_event(Event::HrmpShortfallParked {
+					sender: key.0,
+					recipient: key.1,
+					shortfall,
+				});
+			}
+			Ok(())
+		}
+
 		fn do_receive_channel(channel: &PortableHrmpChannelOf<T>) -> Result<(), Error<T>> {
-			// The deposits arrived as holds on the *sibling sovereign* accounts of the two paras
-			// (the accounts stage translates child sovereigns); re-attribute each side.
 			for (para, wanted, side) in [
 				(channel.sender, channel.sender_deposit, true),
 				(channel.recipient, channel.recipient_deposit, false),
 			] {
-				let sovereign: T::AccountId =
-					Sibling::from(ParaId::from(para)).into_account_truncating();
-				let (attributed, shortfall) =
-					Self::reattribute_hold(&sovereign, wanted, HoldReason::HrmpDeposit)?;
-				ReattributedHrmpDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
-				if !shortfall.is_zero() {
-					ParkedHrmpShortfalls::<T>::insert(
-						(channel.sender, channel.recipient, side),
-						shortfall,
-					);
-					Self::deposit_event(Event::HrmpShortfallParked {
-						sender: channel.sender,
-						recipient: channel.recipient,
-						shortfall,
-					});
-				}
+				Self::reattribute_hrmp_deposit(
+					para,
+					(channel.sender, channel.recipient, side),
+					wanted,
+				)?;
 			}
 
 			RcHrmpChannels::<T>::insert((channel.sender, channel.recipient), channel.clone());

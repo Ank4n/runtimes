@@ -13,7 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Portable ("chain-agnostic") wire types of the AHM v2 migration.
+//! Portable ("chain-agnostic") wire types of the AHM v2 migration, plus the few helpers whose
+//! behavior both sides of the wire must agree on.
 //!
 //! These are the payloads exchanged between the relay-chain sender (`pallet-rc2-migrator`) and
 //! the receiving chains' migrator pallets. They live in their own crate so that no runtime has
@@ -24,8 +25,38 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame_support::{traits::ConstU32, BoundedVec};
+use frame_support::{
+	storage::{transactional::with_transaction_opaque_err, TransactionOutcome},
+	traits::ConstU32,
+	BoundedVec,
+};
+use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use scale_info::TypeInfo;
+use sp_runtime::traits::AccountIdConversion;
+
+/// Run `f` inside a storage transaction: `Ok` commits, `Err` rolls every write back.
+///
+/// This is the rollback primitive of the whole migration pipeline — per-item and per-block
+/// isolation on both sides use it, so a failure can never leave state half-written.
+pub fn with_rollback<R, E>(f: impl FnOnce() -> Result<R, E>) -> Result<R, E> {
+	with_transaction_opaque_err(|| match f() {
+		Ok(r) => TransactionOutcome::Commit(Ok(r)),
+		Err(e) => TransactionOutcome::Rollback(Err(e)),
+	})
+	.expect("Layer limit is never reached with per-block nesting; qed")
+}
+
+/// The sibling-sovereign account of a para: where a (child) para sovereign's balances continue on
+/// a parachain.
+///
+/// Part of the wire contract: the relay chain sends deposits to this account and the receiving
+/// chain looks for them on it, so both sides must derive it identically.
+pub fn sibling_account<AccountId>(para_id: u32) -> AccountId
+where
+	Sibling: AccountIdConversion<AccountId>,
+{
+	Sibling::from(ParaId::from(para_id)).into_account_truncating()
+}
 
 /// Account balance payload in portable format.
 ///

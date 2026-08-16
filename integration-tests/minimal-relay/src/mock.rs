@@ -15,10 +15,8 @@
 
 //! Three-chain test harness: snapshot loading, manual block production and manual DMP/UMP
 //! message shuttling between the Relay Chain and its two migration counterparts (Coretime chain
-//! and Asset Hub).
-//!
-//! Ported from the AHM v1 harness (`integration-tests/ahm` on the `dev-asset-hub-migration`
-//! branch) and generalised from two chains to one relay plus N parachains via the [`Para`] trait.
+//! and Asset Hub). Chain-specific wiring lives behind the [`Para`] trait, so adding a chain
+//! means adding one impl, not another copy of the plumbing.
 
 use codec::{Decode, Encode};
 use cumulus_primitives_core::{
@@ -199,18 +197,17 @@ async fn load_snapshot_uncached(chain: Chain) -> RawSnapshot {
 	ext.inner_ext.into_raw_snapshot()
 }
 
+/// Load one chain on a worker thread, so `tokio::join!`-ed loads actually run in parallel
+/// (snapshot hydration is CPU-bound).
+pub async fn load(chain: Chain) -> TestExternalities {
+	tokio::spawn(remote_ext(chain))
+		.await
+		.unwrap_or_else(|e| panic!("failed to load the {} snapshot: {e}", chain.name()))
+}
+
 /// Load all three chains in parallel.
 pub async fn load_externalities() -> (TestExternalities, TestExternalities, TestExternalities) {
-	let (rc, ah, ct) = tokio::join!(
-		tokio::spawn(remote_ext(Chain::Relay)),
-		tokio::spawn(remote_ext(Chain::AssetHub)),
-		tokio::spawn(remote_ext(Chain::Coretime)),
-	);
-	(
-		rc.expect("failed to load the Relay Chain snapshot"),
-		ah.expect("failed to load the Asset Hub snapshot"),
-		ct.expect("failed to load the Coretime snapshot"),
-	)
+	tokio::join!(load(Chain::Relay), load(Chain::AssetHub), load(Chain::Coretime))
 }
 
 // ---------------------------------------------------------------------------
@@ -315,8 +312,7 @@ pub fn take_ump<P: Para>() -> Vec<UpwardMessage> {
 
 /// Enqueue DMP messages on the message queue of parachain `P`.
 ///
-/// This bypasses `set_validation_data` and `enqueue_inbound_downward_messages` by enqueuing them
-/// directly, like the v1 harness did.
+/// Bypasses `set_validation_data` and `enqueue_inbound_downward_messages` by enqueuing directly.
 pub fn enqueue_dmp<P: Para>(msgs: Vec<InboundDownwardMessage>) {
 	log::info!(target: P::NAME, "Received {} DMP messages from RC", msgs.len());
 	for msg in msgs {

@@ -1892,6 +1892,12 @@ parameter_types! {
 	/// migration. Measured at RC block #32,378,714 (`balance_census` prints the exact value);
 	/// re-measure and update ahead of the real run.
 	pub const TiCorrection: u128 = 216_543_537_220_240;
+	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
+	pub const CtFreeBuffer: Balance = UNITS;
+	/// Asset Hub's existential deposit; mirrors
+	/// `system_parachains_constants::polkadot::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
+	/// (= relay ED / 10) without pulling that crate into the relay runtime.
+	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
 }
 
 impl pallet_rc2_migrator::Config for Runtime {
@@ -1900,6 +1906,8 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type SendXcm = xcm_config::XcmRouter;
 	type CtParaId = BrokerId;
 	type AhParaId = AssetHubId;
+	type CtFreeBuffer = CtFreeBuffer;
+	type AhExistentialDeposit = AhExistentialDeposit;
 	type SweepAccounts = SweepAccounts;
 	type SweepBeneficiary = SweepBeneficiary;
 	type TiCorrection = TiCorrection;

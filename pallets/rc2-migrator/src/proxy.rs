@@ -18,15 +18,15 @@
 //! can still be read from `paras_registrar::Paras`.
 //!
 //! Scope, per the migration design:
-//! - Only **manager-linked** delegators travel: the delegator manages a para, one of its
-//!   delegates does, or a definition is of type `ParaRegistration`. Keyless (pure) managers can
-//!   only ever act on the Coretime chain through definitions recreated there; for everyone else
-//!   the recreation is a harmless convenience.
+//! - Only **manager-linked** delegators travel: the delegator manages a para, one of its delegates
+//!   does, or a definition is of type `ParaRegistration`. Keyless (pure) managers can only ever act
+//!   on the Coretime chain through definitions recreated there; for everyone else the recreation is
+//!   a harmless convenience.
 //! - Only definitions whose permission the Coretime chain represents travel (the runtime's
 //!   `TryInto<PortableProxyType>`); everything else stays on this chain.
 //! - Deposits do not travel: they were refunded by the accounts stage. Entries left behind get
-//!   their recorded deposit clamped to what is still actually reserved, so no ghost deposit
-//!   records are created.
+//!   their recorded deposit clamped to what is still actually reserved, so no ghost deposit records
+//!   are created.
 
 use crate::*;
 use alloc::collections::BTreeSet;
@@ -67,36 +67,32 @@ impl<T: Config> ProxyMigrator<T> {
 				continue;
 			}
 
-			// A delegator with no funds has nothing that could strand: send its manager-linked
-			// definitions (below) and delete the rest of the entry — this cleans the ~424
-			// zero-balance husks v1 left behind.
-			let funded = frame_system::Account::<T>::contains_key(&who);
+			// Convert each definition once; `Ok` means the Coretime chain represents the
+			// permission, `Err` means it must stay here whatever else happens.
+			let defs: Vec<_> = defs
+				.into_iter()
+				.map(|def| {
+					let portable: Result<PortableProxyType, ()> =
+						def.proxy_type.clone().try_into().map_err(|_| ());
+					(def, portable)
+				})
+				.collect();
 
 			// Split the definitions into what travels and what stays.
 			let manager_linked = managers.contains(&who) ||
-				defs.iter().any(|def| managers.contains(&def.delegate)) ||
-				defs.iter().any(|def| {
-					def.proxy_type
-						.clone()
-						.try_into()
-						.map_or(false, |p: PortableProxyType| {
-							p == PortableProxyType::ParaRegistration
-						})
+				defs.iter().any(|(def, portable)| {
+					managers.contains(&def.delegate) ||
+						*portable == Ok(PortableProxyType::ParaRegistration)
 				});
-			let (travel, stay): (Vec<_>, Vec<_>) = defs.into_iter().partition(|def| {
-				manager_linked && def.proxy_type.clone().try_into().is_ok()
-			});
+			let (travel, stay): (Vec<_>, Vec<_>) =
+				defs.into_iter().partition(|(_, portable)| manager_linked && portable.is_ok());
 
 			if !travel.is_empty() {
 				let delegates: Vec<_> = travel
 					.into_iter()
-					.map(|def| migrator_types::PortableProxyDelegate {
+					.map(|(def, portable)| migrator_types::PortableProxyDelegate {
 						delegate: def.delegate,
-						proxy_type: def
-							.proxy_type
-							.try_into()
-							.map_err(|_| ())
-							.expect("partition kept only translatable definitions; qed"),
+						proxy_type: portable.expect("partition kept only Ok conversions; qed"),
 						delay: def.delay.unique_saturated_into(),
 					})
 					.collect();
@@ -108,15 +104,20 @@ impl<T: Config> ProxyMigrator<T> {
 				});
 			}
 
-			// The deposit was refunded by the accounts stage; clamp the recorded field to what
-			// is still actually reserved so the entry never claims money that is gone.
-			let backed = deposit.min(frame_system::Account::<T>::get(&who).data.reserved);
-			if stay.is_empty() || !funded {
-				pallet_proxy::Proxies::<T>::remove(&who);
-			} else {
-				let stay: BoundedVec<_, <T as pallet_proxy::Config>::MaxProxies> =
-					stay.try_into().expect("subset of a bounded vec; qed");
-				pallet_proxy::Proxies::<T>::insert(&who, (stay, backed));
+			// A delegator with no funds has nothing that could strand: its manager-linked
+			// definitions were sent above, the rest of the entry is deleted — this cleans the
+			// zero-balance husks v1 left behind. For funded delegators, the deposit was refunded
+			// by the accounts stage; clamp the recorded field to what is still actually reserved
+			// so the entry never claims money that is gone.
+			let stay: Vec<_> = stay.into_iter().map(|(def, _)| def).collect();
+			match frame_system::Account::<T>::try_get(&who) {
+				Ok(account) if !stay.is_empty() => {
+					let backed = deposit.min(account.data.reserved);
+					let stay: BoundedVec<_, <T as pallet_proxy::Config>::MaxProxies> =
+						stay.try_into().expect("subset of a bounded vec; qed");
+					pallet_proxy::Proxies::<T>::insert(&who, (stay, backed));
+				},
+				_ => pallet_proxy::Proxies::<T>::remove(&who),
 			}
 
 			if batch.len() >= MAX_RECORDS_PER_XCM as usize {
