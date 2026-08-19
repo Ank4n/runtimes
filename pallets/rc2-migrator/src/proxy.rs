@@ -27,6 +27,11 @@
 //! - Deposits do not travel: they were refunded by the accounts stage. Entries left behind get
 //!   their recorded deposit clamped to what is still actually reserved, so no ghost deposit records
 //!   are created.
+//! - Entries of delegators whose accounts already migrated are deleted. For non-manager
+//!   delegators this drops their definitions entirely (deposit refunded, nothing recreated) —
+//!   safe, because a signer can recreate on Asset Hub and pures are covered by the pre-flight,
+//!   but whether such definitions should instead be recreated on Asset Hub (as v1 did) is an
+//!   OPEN policy question; this stage is where an AH-bound lane would plug in.
 
 use crate::*;
 use alloc::collections::BTreeSet;

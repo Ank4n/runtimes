@@ -149,6 +149,105 @@ fn census(chain: &str, phase: &str, block: u32, pallets: Vec<PalletInfoData>) {
 	}
 }
 
+/// Emit `fact` lines describing the RC state at the pre-migration block — one line per
+/// measured fact: `{pallet, key, value}`, where DOT amounts are `{"planck": "..."}` objects
+/// so the frontend can format them. Everything here is measured from state; grouping the
+/// pallets into sections is the frontend's concern. Must run inside the RC
+/// `TestExternalities`, at the last block before the migration is scheduled.
+pub fn emit_pre_facts() {
+	if sink().is_none() {
+		return;
+	}
+	type Rc = polkadot_runtime::Runtime;
+	let block = frame_system::Pallet::<Rc>::block_number();
+	let fact = |pallet: &str, key: &str, value: Value| {
+		emit("rc", block, "fact", json!({ "pallet": pallet, "key": key, "value": value }))
+	};
+	let dot = |v: u128| json!({ "planck": v.to_string() });
+
+	// Balances: account population and the TI ↔ Σ-accounts gap (the phantom issuance).
+	let (mut accounts, mut free, mut reserved) = (0u64, 0u128, 0u128);
+	for (_, info) in frame_system::Account::<Rc>::iter() {
+		accounts += 1;
+		free += info.data.free;
+		reserved += info.data.reserved;
+	}
+	let ti = pallet_balances::TotalIssuance::<Rc>::get();
+	fact("Balances", "accounts", json!(accounts));
+	fact("Balances", "Σ free", dot(free));
+	fact("Balances", "Σ reserved", dot(reserved));
+	fact("Balances", "TI − Σ accounts", dot(ti.saturating_sub(free + reserved)));
+	fact("Balances", "inactive issuance", dot(pallet_balances::InactiveIssuance::<Rc>::get()));
+
+	// Proxy: population and the deposit split.
+	let (mut delegators, mut defs, mut deposits, mut zero_dep) = (0u64, 0u64, 0u128, 0u64);
+	for (_, (list, deposit)) in pallet_proxy::Proxies::<Rc>::iter() {
+		delegators += 1;
+		defs += list.len() as u64;
+		deposits += deposit;
+		if deposit == 0 {
+			zero_dep += 1;
+		}
+	}
+	fact("Proxy", "delegators", json!(delegators));
+	fact("Proxy", "definitions", json!(defs));
+	fact("Proxy", "deposits", dot(deposits));
+	fact("Proxy", "zero-deposit entries", json!(zero_dep));
+	fact("Proxy", "live-deposit entries", json!(delegators - zero_dep));
+	fact(
+		"Proxy",
+		"announcements",
+		json!(pallet_proxy::Announcements::<Rc>::iter_keys().count()),
+	);
+
+	// Registrar: recorded deposits vs what the managers actually hold in reserve.
+	let mut paras = 0u64;
+	let mut recorded = 0u128;
+	let mut by_manager: HashMap<_, u128> = HashMap::new();
+	let (mut ghost_records, mut ghost_amount) = (0u64, 0u128);
+	for (_, info) in polkadot_runtime_common::paras_registrar::Paras::<Rc>::iter() {
+		paras += 1;
+		recorded += info.deposit;
+		*by_manager.entry(info.manager.clone()).or_default() += info.deposit;
+		if frame_system::Account::<Rc>::get(&info.manager).data.reserved == 0 {
+			ghost_records += 1;
+			ghost_amount += info.deposit;
+		}
+	}
+	let backed: u128 = by_manager
+		.iter()
+		.map(|(m, rec)| (*rec).min(frame_system::Account::<Rc>::get(m).data.reserved))
+		.sum();
+	fact("Registrar", "paras", json!(paras));
+	fact("Registrar", "recorded deposits", dot(recorded));
+	fact("Registrar", "backed by manager reserves", dot(backed));
+	fact("Registrar", "records on zero-reserve managers", json!(ghost_records));
+	fact("Registrar", "recorded on zero-reserve managers", dot(ghost_amount));
+
+	// HRMP: channels and pending requests, with their recorded deposits.
+	let (mut channels, mut channel_dep) = (0u64, 0u128);
+	for (_, ch) in runtime_parachains::hrmp::HrmpChannels::<Rc>::iter() {
+		channels += 1;
+		channel_dep += ch.sender_deposit + ch.recipient_deposit;
+	}
+	let (mut requests, mut request_dep) = (0u64, 0u128);
+	for (_, req) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter() {
+		requests += 1;
+		request_dep += req.sender_deposit;
+	}
+	fact("Hrmp", "open channels", json!(channels));
+	fact("Hrmp", "channel deposits", dot(channel_dep));
+	fact("Hrmp", "pending open requests", json!(requests));
+	fact("Hrmp", "request deposits", dot(request_dep));
+
+	// Crowdloan: what, if anything, is left to wind down.
+	fact(
+		"Crowdloan",
+		"funds",
+		json!(polkadot_runtime_common::crowdloan::Funds::<Rc>::iter_keys().count()),
+	);
+}
+
 /// Emit the events and state probe of the relay-chain block that was just produced.
 /// Must run inside the RC `TestExternalities`.
 pub fn emit_rc_block() {

@@ -68,6 +68,91 @@ fn dot(v: u128) -> f64 {
 	v as f64 / 1e10
 }
 
+/// Decompose every account on the RC by why the migration leaves it behind, with per-account
+/// lines for everything that is not aggregate dust.
+///
+/// With `only_referenced`, regular accounts are printed only when extra consumer references
+/// would block their withdrawal — the pre-migration prediction, where printing the millions of
+/// migratable accounts would be noise. Without it, every remaining account is printed: the
+/// post-migration measurement of the "RC → 0" gap.
+fn print_remaining_on_rc(only_referenced: bool) {
+	type Rc = polkadot_runtime::Runtime;
+	let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
+
+	let (mut dust_n, mut dust_amt) = (0u32, 0u128);
+	// Why each dust account is not reapable by the sweep stage (a reapable one would be).
+	let mut dust_blockers = BTreeMap::<&str, (u32, u128)>::new();
+	let (mut accounts, mut total_sum) = (0u32, 0u128);
+	for (who, info) in frame_system::Account::<Rc>::iter() {
+		let d = &info.data;
+		let total = d.free + d.reserved;
+		accounts += 1;
+		total_sum += total;
+		let bytes: &[u8] = who.as_ref();
+		if bytes.starts_with(b"modl") {
+			let name = String::from_utf8_lossy(&bytes[4..12]);
+			println!(
+				"module `{}`: {} | free {:.4} reserved {:.4}",
+				name.trim_end_matches('\0'),
+				ss58(&who),
+				dot(d.free),
+				dot(d.reserved),
+			);
+		// Child sovereigns migrate (translated to sibl); pre-migration they are not leftovers,
+		// so only the post-migration mode prints the ones that stayed (held back / anomalies).
+		} else if bytes.starts_with(b"sibl") || (!only_referenced && bytes.starts_with(b"para")) {
+			let kind = if bytes.starts_with(b"sibl") { "sibl" } else { "para (child)" };
+			let para = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+			println!(
+				"{kind} sovereign of para {para}: {} | free {:.4} reserved {:.4}",
+				ss58(&who),
+				dot(d.free),
+				dot(d.reserved),
+			);
+		} else if total < ed {
+			dust_n += 1;
+			dust_amt += total;
+			let blocker = if !pallet_balances::Holds::<Rc>::get(&who).is_empty() {
+				"holds"
+			} else if info.consumers != 0 {
+				"consumer refs"
+			} else if d.reserved != 0 {
+				"reserved only"
+			} else if d.free == 0 {
+				"zero balance (provider-ref husk)"
+			} else {
+				"none (sweep reaps it)"
+			};
+			let e = dust_blockers.entry(blocker).or_default();
+			e.0 += 1;
+			e.1 += total;
+		} else {
+			// Extra consumer refs (beyond the one a reserve accounts for) mean some pallet
+			// still references the account and withdrawal would fail — session keys being the
+			// known case.
+			let expected = u32::from(d.reserved > 0);
+			let referenced = info.consumers > expected;
+			if referenced || !only_referenced {
+				let keys = pallet_session::NextKeys::<Rc>::get(&who).is_some();
+				println!(
+					"{}: {} | free {:.4} reserved {:.4} consumers {} session-keys {}",
+					if referenced { "referenced" } else { "held back" },
+					ss58(&who),
+					dot(d.free),
+					dot(d.reserved),
+					info.consumers,
+					keys,
+				);
+			}
+		}
+	}
+	println!("below-ED dust: {dust_n} accounts, {:.4} DOT", dot(dust_amt));
+	for (blocker, (n, amt)) in &dust_blockers {
+		println!("  dust blocked by {blocker}: {n} accounts, {:.4} DOT", dot(*amt));
+	}
+	println!("all accounts on the RC: {accounts}, {:.4} DOT", dot(total_sum));
+}
+
 /// Find a parachain manager that migrates cleanly: a live registrar deposit that fully accounts
 /// for the account's reserve, and nothing else attached. Returns `(manager, free, reserved)`.
 /// Must run inside the RC externalities.
@@ -445,54 +530,8 @@ async fn balance_census() {
 
 		// Who would remain on the RC after the migration and why — the "RC → 0" gap list.
 		{
-			type Rc = polkadot_runtime::Runtime;
-			let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
-
 			println!("\n### remaining-on-RC gap list (accounts the migration cannot move)");
-			let (mut dust_n, mut dust_amt) = (0u32, 0u128);
-			for (who, info) in frame_system::Account::<Rc>::iter() {
-				let d = &info.data;
-				let total = d.free + d.reserved;
-				let bytes: &[u8] = who.as_ref();
-				if bytes.starts_with(b"modl") {
-					let name = String::from_utf8_lossy(&bytes[4..12]);
-					println!(
-						"module `{}`: {} | free {:.4} reserved {:.4}",
-						name.trim_end_matches('\0'),
-						ss58(&who),
-						dot(d.free),
-						dot(d.reserved),
-					);
-				} else if bytes.starts_with(b"sibl") {
-					let para = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-					println!(
-						"sibl sovereign of para {para}: {} | free {:.4} reserved {:.4}",
-						ss58(&who),
-						dot(d.free),
-						dot(d.reserved),
-					);
-				} else if total < ed {
-					dust_n += 1;
-					dust_amt += total;
-				} else {
-					// Would this account fail withdrawal? Consumer refs beyond the one its
-					// reserve accounts for mean some pallet still references it.
-					let expected = u32::from(d.reserved > 0);
-					if info.consumers > expected {
-						let keys = pallet_session::NextKeys::<Rc>::get(&who).is_some();
-						println!(
-							"referenced: {} | free {:.4} reserved {:.4} consumers {} \
-							 session-keys {}",
-							ss58(&who),
-							dot(d.free),
-							dot(d.reserved),
-							info.consumers,
-							keys,
-						);
-					}
-				}
-			}
-			println!("below-ED dust: {dust_n} accounts, {:.4} DOT", dot(dust_amt));
+			print_remaining_on_rc(true);
 		}
 
 		// The Balances pallet's own storage keys: how many are empty leftovers, and how many
@@ -607,14 +646,22 @@ async fn proxy_census() {
 					)
 				})
 				.collect();
+			// `consumers` decides the delegator's fate in the migration: withdrawal fails when
+			// consumer references remain after the reserve is released (session references
+			// being the known case), keeping the entry on the RC. Session keys themselves are
+			// never touched either way — they are live session state managed from AH via XCM,
+			// and a zero-balance key-holder is the intended end state.
 			out.push(format!(
-				r#"{{"who":"{}","deposit":"{}","free":"{}","reserved":"{}","nonce":{},"sovereign":{},"manages":{:?},"delegates":[{}]}}"#,
+				r#"{{"who":"{}","deposit":"{}","free":"{}","reserved":"{}","nonce":{},"consumers":{},"sovereign":{},"session_keys":{},"exists":{},"manages":{:?},"delegates":[{}]}}"#,
 				ss58(&who),
 				deposit,
 				account.data.free,
 				account.data.reserved,
 				account.nonce,
+				account.consumers,
 				sovereign,
+				pallet_session::NextKeys::<Rc>::get(&who).is_some(),
+				frame_system::Account::<Rc>::contains_key(&who),
 				manages.get(&who).cloned().unwrap_or_default(),
 				delegates.join(","),
 			));
@@ -765,6 +812,7 @@ async fn full_migration_rc_to_ct() {
 	let (paras_before, hrmp_before, requests_before, rc_ti_before, sample) =
 		rc.execute_with(|| {
 			crate::events::emit_rc_census("before");
+			crate::events::emit_pre_facts();
 			let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
 				.map(|(id, info)| (id.into(), info.deposit))
 				.collect();
@@ -1028,6 +1076,32 @@ async fn full_migration_rc_to_ct() {
 			.filter(|(who, _, existed)| *existed && !frame_system::Account::<Rc>::contains_key(who))
 			.cloned()
 			.collect();
+		// The measured counterpart of `balance_census`'s pre-migration gap list: every account
+		// still here, per line. Visible with `--nocapture`.
+		println!("\n### remaining on RC after the migration");
+		print_remaining_on_rc(false);
+
+		// The proxy entries that survive the proxy stage, with why their delegator is still
+		// here (session keys / deny list / unattributable reserve).
+		println!("\n### proxy entries remaining on RC");
+		for (who, (defs, deposit)) in pallet_proxy::Proxies::<Rc>::iter() {
+			let account = frame_system::Account::<Rc>::get(&who);
+			let types: Vec<String> =
+				defs.iter().map(|d| format!("{:?}/{}", d.proxy_type, d.delay)).collect();
+			println!(
+				"{} | defs [{}] deposit {:.4} | free {:.4} reserved {:.4} nonce {} \
+				 session-keys {} deny-listed {}",
+				ss58(&who),
+				types.join(", "),
+				dot(deposit),
+				dot(account.data.free),
+				dot(account.data.reserved),
+				account.nonce,
+				pallet_session::NextKeys::<Rc>::get(&who).is_some(),
+				pallet_rc2_migrator::HeldBackAccounts::<Rc>::contains_key(&who),
+			);
+		}
+
 		let tracker = RcMigratedBalance::<Rc>::get();
 		assert_eq!(
 			tracker.kept +
