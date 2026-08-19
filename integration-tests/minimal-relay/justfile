@@ -23,6 +23,17 @@ test *args: _ensure-snapshots
 	SNAP_CT="{{ snap_dir }}/snap_ct.snap" \
 		cargo test -p polkadot-integration-tests-minimal-relay {{ args }}
 
+# Only `full_migration_rc_to_ct` emits a complete stream (pre-facts + before/after census);
+# running the whole suite with AHM_EVENTS set would interleave parallel tests into the file.
+
+# Regenerate the migration-monitor event stream (runs only the full-migration test).
+events out="events.jsonl": _ensure-snapshots
+	SNAP_RC="{{ snap_dir }}/snap_rc.snap" \
+	SNAP_AH="{{ snap_dir }}/snap_ah.snap" \
+	SNAP_CT="{{ snap_dir }}/snap_ct.snap" \
+	AHM_EVENTS="{{ absolute_path(out) }}" \
+		cargo test -p polkadot-integration-tests-minimal-relay full_migration_rc_to_ct
+
 # TODO: Host the snapshots somewhere easy to download and fetch from there instead.
 
 # Download fresh snapshots from the daily `Check Migrations` CI artifacts (needs `gh` auth).
