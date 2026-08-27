@@ -11154,6 +11154,7 @@ dependencies = [
  "log",
  "migrator-types",
  "pallet-balances",
+ "pallet-multisig",
  "pallet-proxy",
  "parity-scale-codec",
  "polkadot-parachain-primitives",
