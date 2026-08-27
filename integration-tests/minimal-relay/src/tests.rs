@@ -46,7 +46,8 @@ fn unpaid_transact<Call: Encode>(call: Call) -> Xcm<()> {
 
 /// Mirror of the accounts-stage split rule, for assertions: how much of an account's free
 /// balance goes to the Coretime chain (working buffer) versus Asset Hub (teleport). Valid for
-/// accounts whose reserve is fully CT-bound (which is what [`find_clean_manager`] selects).
+/// keyed (`nonce > 0`) accounts whose reserve is fully CT-bound (which is what
+/// [`find_clean_manager`] selects); never-signed `Any`-delegators route everything to CT instead.
 fn expected_split(free: u128, reserved: u128) -> (u128, u128) {
 	let buffer: u128 = polkadot_runtime::CtFreeBuffer::get();
 	let ah_ed: u128 = polkadot_runtime::AhExistentialDeposit::get();
@@ -154,7 +155,8 @@ fn print_remaining_on_rc(only_referenced: bool) {
 }
 
 /// Find a parachain manager that migrates cleanly: a live registrar deposit that fully accounts
-/// for the account's reserve, and nothing else attached. Returns `(manager, free, reserved)`.
+/// for the account's reserve, a signing key (so the buffer split applies, not the pure-proxy
+/// routing), and nothing else attached. Returns `(manager, free, reserved)`.
 /// Must run inside the RC externalities.
 fn find_clean_manager() -> (AccountId32, u128, u128) {
 	type Rc = polkadot_runtime::Runtime;
@@ -165,7 +167,8 @@ fn find_clean_manager() -> (AccountId32, u128, u128) {
 	paras_registrar::Paras::<Rc>::iter()
 		.find_map(|(_, info)| {
 			let account = frame_system::Account::<Rc>::get(&info.manager);
-			(account.data.reserved > 0 &&
+			(account.nonce > 0 &&
+				account.data.reserved > 0 &&
 				account.data.reserved <= *recorded.get(&info.manager).unwrap_or(&0) &&
 				account.data.frozen == 0 &&
 				pallet_balances::Holds::<Rc>::get(&info.manager).is_empty() &&
@@ -858,7 +861,7 @@ async fn full_migration_rc_to_ct() {
 	let recorded_hrmp: u128 = hrmp_before.iter().map(|(_, s, r)| s + r).sum::<u128>() +
 		requests_before.iter().sum::<u128>();
 
-	// Proxy state before: the manager-linked delegators (whose definitions travel to CT), one
+	// Proxy state before: the delegators with portable definitions (which travel to CT), one
 	// delegator with both an Any and a ParaRegistration delegate for the dispatch checks, and
 	// every never-signed delegator for the funds-follow-control invariant.
 	let (ct_bound_proxies, nonce0_delegators, proxy_dispatch) = rc.execute_with(|| {
@@ -866,86 +869,76 @@ async fn full_migration_rc_to_ct() {
 		let portable = |t: &<Rc as pallet_proxy::Config>::ProxyType| {
 			PortableProxyType::try_from(t.clone()).ok()
 		};
-		let managers: std::collections::BTreeSet<_> =
-			paras_registrar::Paras::<Rc>::iter().map(|(_, i)| i.manager).collect();
 		let mut ct_bound = Vec::new();
 		let mut nonce0 = Vec::new();
 		let mut dispatch = None;
 		for (who, (defs, _)) in pallet_proxy::Proxies::<Rc>::iter() {
-			if frame_system::Account::<Rc>::get(&who).nonce == 0 {
-				// `had_any` marks a possible v1-era pure (v1 retained `Any` defs for pures).
-				// A nonce-0 delegator WITHOUT `Any` defs necessarily created its entry via
+			let account = frame_system::Account::<Rc>::get(&who);
+			let had_any =
+				defs.iter().any(|d| portable(&d.proxy_type) == Some(PortableProxyType::Any));
+			if account.nonce == 0 {
+				// A never-signed delegator. With an `Any` def it is (or must be treated as) a
+				// keyless pure whose whole balance follows the recreated definitions to CT. A
+				// nonce-0 delegator WITHOUT `Any` defs necessarily created its entry via
 				// `as_multi` — no other dispatch path exists at nonce 0 with no prior defs and
 				// no post-v1 `create_pure` (verified by events and the spawner-reserve
 				// signature) — so it is a multisig, controllable on every chain by its members.
-				let had_any =
-					defs.iter().any(|d| portable(&d.proxy_type) == Some(PortableProxyType::Any));
 				let existed = frame_system::Account::<Rc>::contains_key(&who);
-				nonce0.push((who.clone(), had_any, existed));
+				nonce0.push((
+					who.clone(),
+					had_any,
+					existed,
+					account.data.free + account.data.reserved,
+				));
 			}
-			let linked = managers.contains(&who) ||
-				defs.iter().any(|d| managers.contains(&d.delegate)) ||
-				defs.iter().any(|d| {
-					portable(&d.proxy_type) == Some(PortableProxyType::ParaRegistration)
-				});
-			if linked {
-				let any =
-					defs.iter().find(|d| portable(&d.proxy_type) == Some(PortableProxyType::Any));
-				let reg = defs
-					.iter()
-					.find(|d| portable(&d.proxy_type) == Some(PortableProxyType::ParaRegistration));
-				if let (Some(any), Some(reg), None) = (any, reg, dispatch.as_ref()) {
-					dispatch = Some((who.clone(), any.delegate.clone(), reg.delegate.clone()));
-				}
+			if defs.iter().any(|d| portable(&d.proxy_type).is_some()) {
 				ct_bound.push(who.clone());
+			}
+			let any =
+				defs.iter().find(|d| portable(&d.proxy_type) == Some(PortableProxyType::Any));
+			let reg = defs
+				.iter()
+				.find(|d| portable(&d.proxy_type) == Some(PortableProxyType::ParaRegistration));
+			if let (Some(any), Some(reg), None) = (any, reg, dispatch.as_ref()) {
+				dispatch = Some((who.clone(), any.delegate.clone(), reg.delegate.clone()));
 			}
 		}
 		let dispatch =
-			dispatch.expect("snapshot has a manager with Any + ParaRegistration proxies");
+			dispatch.expect("snapshot has a delegator with Any + ParaRegistration proxies");
 		(ct_bound, nonce0, dispatch)
 	});
-	assert!(!ct_bound_proxies.is_empty(), "live snapshot has manager-linked proxies");
+	assert!(!ct_bound_proxies.is_empty(), "live snapshot has portable proxies");
 
-	let ct_ti_before = ct.execute_with(|| {
+	let (ct_ti_before, ct_pures_before) = ct.execute_with(|| {
 		crate::events::emit_ct_census("before");
-		pallet_balances::TotalIssuance::<Ct>::get()
+		// Pre-migration CT balances of the possible pures, so their arrival asserts exactly.
+		let pures: BTreeMap<AccountId32, u128> = nonce0_delegators
+			.iter()
+			.filter(|(_, had_any, existed, _)| *had_any && *existed)
+			.map(|(who, ..)| {
+				let d = frame_system::Account::<Ct>::get(who).data;
+				(who.clone(), d.free + d.reserved)
+			})
+			.collect();
+		(pallet_balances::TotalIssuance::<Ct>::get(), pures)
 	});
-	let (ah_ti_before, ah_checking_before, ah_sample_before, deny_list) = ah.execute_with(|| {
+	let (ah_ti_before, ah_checking_before, ah_sample_before) = ah.execute_with(|| {
 		// Baseline probe so the event stream carries the checking account's pre-migration
 		// value; the monitor measures the teleport receipts as the drain from this baseline.
 		crate::events::emit_para_block(Chain::AssetHub);
-
-		// The off-chain pre-flight: possible pures (never signed, hold `Any` defs) whose
-		// control on AH cannot be verified must not migrate — their funds would strand.
-		let deny: Vec<_> = nonce0_delegators
-			.iter()
-			.filter(|(who, had_any, existed)| {
-				*existed &&
-					*had_any && frame_system::Account::<Ah>::get(who).nonce == 0 &&
-					pallet_proxy::Proxies::<Ah>::get(who).0.is_empty()
-			})
-			.map(|(who, ..)| who.clone())
-			.collect();
 
 		let checking = pallet_xcm::Pallet::<Ah>::check_account();
 		(
 			pallet_balances::TotalIssuance::<Ah>::get(),
 			frame_system::Account::<Ah>::get(&checking).data.free,
 			frame_system::Account::<Ah>::get(&sample.0).data.free,
-			deny,
 		)
 	});
 	let ah_treasury_before =
 		ah.execute_with(|| frame_system::Account::<Ah>::get(&treasury).data.free);
 
-	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks. The
-	// pre-flight deny list is pinned first, as governance would ahead of the real run.
+	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks.
 	rc.execute_with(|| {
-		pallet_rc2_migrator::Pallet::<Rc>::hold_back_accounts(
-			polkadot_runtime::RuntimeOrigin::root(),
-			deny_list.clone(),
-		)
-		.expect("root may pin the deny list");
 		let start = frame_system::Pallet::<Rc>::block_number() + 1;
 		pallet_rc2_migrator::Pallet::<Rc>::force_set_stage(
 			polkadot_runtime::RuntimeOrigin::root(),
@@ -954,15 +947,6 @@ async fn full_migration_rc_to_ct() {
 		.expect("root may set the stage");
 	});
 	rc.commit_all().unwrap();
-	// Deny-listed accounts that actually hold funds; the fund-less ones are v1 husks whose
-	// accounts never existed (only their proxy entries do).
-	let deny_funded: Vec<_> = rc.execute_with(|| {
-		deny_list
-			.iter()
-			.filter(|who| frame_system::Account::<Rc>::contains_key(*who))
-			.cloned()
-			.collect()
-	});
 
 	let mut rounds = 0;
 	loop {
@@ -1054,26 +1038,13 @@ async fn full_migration_rc_to_ct() {
 			"the treasury pot must be swept"
 		);
 
-		// The deny-listed possible pures stayed whole: funds (where any existed) and proxy
-		// entries untouched.
-		for who in &deny_funded {
-			assert!(
-				frame_system::Account::<Rc>::contains_key(who),
-				"held-back possible pure {who:?} must keep its funds on the RC"
-			);
-		}
-		for who in &deny_list {
-			assert!(
-				!pallet_proxy::Proxies::<Rc>::get(who).0.is_empty(),
-				"held-back possible pure {who:?} must keep its proxy entry"
-			);
-		}
-
 		// Never-signed delegators whose accounts migrated away (fund-less husks never had an
-		// account to migrate): their AH-side control is asserted below.
+		// account to migrate): their CT-side control is asserted below.
 		let migrated_nonce0: Vec<_> = nonce0_delegators
 			.iter()
-			.filter(|(who, _, existed)| *existed && !frame_system::Account::<Rc>::contains_key(who))
+			.filter(|(who, _, existed, _)| {
+				*existed && !frame_system::Account::<Rc>::contains_key(who)
+			})
 			.cloned()
 			.collect();
 		// The measured counterpart of `balance_census`'s pre-migration gap list: every account
@@ -1082,7 +1053,7 @@ async fn full_migration_rc_to_ct() {
 		print_remaining_on_rc(false);
 
 		// The proxy entries that survive the proxy stage, with why their delegator is still
-		// here (session keys / deny list / unattributable reserve).
+		// here (session keys / unattributable reserve).
 		println!("\n### proxy entries remaining on RC");
 		for (who, (defs, deposit)) in pallet_proxy::Proxies::<Rc>::iter() {
 			let account = frame_system::Account::<Rc>::get(&who);
@@ -1090,7 +1061,7 @@ async fn full_migration_rc_to_ct() {
 				defs.iter().map(|d| format!("{:?}/{}", d.proxy_type, d.delay)).collect();
 			println!(
 				"{} | defs [{}] deposit {:.4} | free {:.4} reserved {:.4} nonce {} \
-				 session-keys {} deny-listed {}",
+				 session-keys {}",
 				ss58(&who),
 				types.join(", "),
 				dot(deposit),
@@ -1098,7 +1069,6 @@ async fn full_migration_rc_to_ct() {
 				dot(account.data.reserved),
 				account.nonce,
 				pallet_session::NextKeys::<Rc>::get(&who).is_some(),
-				pallet_rc2_migrator::HeldBackAccounts::<Rc>::contains_key(&who),
 			);
 		}
 
@@ -1191,13 +1161,36 @@ async fn full_migration_rc_to_ct() {
 		assert_eq!(CtMintedTotal::<Ct>::get(), migrated_ct, "CT minted exactly the CT-bound burn");
 		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated_ct);
 
-		// AND every manager-linked delegator's definitions were recreated in the REAL proxy
-		// pallet, so keyless (pure) managers can dispatch here from day one.
+		// AND every portable definition was recreated in the REAL proxy pallet, so keyless
+		// (pure) delegators can dispatch here from day one.
 		assert!(FailedProxies::<Ct>::iter().next().is_none(), "no proxy set may fail");
 		for who in &ct_bound_proxies {
 			assert!(
 				!pallet_proxy::Proxies::<Ct>::get(who).0.is_empty(),
-				"manager-linked delegator {who:?} must have proxies on CT"
+				"delegator {who:?} must have proxies on CT"
+			);
+		}
+
+		// Funds-follow-control invariant: every never-signed delegator with an `Any` definition
+		// that migrated moved WHOLE to this chain — its balance and an `Any` def — so the
+		// delegate keeps full control. A violation would strand money nobody can use.
+		for (who, had_any, _, rc_total) in &migrated_nonce0 {
+			if !*had_any {
+				continue;
+			}
+			let d = frame_system::Account::<Ct>::get(who).data;
+			let before = ct_pures_before.get(who).copied().unwrap_or_default();
+			assert_eq!(
+				d.free + d.reserved,
+				before + rc_total,
+				"possible pure {who:?}'s whole RC balance must arrive on CT"
+			);
+			assert!(
+				pallet_proxy::Proxies::<Ct>::get(who)
+					.0
+					.iter()
+					.any(|def| def.proxy_type == coretime_polkadot_runtime::ProxyType::Any),
+				"possible pure {who:?} must have an Any definition on CT"
 			);
 		}
 
@@ -1272,17 +1265,8 @@ async fn full_migration_rc_to_ct() {
 			"sweep must arrive on the AH treasury account"
 		);
 
-		// Funds-follow-control invariant: every never-signed delegator whose funds left the RC
-		// must be controllable on AH — a key that signed there, proxy definitions (v1 migrated
-		// them for every possible pure), or the multisig inference from the capture above.
-		// A violation would mean teleporting money to an address nobody can use.
-		for (who, had_any, _) in &migrated_nonce0 {
-			assert!(
-				!had_any ||
-					frame_system::Account::<Ah>::get(who).nonce > 0 ||
-					!pallet_proxy::Proxies::<Ah>::get(who).0.is_empty(),
-				"possible pure {who:?} migrated but is not controllable on AH"
-			);
-		}
+		// Never-signed delegators with `Any` defs went whole to CT (asserted there); the ones
+		// without are multisigs, controllable on every chain by their members, so their teleport
+		// here needs no per-account control check.
 	});
 }

@@ -344,7 +344,7 @@ pub mod pallet {
 			Ok(())
 		}
 
-		/// Receive a batch of manager-linked proxy sets migrated from the relay chain.
+		/// Receive a batch of portable proxy sets migrated from the relay chain.
 		///
 		/// Delegations are written into the real proxy pallet, merged with any existing local
 		/// ones, and backed by a deposit at THIS chain's rates reserved from the delegator's

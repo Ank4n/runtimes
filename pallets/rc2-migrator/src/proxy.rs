@@ -13,28 +13,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Proxy stage: migrates the proxy definitions of para-management accounts to the Coretime
-//! chain, where para management continues. Runs before the registrar stage so the manager set
-//! can still be read from `paras_registrar::Paras`.
+//! Proxy stage: migrates proxy definitions to the Coretime chain, where para management
+//! continues.
 //!
 //! Scope, per the migration design:
-//! - Only **manager-linked** delegators travel: the delegator manages a para, one of its delegates
-//!   does, or a definition is of type `ParaRegistration`. Keyless (pure) managers can only ever act
-//!   on the Coretime chain through definitions recreated there; for everyone else the recreation is
-//!   a harmless convenience.
-//! - Only definitions whose permission the Coretime chain represents travel (the runtime's
-//!   `TryInto<PortableProxyType>`); everything else stays on this chain.
+//! - Every definition whose permission the Coretime chain represents travels (the runtime's
+//!   `TryInto<PortableProxyType>`: `Any`, `NonTransfer`, `CancelProxy`, `ParaRegistration`);
+//!   everything else (staking, governance, …) has no meaning there and stays on this chain.
+//!   Keyless (pure) delegators can only ever act through definitions recreated on the Coretime
+//!   chain — the accounts stage routes their whole balance there for the same reason; for keyed
+//!   delegators the recreation is a harmless convenience.
 //! - Deposits do not travel: they were refunded by the accounts stage. Entries left behind get
 //!   their recorded deposit clamped to what is still actually reserved, so no ghost deposit records
 //!   are created.
-//! - Entries of delegators whose accounts already migrated are deleted. For non-manager
-//!   delegators this drops their definitions entirely (deposit refunded, nothing recreated) —
-//!   safe, because a signer can recreate on Asset Hub and pures are covered by the pre-flight,
-//!   but whether such definitions should instead be recreated on Asset Hub (as v1 did) is an
-//!   OPEN policy question; this stage is where an AH-bound lane would plug in.
+//! - Entries of delegators whose accounts already migrated are deleted. For definitions that did
+//!   not travel this drops them entirely (deposit refunded, nothing recreated) — safe, because a
+//!   signer can recreate on Asset Hub, but whether they should instead be recreated on Asset Hub
+//!   (as v1 did) is an OPEN policy question; this stage is where an AH-bound lane would plug in.
 
 use crate::*;
-use alloc::collections::BTreeSet;
 use sp_runtime::traits::UniqueSaturatedInto;
 
 pub struct ProxyMigrator<T>(PhantomData<T>);
@@ -46,11 +43,6 @@ impl<T: Config> ProxyMigrator<T> {
 	/// exhausted. The caller wraps this in a storage transaction; an `Err` rolls back the whole
 	/// block's changes.
 	pub fn migrate_many(last_key: Option<T::AccountId>) -> Result<Option<T::AccountId>, Error<T>> {
-		// Rebuilt every block instead of persisted: `Paras` is still intact (the registrar
-		// stage runs after this one) and small.
-		let managers: BTreeSet<T::AccountId> =
-			paras_registrar::Paras::<T>::iter().map(|(_, info)| info.manager).collect();
-
 		let mut iter = match &last_key {
 			Some(last_key) => pallet_proxy::Proxies::<T>::iter_from(
 				pallet_proxy::Proxies::<T>::hashed_key_for(last_key),
@@ -64,16 +56,8 @@ impl<T: Config> ProxyMigrator<T> {
 			let Some((who, (defs, deposit))) = iter.next() else { break None };
 			processed += 1;
 
-			// Held-back accounts keep their entry untouched: it may be a pure's only control.
-			if HeldBackAccounts::<T>::contains_key(&who) {
-				if processed >= MAX_RECORDS_PER_BLOCK {
-					break Some(who);
-				}
-				continue;
-			}
-
 			// Convert each definition once; `Ok` means the Coretime chain represents the
-			// permission, `Err` means it must stay here whatever else happens.
+			// permission and the definition travels, `Err` means it stays here.
 			let defs: Vec<_> = defs
 				.into_iter()
 				.map(|def| {
@@ -82,15 +66,8 @@ impl<T: Config> ProxyMigrator<T> {
 					(def, portable)
 				})
 				.collect();
-
-			// Split the definitions into what travels and what stays.
-			let manager_linked = managers.contains(&who) ||
-				defs.iter().any(|(def, portable)| {
-					managers.contains(&def.delegate) ||
-						*portable == Ok(PortableProxyType::ParaRegistration)
-				});
 			let (travel, stay): (Vec<_>, Vec<_>) =
-				defs.into_iter().partition(|(_, portable)| manager_linked && portable.is_ok());
+				defs.into_iter().partition(|(_, portable)| portable.is_ok());
 
 			if !travel.is_empty() {
 				let delegates: Vec<_> = travel

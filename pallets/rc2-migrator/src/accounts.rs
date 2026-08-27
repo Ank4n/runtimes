@@ -24,9 +24,13 @@
 //! - all remaining free balance is **teleported to Asset Hub**, where the owners' phase-1 funds
 //!   already live.
 //!
-//! Accounts whose reserve exceeds their recorded registrar/HRMP deposits (proxy deposits, known
-//! anomalies) are kept whole on the relay chain for a later stage — money whose destination is
-//! not designed yet does not move.
+//! Exception: a delegator that never signed (`nonce == 0`) and grants an `Any` proxy is treated
+//! as a keyless pure proxy — its delegate keeps full control only where the definitions are
+//! recreated (the Coretime chain, by the proxy stage), so ALL of its balance goes there instead
+//! of Asset Hub.
+//!
+//! Accounts whose reserve exceeds what the pallets' deposit records account for are kept whole on
+//! the relay chain — money whose destination is unknown does not move.
 //!
 //! Para sovereign accounts are included: their child-sovereign id (`para…`) is translated to the
 //! sibling id (`sibl…`) that represents the same para on a parachain.
@@ -207,12 +211,6 @@ impl<T: Config> AccountsMigrator<T> {
 			Ok(None)
 		};
 
-		// Pinned by governance after the off-chain pre-flight (e.g. a possible pure proxy whose
-		// control at the destination could not be verified): nothing of it moves.
-		if HeldBackAccounts::<T>::contains_key(who) {
-			return held_back("pinned by governance");
-		}
-
 		// Reserved balance is only trusted up to what the owning pallets say this account
 		// deposited: registrar/HRMP deposits continue on the Coretime chain, proxy and pending
 		// HRMP-request deposits are refunded. More reserve than the two together is money whose
@@ -266,6 +264,10 @@ impl<T: Config> AccountsMigrator<T> {
 		// buffer → CT free; the rest → AH free. Free balance below AH's ED cannot teleport into
 		// a fresh account, so such dust follows the deposit to CT instead (only deposit holders
 		// can be in this situation: everyone else has free >= the RC ED, which exceeds AH's).
+		//
+		// Exception: a never-signed delegator granting an `Any` proxy is (or must be treated as)
+		// a keyless pure proxy. Its delegate keeps full control only on the Coretime chain, where
+		// the proxy stage recreates the definitions, so ALL of its liquid balance goes there.
 		let ct_hold = reserved.min(expected_ct);
 		let refunded = reserved.saturating_sub(ct_hold);
 		if !refunded.is_zero() {
@@ -275,7 +277,17 @@ impl<T: Config> AccountsMigrator<T> {
 			});
 		}
 		let liquid = free.saturating_add(refunded);
-		let mut ct_free = if ct_hold.is_zero() { 0 } else { liquid.min(T::CtFreeBuffer::get()) };
+		let pure_like = info.nonce.is_zero() &&
+			pallet_proxy::Proxies::<T>::get(who).0.iter().any(|def| {
+				matches!(def.proxy_type.clone().try_into(), Ok(PortableProxyType::Any))
+			});
+		let mut ct_free = if pure_like {
+			liquid
+		} else if ct_hold.is_zero() {
+			0
+		} else {
+			liquid.min(T::CtFreeBuffer::get())
+		};
 		let mut ah_free = liquid.saturating_sub(ct_free);
 		if !ah_free.is_zero() && ah_free < T::AhExistentialDeposit::get() && !ct_hold.is_zero() {
 			ct_free = ct_free.saturating_add(ah_free);
