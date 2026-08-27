@@ -212,9 +212,11 @@ pub mod pallet {
 		> + pallet_balances::Config<Balance = u128>
 		// The `Currency` equalities pin the deposit balance types to u128; the `ProxyType`
 		// bound is where the runtime declares which proxy permissions travel to the Coretime
-		// chain (untranslatable ones stay here).
+		// chain (untranslatable ones stay here). Multisig is bound only to index its deposits:
+		// the one pallet whose calls stay open pre-migration, so new deposits can still appear.
 		+ paras_registrar::Config<Currency = pallet_balances::Pallet<Self>>
 		+ runtime_parachains::hrmp::Config
+		+ pallet_multisig::Config<Currency = pallet_balances::Pallet<Self>>
 		+ pallet_proxy::Config<
 			Currency = pallet_balances::Pallet<Self>,
 			ProxyType: TryInto<PortableProxyType>,
@@ -249,8 +251,8 @@ pub mod pallet {
 		/// Their full balance teleports to `SweepBeneficiary`.
 		type SweepAccounts: Get<Vec<AccountId32>>;
 
-		/// Where swept pots and dust land on Asset Hub — the treasury / DAP buffer account
-		/// designated by governance.
+		/// Where swept pots and reaped dust land on Asset Hub — the treasury / DAP buffer
+		/// account designated by governance.
 		type SweepBeneficiary: Get<AccountId32>;
 
 		/// The audited amount of total issuance that no account holds ("phantom issuance"),
@@ -306,8 +308,6 @@ pub mod pallet {
 		XcmSendFailed,
 		/// The account balance could not be fully withdrawn.
 		FailedToWithdrawAccount,
-		/// The account still has consumer references after releasing its reserves.
-		AccountReferenced,
 		/// The migrated/kept balance bookkeeping would overflow.
 		BalanceAccounting,
 	}
@@ -377,6 +377,17 @@ pub mod pallet {
 		},
 		/// A batch of drained HRMP channel records was sent to the Coretime chain.
 		HrmpBatchSent {
+			count: u32,
+		},
+		/// An account that must survive (a consumer reference forbids reaping — session keys
+		/// being the known case) was drained to a zero-balance shell; the balance travels like
+		/// any other account's.
+		AccountShellDrained {
+			who: AccountId32,
+			amount: u128,
+		},
+		/// Zero-balance records held alive only by stale provider references were reaped.
+		HusksReaped {
 			count: u32,
 		},
 	}
@@ -505,9 +516,7 @@ pub mod pallet {
 						Self::correct_total_issuance,
 						MigrationStage::CoolOff { end_at: now + COOL_OFF_BLOCKS.into() },
 					);
-					// Placeholder: the unaccounted-issuance measurement iterates every remaining
-					// account once.
-					T::DbWeight::get().reads_writes(10_000, 10)
+					T::DbWeight::get().reads_writes(10, 10)
 				},
 				MigrationStage::CoolOff { end_at } if now >= end_at => {
 					Self::transition(MigrationStage::MigrationDone);
@@ -664,36 +673,64 @@ pub mod pallet {
 					Fortitude::Polite,
 				)
 				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
-				// The treasury pot was book-kept as inactive issuance; reactivate what leaves so
-				// the issuance accounting stays consistent.
+				// Pot balances book-kept as inactive issuance (the treasury) must reactivate on
+				// leaving so the issuance accounting stays consistent. Applied saturating to
+				// every pot: a pot that was never deactivated just floors the counter toward
+				// its true end state — zero, since no pot survives the sweep.
 				pallet_balances::InactiveIssuance::<T>::mutate(|i| *i = i.saturating_sub(burned));
 				total = total.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
 				Self::deposit_event(Event::AccountSwept { who, amount: burned });
 			}
 
-			// Below-ED dust: reap accounts that nothing references and no hold complicates.
-			let (mut dust_count, mut dust_amount) = (0u32, 0u128);
+			// Below-ED dust: below the existential deposit nothing meaningful can still be
+			// backed by the balance on a retiring chain, so any hold or reserve is killed —
+			// including the consumer reference the backing carried — and the account zeroed.
+			// The fungible APIs refuse to touch referenced or held-against accounts, hence the
+			// direct write (same pattern as the accounts-stage shell drain). Zero-balance
+			// provider-ref husks are reaped along the way. A record survives only while
+			// something still references it (session key-holders being the known case) or it
+			// is a module account.
+			let (mut dust_count, mut dust_amount, mut husk_count) = (0u32, 0u128, 0u32);
 			let ed = <T as Config>::Currency::minimum_balance();
 			for (who, info) in frame_system::Account::<T>::iter() {
 				let d = &info.data;
-				if d.free.saturating_add(d.reserved) >= ed ||
-					d.free == 0 || d.reserved != 0 ||
-					info.consumers != 0 ||
-					!pallet_balances::Holds::<T>::get(&who).is_empty()
-				{
+				let amount = d.free.saturating_add(d.reserved);
+				let bytes: &[u8] = who.as_ref();
+				if amount >= ed || bytes.starts_with(b"modl") {
 					continue;
 				}
-				let burned = <T as Config>::Currency::burn_from(
-					&who,
-					d.free,
-					Preservation::Expendable,
-					Precision::Exact,
-					Fortitude::Polite,
-				)
-				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+				if amount == 0 {
+					// A husk: exists only via a stale provider reference. `dec_providers`
+					// refuses whenever something still references the account.
+					if info.consumers == 0 &&
+						frame_system::Pallet::<T>::dec_providers(&who).is_ok()
+					{
+						husk_count += 1;
+					}
+					continue;
+				}
+				let backed = !d.reserved.is_zero() ||
+					!pallet_balances::Holds::<T>::get(&who).is_empty();
+				pallet_balances::Holds::<T>::remove(&who);
+				frame_system::Account::<T>::mutate(&who, |a| {
+					a.data.free = 0;
+					a.data.reserved = 0;
+				});
+				pallet_balances::TotalIssuance::<T>::mutate(|ti| {
+					*ti = ti.saturating_sub(amount)
+				});
+				// Reserves and holds collectively carry one consumer reference; killing the
+				// backing drops it, so the record does not survive as a stale-ref shell.
+				if backed && info.consumers > 0 {
+					frame_system::Pallet::<T>::dec_consumers(&who);
+				}
+				let _ = frame_system::Pallet::<T>::dec_providers(&who);
 				dust_count += 1;
 				dust_amount =
-					dust_amount.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
+					dust_amount.checked_add(amount).ok_or(Error::<T>::BalanceAccounting)?;
+			}
+			if husk_count > 0 {
+				Self::deposit_event(Event::HusksReaped { count: husk_count });
 			}
 			if dust_count > 0 {
 				total = total.checked_add(dust_amount).ok_or(Error::<T>::BalanceAccounting)?;
@@ -713,17 +750,15 @@ pub mod pallet {
 
 		/// Burn the audited phantom issuance and send the finish signal.
 		///
-		/// Measures the issuance no account holds, burns `min(expected, measured)` — never
-		/// touching issuance that an account actually backs — and reports via events: a
-		/// remainder above the expectation stays on the books for investigation, a measurement
-		/// below it is an explicit anomaly.
+		/// By this stage the accounts and sweep stages have drained every account to zero, so
+		/// whatever issuance the ledger still counts is held by nobody — no O(accounts) scan is
+		/// needed. (Once the migration manager lands it stays funded through `CoolOff` and its
+		/// balance must be subtracted here.) Burns `min(expected, measured)` and reports via
+		/// events: a remainder above the expectation stays on the books for investigation, a
+		/// measurement below it is an explicit anomaly.
 		fn correct_total_issuance() -> Result<(), Error<T>> {
 			let expected = T::TiCorrection::get();
-			let in_accounts: u128 = frame_system::Account::<T>::iter_values()
-				.map(|a| a.data.free.saturating_add(a.data.reserved))
-				.sum();
-			let ti = pallet_balances::TotalIssuance::<T>::get();
-			let unaccounted = ti.saturating_sub(in_accounts);
+			let unaccounted = pallet_balances::TotalIssuance::<T>::get();
 			let burned = expected.min(unaccounted);
 
 			if unaccounted < expected {
@@ -737,7 +772,7 @@ pub mod pallet {
 			// No account holds this balance, so there is nothing to burn *from*: the correction
 			// is a direct issuance write, mirrored in the migration tracker so the conservation
 			// invariant stays exact.
-			pallet_balances::TotalIssuance::<T>::put(ti.saturating_sub(burned));
+			pallet_balances::TotalIssuance::<T>::put(unaccounted.saturating_sub(burned));
 			RcMigratedBalance::<T>::try_mutate(|t| {
 				t.kept = t.kept.checked_sub(burned).ok_or(Error::<T>::BalanceAccounting)?;
 				t.ti_corrected =

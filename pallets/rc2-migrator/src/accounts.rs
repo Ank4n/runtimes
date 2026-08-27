@@ -31,7 +31,8 @@
 //!
 //! Nothing stays behind: reserve that no pallet's deposit records account for (a known on-chain
 //! anomaly) also travels to the Coretime chain, under its own hold reason, and stays parked there
-//! for investigation.
+//! for investigation. Accounts that a consumer reference forbids reaping (session key-holders)
+//! are drained to zero-balance shells — the record survives, the money moves.
 //!
 //! Para sovereign accounts are included: their child-sovereign id (`para…`) is translated to the
 //! sibling id (`sibl…`) that represents the same para on a parachain.
@@ -48,10 +49,12 @@ pub type AccountInfoFor<T> = frame_system::AccountInfo<
 	pallet_balances::AccountData<u128>,
 >;
 
-/// Account-id prefixes that are never migrated: sibling-format sovereigns (an anomaly on a relay
-/// chain) and pallet (module) accounts. Child sovereigns (`para`) ARE migrated, translated to
-/// their sibling id.
-const UNMIGRATED_PREFIXES: [&[u8]; 2] = [b"sibl", b"modl"];
+/// Account-id prefixes that are never migrated: pallet (module) accounts — leftover pots among
+/// them are handled by the `Sweep` stage. Child sovereigns (`para`) ARE migrated, translated to
+/// their sibling id; sibling-format sovereigns (an anomaly on a relay chain, someone teleported
+/// to the wrong address) migrate untranslated — on Asset Hub the same bytes ARE that para's
+/// sovereign, so the para regains control of the funds.
+const UNMIGRATED_PREFIXES: [&[u8]; 1] = [b"modl"];
 
 /// Where the pieces of one withdrawn account go.
 pub struct Withdrawal {
@@ -110,6 +113,13 @@ impl<T: Config> AccountsMigrator<T> {
 			} else {
 				add_refund(who, deposit);
 			}
+			records += 1;
+		}
+		// Multisig operation deposits: the one deposit source whose calls stay open until the
+		// migration starts, so entries can still appear. The operation itself cannot complete on
+		// a retired chain — the deposit is refunded to the depositor.
+		for (_, _, op) in pallet_multisig::Multisigs::<T>::iter() {
+			add_refund(op.depositor, op.deposit);
 			records += 1;
 		}
 		// Pending open-channel requests migrate to the Coretime chain with their deposits, so
@@ -257,21 +267,36 @@ impl<T: Config> AccountsMigrator<T> {
 		}
 
 		// Releasing the reserve drops its consumer reference; anything left means some pallet
-		// still references this account and deleting its balance would corrupt that state.
-		if frame_system::Pallet::<T>::consumers(who) != 0 {
-			return Err(Error::<T>::AccountReferenced);
-		}
-
+		// still references this account (session keys being the known case) and the account
+		// record must survive. Its balance must not: drain it to a zero-balance shell — the
+		// intended end state for validator key-holders. Every fungible API (`burn_from`,
+		// `write_balance`) insists on keeping the ED for an unreapable account, so the account
+		// data is written directly — record, refcounts and providers untouched — with total
+		// issuance adjusted to match (the same direct-write pattern the TI-correction stage
+		// uses). Zero-balance consumer-referenced accounts already exist on chain, so this
+		// creates no new state shape.
 		let total = free.saturating_add(reserved);
-		let burned = <T as Config>::Currency::burn_from(
-			who,
-			total,
-			Preservation::Expendable,
-			Precision::Exact,
-			Fortitude::Polite,
-		)
-		.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
-		defensive_assert!(burned == total, "burned the account's whole balance");
+		if frame_system::Pallet::<T>::consumers(who) != 0 {
+			frame_system::Account::<T>::mutate(who, |a| {
+				a.data.free = 0;
+				a.data.reserved = 0;
+			});
+			pallet_balances::TotalIssuance::<T>::mutate(|ti| *ti = ti.saturating_sub(total));
+			Pallet::<T>::deposit_event(Event::AccountShellDrained {
+				who: who.clone(),
+				amount: total,
+			});
+		} else {
+			let burned = <T as Config>::Currency::burn_from(
+				who,
+				total,
+				Preservation::Expendable,
+				Precision::Exact,
+				Fortitude::Polite,
+			)
+			.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+			defensive_assert!(burned == total, "burned the account's whole balance");
+		}
 
 		// The split: CT-bound deposits, proxy deposits and unattributed reserve → CT holds (one
 		// per reason); refunded deposits become liquid; working buffer → CT free; the rest → AH

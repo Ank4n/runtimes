@@ -286,6 +286,11 @@ pub fn emit_rc_block() {
 					"unattributed_reserve",
 					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
 				),
+				MigEvent::AccountShellDrained { who, amount } => e(
+					"account_shell_drained",
+					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
+				),
+				MigEvent::HusksReaped { count } => e("husks_reaped", json!({ "count": count })),
 				MigEvent::TiCorrected { expected, unaccounted, burned } => e(
 					"ti_corrected",
 					json!({

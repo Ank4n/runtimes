@@ -1881,9 +1881,14 @@ impl pallet_rc_migrator::Config for Runtime {
 
 parameter_types! {
 	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
-	/// Leftover pots emptied by the migration's `Sweep` stage.
-	pub SweepAccounts: Vec<AccountId> =
-		vec![TreasuryPalletId::get().into_account_truncating()];
+	/// Leftover pots emptied by the migration's `Sweep` stage. `dap/satl` is the retired
+	/// direct-allocation pot's `PalletId`; the on-demand pot can accrue order revenue up to
+	/// the migration.
+	pub SweepAccounts: Vec<AccountId> = vec![
+		TreasuryPalletId::get().into_account_truncating(),
+		PalletId(*b"dap/satl").into_account_truncating(),
+		OnDemandPalletId::get().into_account_truncating(),
+	];
 	/// Where swept pots and dust land on Asset Hub: the AH treasury account (same `PalletId`
 	/// derivation, so the same address). TODO: point at the DAP buffer account once governance
 	/// designates it.

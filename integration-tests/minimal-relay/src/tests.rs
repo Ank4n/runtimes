@@ -836,25 +836,45 @@ async fn full_migration_rc_to_ct() {
 			)
 		});
 
-	// The sweep stage's inputs: the old treasury pot plus reapable below-ED dust.
-	let (treasury, sweep_expected) = rc.execute_with(|| {
+	// The sweep stage's inputs — the configured pots plus reapable below-ED dust, all landing
+	// on the sweep beneficiary — and the sibl-format sovereigns, whose balances migrate
+	// untranslated to the same bytes on AH.
+	let (treasury, sweep_pots, sweep_dust, sibl_before) = rc.execute_with(|| {
 		let treasury: AccountId32 =
 			polkadot_runtime::TreasuryPalletId::get().into_account_truncating();
+		let pots: Vec<(AccountId32, u128)> = polkadot_runtime::SweepAccounts::get()
+			.into_iter()
+			.map(|who| {
+				let amount = frame_system::Account::<Rc>::get(&who).data.free;
+				(who, amount)
+			})
+			.collect();
 		let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
-		let mut expected = frame_system::Account::<Rc>::get(&treasury).data.free;
-		for (who, info) in frame_system::Account::<Rc>::iter() {
-			let d = &info.data;
-			if d.free + d.reserved < ed &&
-				d.free > 0 && d.reserved == 0 &&
-				info.consumers == 0 &&
-				pallet_balances::Holds::<Rc>::get(&who).is_empty()
-			{
-				expected += d.free;
+		let mut dust = 0u128;
+		for (_, info) in frame_system::Account::<Rc>::iter() {
+			let total = info.data.free + info.data.reserved;
+			if total > 0 && total < ed {
+				dust += total;
 			}
 		}
-		(treasury, expected)
+		// A sibl account's expected AH arrival includes its para's CHILD sovereign: the child
+		// migrates translated to the same sibl bytes, its AH-bound free landing on one address.
+		let sibl: Vec<(AccountId32, u128)> = frame_system::Account::<Rc>::iter()
+			.filter(|(who, _)| AsRef::<[u8]>::as_ref(who).starts_with(b"sibl"))
+			.map(|(who, info)| {
+				let bytes: &[u8] = who.as_ref();
+				let para = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
+				let child: AccountId32 =
+					polkadot_primitives::Id::from(para).into_account_truncating();
+				let child_data = frame_system::Account::<Rc>::get(&child).data;
+				let (_, child_ah) = expected_split(child_data.free, child_data.reserved);
+				(who, info.data.free + info.data.reserved + child_ah)
+			})
+			.collect();
+		(treasury, pots, dust, sibl)
 	});
-	assert!(sweep_expected > 0, "the snapshot has a treasury pot to sweep");
+	assert!(sweep_pots.iter().any(|(_, a)| *a > 0), "the snapshot has pots to sweep");
+	assert!(!sibl_before.is_empty(), "the snapshot has sibl-format sovereigns");
 	assert!(!paras_before.is_empty(), "live RC snapshot has registered paras");
 	assert!(!hrmp_before.is_empty(), "live RC snapshot has HRMP channels");
 	let recorded_deposits: u128 = paras_before.iter().map(|(_, d)| d).sum();
@@ -934,8 +954,15 @@ async fn full_migration_rc_to_ct() {
 			frame_system::Account::<Ah>::get(&sample.0).data.free,
 		)
 	});
-	let ah_treasury_before =
-		ah.execute_with(|| frame_system::Account::<Ah>::get(&treasury).data.free);
+	// Pre-migration AH balances of every address the sweep and sibl legs pay into.
+	let ah_arrivals_before: BTreeMap<AccountId32, u128> = ah.execute_with(|| {
+		sweep_pots
+			.iter()
+			.map(|(who, _)| who)
+			.chain(sibl_before.iter().map(|(who, _)| who))
+			.map(|who| (who.clone(), frame_system::Account::<Ah>::get(who).data.free))
+			.collect()
+	});
 
 	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks.
 	rc.execute_with(|| {
@@ -1032,11 +1059,31 @@ async fn full_migration_rc_to_ct() {
 			"the manager's translatable defs must have left the RC"
 		);
 
-		// The treasury pot is gone; its funds (plus dust) teleported to the same address on AH.
-		assert!(
-			!frame_system::Account::<Rc>::contains_key(&treasury),
-			"the treasury pot must be swept"
-		);
+		// Every funded pot is gone; its balance teleported to the same address on AH.
+		for (who, amount) in &sweep_pots {
+			if *amount > 0 {
+				assert!(
+					!frame_system::Account::<Rc>::contains_key(who),
+					"pot {who:?} must be swept"
+				);
+			}
+		}
+
+		// The RC end state: not a single planck remains anywhere, and every surviving record
+		// earns its place — something still references it (session key-holders being the known
+		// case) or it is a module account. Unreferenced husks are reaped.
+		for (who, info) in frame_system::Account::<Rc>::iter() {
+			assert_eq!(
+				info.data.free + info.data.reserved,
+				0,
+				"only zero-balance shells may stay on the RC, found {who:?}"
+			);
+			let bytes: &[u8] = who.as_ref();
+			assert!(
+				info.consumers > 0 || bytes.starts_with(b"modl"),
+				"unreferenced husk {who:?} must have been reaped"
+			);
+		}
 
 		// Never-signed delegators whose accounts migrated away (fund-less husks never had an
 		// account to migrate): their CT-side control is asserted below.
@@ -1083,6 +1130,8 @@ async fn full_migration_rc_to_ct() {
 			"balance bookkeeping is exact"
 		);
 		assert_eq!(pallet_balances::TotalIssuance::<Rc>::get(), tracker.kept);
+		// The headline: the relay chain ends the migration with ZERO issuance.
+		assert_eq!(tracker.kept, 0, "the RC must drain to exactly zero DOT");
 		// The audited phantom issuance was burned in full: the runtime constant equals the
 		// measured unaccounted issuance on this snapshot, so nothing remains and no anomaly.
 		assert_eq!(
@@ -1275,12 +1324,24 @@ async fn full_migration_rc_to_ct() {
 			"the manager's free balance arrived on AH"
 		);
 
-		// The swept pots and dust landed on the AH treasury account, exactly.
+		// The swept pots and reaped dust landed on the sweep beneficiary, exactly.
+		let pots_total: u128 = sweep_pots.iter().map(|(_, amount)| amount).sum();
 		assert_eq!(
 			frame_system::Account::<Ah>::get(&treasury).data.free,
-			ah_treasury_before + sweep_expected,
-			"sweep must arrive on the AH treasury account"
+			ah_arrivals_before[&treasury] + pots_total + sweep_dust,
+			"pots and dust must arrive on the sweep beneficiary"
 		);
+
+		// The sibl-format sovereigns' balances arrived on the same bytes — on AH those ARE the
+		// paras' sovereign accounts, so the paras regain control. The expectation includes the
+		// child sovereign's AH leg, which translates to the same address.
+		for (who, total) in &sibl_before {
+			assert_eq!(
+				frame_system::Account::<Ah>::get(who).data.free,
+				ah_arrivals_before[who] + total,
+				"sibl sovereign {who:?}'s balance must arrive on its AH sovereign account"
+			);
+		}
 
 		// Never-signed delegators with `Any` defs went whole to CT (asserted there); the ones
 		// without are multisigs, controllable on every chain by their members, so their teleport
