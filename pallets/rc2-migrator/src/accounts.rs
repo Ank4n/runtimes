@@ -29,8 +29,9 @@
 //! recreated (the Coretime chain, by the proxy stage), so ALL of its balance goes there instead
 //! of Asset Hub.
 //!
-//! Accounts whose reserve exceeds what the pallets' deposit records account for are kept whole on
-//! the relay chain — money whose destination is unknown does not move.
+//! Nothing stays behind: reserve that no pallet's deposit records account for (a known on-chain
+//! anomaly) also travels to the Coretime chain, under its own hold reason, and stays parked there
+//! for investigation.
 //!
 //! Para sovereign accounts are included: their child-sovereign id (`para…`) is translated to the
 //! sibling id (`sibl…`) that represents the same para on a parachain.
@@ -66,8 +67,11 @@ impl<T: Config> AccountsMigrator<T> {
 	/// Index every account's expected reserves from the owning pallets' records:
 	/// - Coretime-bound ([`ExpectedCtReserve`]): registrar deposits per manager, HRMP channel
 	///   deposits per (child) para sovereign;
-	/// - refunded ([`ExpectedRefundReserve`]): proxy deposits per delegator and pending HRMP
-	///   open-channel-request deposits per sovereign — deposits whose purpose does not continue.
+	/// - proxy deposits ([`ExpectedProxyReserve`]): per delegator with at least one portable
+	///   definition — they travel under their own hold reason and are resized when the
+	///   definitions arrive;
+	/// - refunded ([`ExpectedRefundReserve`]): proxy deposits of delegators none of whose
+	///   definitions travel — deposits whose purpose does not continue.
 	///
 	/// Called once by `AccountsInit`. Returns the number of records indexed.
 	pub fn build_expected_reserves() -> u32 {
@@ -75,6 +79,11 @@ impl<T: Config> AccountsMigrator<T> {
 		let add_ct = |who: T::AccountId, amount: u128| {
 			if !amount.is_zero() {
 				ExpectedCtReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
+			}
+		};
+		let add_proxy = |who: T::AccountId, amount: u128| {
+			if !amount.is_zero() {
+				ExpectedProxyReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
 			}
 		};
 		let add_refund = |who: T::AccountId, amount: u128| {
@@ -92,8 +101,15 @@ impl<T: Config> AccountsMigrator<T> {
 			add_ct(id.recipient.into_account_truncating(), channel.recipient_deposit);
 			records += 1;
 		}
-		for (who, (_, deposit)) in pallet_proxy::Proxies::<T>::iter() {
-			add_refund(who, deposit);
+		for (who, (defs, deposit)) in pallet_proxy::Proxies::<T>::iter() {
+			let travels = defs
+				.iter()
+				.any(|def| TryInto::<PortableProxyType>::try_into(def.proxy_type.clone()).is_ok());
+			if travels {
+				add_proxy(who, deposit);
+			} else {
+				add_refund(who, deposit);
+			}
 			records += 1;
 		}
 		// Pending open-channel requests migrate to the Coretime chain with their deposits, so
@@ -205,24 +221,21 @@ impl<T: Config> AccountsMigrator<T> {
 		}
 		let free = info.data.free;
 		let reserved = info.data.reserved;
-		let held_back = |reason: &str| {
-			log::info!(target: LOG_TARGET, "Holding back account {who:?}: {reason}");
-			Pallet::<T>::deposit_event(Event::AccountHeldBack { who: who.clone(), free, reserved });
-			Ok(None)
-		};
 
-		// Reserved balance is only trusted up to what the owning pallets say this account
-		// deposited: registrar/HRMP deposits continue on the Coretime chain, proxy and pending
-		// HRMP-request deposits are refunded. More reserve than the two together is money whose
-		// origin is unknown (a true anomaly): the whole account stays on the RC.
-		let (expected_ct, expected_refund) = if reserved.is_zero() {
-			(0, 0)
+		// What the owning pallets say this account deposited: registrar/HRMP deposits continue on
+		// the Coretime chain, proxy deposits travel there under their own reason (or are refunded
+		// when no definition travels). Anything beyond is money whose origin is unknown (a true
+		// anomaly): it travels too — nothing stays behind — but under its own hold reason, parked
+		// at the destination for investigation.
+		let (expected_ct, expected_proxy, expected_refund) = if reserved.is_zero() {
+			(0, 0, 0)
 		} else {
-			(ExpectedCtReserve::<T>::get(who), ExpectedRefundReserve::<T>::get(who))
+			(
+				ExpectedCtReserve::<T>::get(who),
+				ExpectedProxyReserve::<T>::get(who),
+				ExpectedRefundReserve::<T>::get(who),
+			)
 		};
-		if reserved > expected_ct.saturating_add(expected_refund) {
-			return held_back("unattributable reserve");
-		}
 
 		// A reserve is supposed to be backed by a consumer reference; accounts where it is not
 		// have broken refcounts (a known on-chain anomaly). Unreserving them still works, but
@@ -260,22 +273,34 @@ impl<T: Config> AccountsMigrator<T> {
 		.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
 		defensive_assert!(burned == total, "burned the account's whole balance");
 
-		// The split: CT-bound deposits → CT hold; refunded deposits become liquid; working
-		// buffer → CT free; the rest → AH free. Free balance below AH's ED cannot teleport into
-		// a fresh account, so such dust follows the deposit to CT instead (only deposit holders
-		// can be in this situation: everyone else has free >= the RC ED, which exceeds AH's).
+		// The split: CT-bound deposits, proxy deposits and unattributed reserve → CT holds (one
+		// per reason); refunded deposits become liquid; working buffer → CT free; the rest → AH
+		// free. Free balance below AH's ED cannot teleport into a fresh account, so such dust
+		// follows the deposit to CT instead (only deposit holders can be in this situation:
+		// everyone else has free >= the RC ED, which exceeds AH's).
 		//
 		// Exception: a never-signed delegator granting an `Any` proxy is (or must be treated as)
 		// a keyless pure proxy. Its delegate keeps full control only on the Coretime chain, where
 		// the proxy stage recreates the definitions, so ALL of its liquid balance goes there.
 		let ct_hold = reserved.min(expected_ct);
-		let refunded = reserved.saturating_sub(ct_hold);
+		let proxy_hold = reserved.saturating_sub(ct_hold).min(expected_proxy);
+		let refunded =
+			reserved.saturating_sub(ct_hold).saturating_sub(proxy_hold).min(expected_refund);
+		let unattributed =
+			reserved.saturating_sub(ct_hold).saturating_sub(proxy_hold).saturating_sub(refunded);
 		if !refunded.is_zero() {
 			Pallet::<T>::deposit_event(Event::DepositRefunded {
 				who: who.clone(),
 				amount: refunded,
 			});
 		}
+		if !unattributed.is_zero() {
+			Pallet::<T>::deposit_event(Event::UnattributedReserve {
+				who: who.clone(),
+				amount: unattributed,
+			});
+		}
+		let held = ct_hold.saturating_add(proxy_hold).saturating_add(unattributed);
 		let liquid = free.saturating_add(refunded);
 		let pure_like = info.nonce.is_zero() &&
 			pallet_proxy::Proxies::<T>::get(who).0.iter().any(|def| {
@@ -283,29 +308,32 @@ impl<T: Config> AccountsMigrator<T> {
 			});
 		let mut ct_free = if pure_like {
 			liquid
-		} else if ct_hold.is_zero() {
+		} else if held.is_zero() {
 			0
 		} else {
 			liquid.min(T::CtFreeBuffer::get())
 		};
 		let mut ah_free = liquid.saturating_sub(ct_free);
-		if !ah_free.is_zero() && ah_free < T::AhExistentialDeposit::get() && !ct_hold.is_zero() {
+		if !ah_free.is_zero() && ah_free < T::AhExistentialDeposit::get() && !held.is_zero() {
 			ct_free = ct_free.saturating_add(ah_free);
 			ah_free = 0;
 		}
 
 		let dest = Self::translate_destination(who);
-		let ct = if ct_hold.is_zero() && ct_free.is_zero() {
+		let ct = if held.is_zero() && ct_free.is_zero() {
 			None
 		} else {
 			let mut holds = BoundedVec::default();
-			if !ct_hold.is_zero() {
-				holds
-					.try_push(PortableHold {
-						reason: PortableHoldReason::UnnamedReserve,
-						amount: ct_hold,
-					})
-					.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+			for (reason, amount) in [
+				(PortableHoldReason::UnnamedReserve, ct_hold),
+				(PortableHoldReason::ProxyDeposit, proxy_hold),
+				(PortableHoldReason::UnattributedReserve, unattributed),
+			] {
+				if !amount.is_zero() {
+					holds
+						.try_push(PortableHold { reason, amount })
+						.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
+				}
 			}
 			Some(PortableAccount { who: dest.clone(), free: ct_free, holds })
 		};

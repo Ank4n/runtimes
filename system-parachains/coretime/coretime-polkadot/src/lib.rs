@@ -701,6 +701,10 @@ impl From<pallet_ct_migrator::PortableHoldReason> for RuntimeHoldReason {
 		match reason {
 			pallet_ct_migrator::PortableHoldReason::UnnamedReserve =>
 				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::RcMigratedReserve),
+			pallet_ct_migrator::PortableHoldReason::ProxyDeposit =>
+				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::ProxyDeposit),
+			pallet_ct_migrator::PortableHoldReason::UnattributedReserve =>
+				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::UnattributedReserve),
 		}
 	}
 }

@@ -282,13 +282,9 @@ pub fn emit_rc_block() {
 					e("hrmp_requests_sent", json!({ "count": count })),
 				MigEvent::AccountsTeleported { count, amount } =>
 					e("accounts_teleported", json!({ "count": count, "amount": planck(amount) })),
-				MigEvent::AccountHeldBack { who, free, reserved } => e(
-					"account_held_back",
-					json!({
-						"who": format!("{who:?}"),
-						"free": planck(free),
-						"reserved": planck(reserved),
-					}),
+				MigEvent::UnattributedReserve { who, amount } => e(
+					"unattributed_reserve",
+					json!({ "who": format!("{who:?}"), "amount": planck(amount) }),
 				),
 				MigEvent::TiCorrected { expected, unaccounted, burned } => e(
 					"ti_corrected",

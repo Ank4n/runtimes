@@ -1145,18 +1145,35 @@ async fn full_migration_rc_to_ct() {
 			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::RegistrarDeposit);
 		let hrmp_id =
 			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::HrmpDeposit);
-		let (mut reg_held, mut hrmp_held) = (0u128, 0u128);
+		let proxy_id =
+			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::ProxyDeposit);
+		let unattributed_id = coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(
+			HoldReason::UnattributedReserve,
+		);
+		let (mut reg_held, mut hrmp_held, mut proxy_held, mut unattributed_held) =
+			(0u128, 0u128, 0u128, 0u128);
 		for who in frame_system::Account::<Ct>::iter_keys() {
 			for hold in pallet_balances::Holds::<Ct>::get(&who) {
 				if hold.id == reg_id {
 					reg_held += hold.amount;
 				} else if hold.id == hrmp_id {
 					hrmp_held += hold.amount;
+				} else if hold.id == proxy_id {
+					proxy_held += hold.amount;
+				} else if hold.id == unattributed_id {
+					unattributed_held += hold.amount;
 				}
 			}
 		}
 		assert_eq!(reg_held, reattributed, "RegistrarDeposit holds match the re-attributed total");
 		assert_eq!(hrmp_held, reattributed_hrmp, "HrmpDeposit holds match the re-attributed total");
+		// Every migrated proxy deposit is resized (released and re-reserved at this chain's
+		// rates) when its definitions arrive; a remaining hold would mean defs never followed.
+		assert_eq!(proxy_held, 0, "no unresized proxy deposit may remain");
+		// The RC's anomalous reserves (backed by no deposit record) must arrive parked rather
+		// than stay behind; the snapshot is known to carry some.
+		assert!(unattributed_held > 0, "unattributed reserves must arrive parked on CT");
+		println!("unattributed reserves parked on CT: {:.4} DOT", dot(unattributed_held));
 
 		assert_eq!(CtMintedTotal::<Ct>::get(), migrated_ct, "CT minted exactly the CT-bound burn");
 		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated_ct);
