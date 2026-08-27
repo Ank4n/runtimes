@@ -95,8 +95,7 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 		last_key: Option<AccountId>,
 	},
 	AccountsDone,
-	/// Migrates manager-linked proxy definitions to the Coretime chain. Runs before the
-	/// registrar stage so classification can read the (not yet drained) `Paras` map.
+	/// Migrates portable proxy definitions to the Coretime chain.
 	ProxyInit,
 	ProxyOngoing {
 		last_key: Option<AccountId>,
@@ -292,16 +291,6 @@ pub mod pallet {
 	pub type ExpectedRefundReserve<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
 
-	/// Accounts that must not be migrated, set by governance before the migration starts.
-	///
-	/// The off-chain pre-flight populates this with accounts whose funds would strand at the
-	/// destination — e.g. possible pure proxies without verifiable control on Asset Hub. The
-	/// chain cannot check another chain's state, so the verification result is pinned here
-	/// (v1's `preserve_accounts` pattern).
-	#[pallet::storage]
-	pub type HeldBackAccounts<T: Config> =
-		StorageMap<_, Twox64Concat, T::AccountId, (), OptionQuery>;
-
 	#[pallet::error]
 	pub enum Error<T> {
 		/// Sending an XCM message to the Coretime chain failed.
@@ -330,9 +319,8 @@ pub mod pallet {
 			count: u32,
 			amount: u128,
 		},
-		/// An account was kept whole on the relay chain: pinned by governance, or carrying
-		/// reserve that no pallet's deposit records account for. Money whose destination is
-		/// unknown does not move.
+		/// An account was kept whole on the relay chain: it carries reserve that no pallet's
+		/// deposit records account for. Money whose destination is unknown does not move.
 		AccountHeldBack {
 			who: AccountId32,
 			free: u128,
@@ -343,7 +331,7 @@ pub mod pallet {
 			who: AccountId32,
 			amount: u128,
 		},
-		/// A batch of manager-linked proxy sets was sent to the Coretime chain.
+		/// A batch of portable proxy sets was sent to the Coretime chain.
 		ProxyBatchSent {
 			count: u32,
 		},
@@ -404,21 +392,6 @@ pub mod pallet {
 			ensure_root(origin)?;
 
 			Self::transition(stage);
-			Ok(())
-		}
-
-		/// Pin accounts that must stay on the relay chain untouched (see [`HeldBackAccounts`]).
-		#[pallet::call_index(1)]
-		#[pallet::weight(T::DbWeight::get().writes(accounts.len() as u64))]
-		pub fn hold_back_accounts(
-			origin: OriginFor<T>,
-			accounts: Vec<AccountId32>,
-		) -> DispatchResult {
-			ensure_root(origin)?;
-
-			for who in accounts {
-				HeldBackAccounts::<T>::insert(who, ());
-			}
 			Ok(())
 		}
 	}
@@ -633,7 +606,7 @@ pub mod pallet {
 			Ok(())
 		}
 
-		/// Send a batch of manager-linked proxy sets to the Coretime chain.
+		/// Send a batch of portable proxy sets to the Coretime chain.
 		pub(crate) fn send_proxies(
 			proxies: Vec<PortableProxy<AccountId32>>,
 		) -> Result<(), Error<T>> {
