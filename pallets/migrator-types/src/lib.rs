@@ -107,10 +107,20 @@ pub struct PortableHold<Balance> {
 )]
 pub enum PortableHoldReason {
 	/// Reserved on the relay chain without a named reason, via the old `Currency` API — how all
-	/// relay-chain deposits (`paras_registrar`, `hrmp`, `proxy`) are placed. Attribution to the
-	/// pallet owning the deposit happens when that pallet's own state migrates.
+	/// relay-chain deposits are placed. Carries the registrar and HRMP deposits; attribution to
+	/// the pallet owning the deposit happens when that pallet's own state migrates.
 	#[codec(index = 0)]
 	UnnamedReserve,
+	/// A proxy deposit of a delegator whose (portable) definitions travel to the destination.
+	/// Resized there when the definitions arrive: the destination reserves its own rates for the
+	/// recreated entry and releases the rest as free balance.
+	#[codec(index = 1)]
+	ProxyDeposit,
+	/// Reserve that no pallet's deposit records account for (a known on-chain anomaly). Nothing
+	/// stays behind on the relay chain, so it travels under its own reason and stays parked at
+	/// the destination for investigation; no stage ever re-attributes it.
+	#[codec(index = 2)]
+	UnattributedReserve,
 }
 
 /// Registrar record (`paras_registrar::ParaInfo`) in portable format.
@@ -203,10 +213,10 @@ pub struct PortableProxyDelegate<AccountId> {
 
 /// A migrated delegator with its (translatable) proxy delegations.
 ///
-/// The original relay-chain deposit does not travel — it is refunded by the accounts stage; the
-/// entry is backed at the destination's own deposit rates from the delegator's local balance
-/// instead, so keyless (pure) delegators keep control there without anyone having to sign
-/// anything.
+/// The original relay-chain deposit travels separately, as a [`PortableHoldReason::ProxyDeposit`]
+/// hold placed by the accounts stage. When the delegations arrive, the destination releases that
+/// hold, re-reserves the recreated entry at its own deposit rates and leaves the rest free — so
+/// keyless (pure) delegators keep control there without anyone having to sign anything.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
 )]

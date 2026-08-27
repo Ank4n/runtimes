@@ -284,9 +284,18 @@ pub mod pallet {
 	pub type ExpectedCtReserve<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
 
+	/// How much reserved balance each account carries to the Coretime chain as a
+	/// [`PortableHoldReason::ProxyDeposit`] hold: the proxy deposits of delegators with at least
+	/// one portable definition. Resized on the Coretime chain when the definitions arrive. Built
+	/// by `AccountsInit` like [`ExpectedCtReserve`].
+	#[pallet::storage]
+	pub type ExpectedProxyReserve<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
+
 	/// How much reserved balance each account gets *refunded* (released and teleported to Asset
-	/// Hub as free): proxy deposits, whose entries are recreated deposit-free or backed at the
-	/// destination's own rates. Built by `AccountsInit` like [`ExpectedCtReserve`].
+	/// Hub as free): the proxy deposits of delegators none of whose definitions travel — nothing
+	/// is recreated, so the deposit's purpose ends here. Built by `AccountsInit` like
+	/// [`ExpectedCtReserve`].
 	#[pallet::storage]
 	pub type ExpectedRefundReserve<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
@@ -319,12 +328,11 @@ pub mod pallet {
 			count: u32,
 			amount: u128,
 		},
-		/// An account was kept whole on the relay chain: it carries reserve that no pallet's
-		/// deposit records account for. Money whose destination is unknown does not move.
-		AccountHeldBack {
+		/// An account carried reserve that no pallet's deposit records account for. It travels to
+		/// the Coretime chain under its own hold reason and stays parked there for investigation.
+		UnattributedReserve {
 			who: AccountId32,
-			free: u128,
-			reserved: u128,
+			amount: u128,
 		},
 		/// A proxy deposit was released and refunded: it travels to Asset Hub as free balance.
 		DepositRefunded {

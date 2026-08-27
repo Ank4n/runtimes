@@ -139,6 +139,15 @@ pub mod pallet {
 		/// Placeholder reason like [`Self::RegistrarDeposit`], for the future HRMP pallet.
 		#[codec(index = 2)]
 		HrmpDeposit,
+		/// A relay-chain proxy deposit whose definitions travel here. Released when they arrive:
+		/// the recreated entry is re-reserved at this chain's rates and the rest becomes free.
+		#[codec(index = 3)]
+		ProxyDeposit,
+		/// Relay-chain reserve that no pallet's deposit records accounted for. Parked here for
+		/// investigation — nothing was allowed to stay behind on the relay chain — and never
+		/// re-attributed by any stage.
+		#[codec(index = 4)]
+		UnattributedReserve,
 	}
 
 	#[pallet::pallet]
@@ -574,6 +583,21 @@ pub mod pallet {
 		fn do_receive_proxy(proxy: &PortableProxyOf<T>) -> Result<(), Error<T>> {
 			use frame_support::traits::ReservableCurrency;
 
+			// Resize the migrated relay-chain deposit to this chain's rates: release it whole —
+			// making it free balance — and re-reserve below only what the recreated entry needs.
+			// The difference stays free on this chain, in the delegator's hands.
+			let proxy_reason: T::RuntimeHoldReason = HoldReason::ProxyDeposit.into();
+			let migrated = <T as Config>::Currency::balance_on_hold(&proxy_reason, &proxy.delegator);
+			if !migrated.is_zero() {
+				<T as Config>::Currency::release(
+					&proxy_reason,
+					&proxy.delegator,
+					migrated,
+					Precision::Exact,
+				)
+				.map_err(|_| Error::<T>::FailedToProcessProxy)?;
+			}
+
 			pallet_proxy::Proxies::<T>::try_mutate(&proxy.delegator, |(defs, deposit)| {
 				for delegate in proxy.delegates.iter() {
 					let def = pallet_proxy::ProxyDefinition {
@@ -587,8 +611,8 @@ pub mod pallet {
 					}
 				}
 
-				// Back the entry at this chain's rates from the delegator's local balance,
-				// topping up whatever is already reserved for pre-existing local proxies.
+				// Back the entry at this chain's rates (normally from the released deposit
+				// above), topping up whatever is already reserved for pre-existing local proxies.
 				let required = <T as pallet_proxy::Config>::ProxyDepositBase::get().saturating_add(
 					<T as pallet_proxy::Config>::ProxyDepositFactor::get()
 						.saturating_mul((defs.len() as u32).into()),
