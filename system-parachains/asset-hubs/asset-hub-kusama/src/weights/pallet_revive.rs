@@ -566,6 +566,12 @@ impl<T: frame_system::Config> pallet_revive::WeightInfo for WeightInfo<T> {
 		Weight::from_parts(998_000, 0)
 			.saturating_add(Weight::from_parts(0, 0))
 	}
+	/// Placeholder: `origin_is_root` was added to `pallet_revive::WeightInfo` after these weights
+	/// were generated. Priced as `caller_is_root`, which does the same shape of work. Regenerate
+	/// with the benchmark CLI rather than tuning this by hand.
+	fn origin_is_root() -> Weight {
+		Self::caller_is_root()
+	}
 	fn caller_is_root() -> Weight {
 		// Proof Size summary in bytes:
 		//  Measured:  `0`
