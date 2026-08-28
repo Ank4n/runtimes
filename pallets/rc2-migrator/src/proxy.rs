@@ -37,6 +37,40 @@ use sp_runtime::traits::UniqueSaturatedInto;
 pub struct ProxyMigrator<T>(PhantomData<T>);
 
 impl<T: Config> ProxyMigrator<T> {
+	/// Drop the announcement records of announcers whose accounts migrated away. Their deposits
+	/// were refunded by the accounts stage (indexed as [`ExpectedRefundReserve`]), so keeping the
+	/// record would claim money that is gone. Announcers still on this chain (kept accounts) keep
+	/// their record with the recorded deposit clamped to what is still actually reserved — the
+	/// same no-ghost-deposit rule as proxy entries.
+	///
+	/// One-shot, called by `ProxyInit`; the announcement count is small. The caller wraps this in
+	/// a storage transaction.
+	pub fn drain_announcements() -> Result<(), Error<T>> {
+		let mut count = 0u32;
+		let entries: Vec<_> = pallet_proxy::Announcements::<T>::iter().collect();
+		for (announcer, (announcements, deposit)) in entries {
+			match frame_system::Account::<T>::try_get(&announcer) {
+				Ok(account) => {
+					let backed = deposit.min(account.data.reserved);
+					if backed != deposit {
+						pallet_proxy::Announcements::<T>::insert(
+							&announcer,
+							(announcements, backed),
+						);
+					}
+				},
+				Err(()) => {
+					pallet_proxy::Announcements::<T>::remove(&announcer);
+					count += 1;
+				},
+			}
+		}
+		if count > 0 {
+			log::info!(target: LOG_TARGET, "Dropped {count} announcement records");
+		}
+		Ok(())
+	}
+
 	/// Migrate proxy definitions until the per-block limit is reached.
 	///
 	/// Returns the cursor to continue from on the next block, or `None` once the map is

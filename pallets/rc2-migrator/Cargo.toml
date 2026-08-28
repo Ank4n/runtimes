@@ -23,6 +23,10 @@ runtime-parachains = { workspace = true }
 sp-runtime = { workspace = true }
 xcm = { workspace = true }
 
+[dev-dependencies]
+sp-core = { workspace = true, features = ["std"] }
+sp-io = { workspace = true, features = ["std"] }
+
 [features]
 default = ["std"]
 std = [

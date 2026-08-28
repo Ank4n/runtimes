@@ -30,13 +30,18 @@ extern crate alloc;
 pub use migrator_types::*;
 pub use pallet::*;
 
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+
 use alloc::vec::Vec;
 use frame_support::{
 	defensive_assert,
 	pallet_prelude::*,
 	traits::{
-		fungible::{Inspect, InspectHold, Mutate, MutateHold},
-		tokens::Precision,
+		fungible::{Inspect, InspectHold, Mutate, MutateHold, Unbalanced, UnbalancedHold},
+		tokens::{Fortitude, Precision, Preservation},
 	},
 };
 use frame_system::pallet_prelude::*;
@@ -496,11 +501,35 @@ pub mod pallet {
 			defensive_assert!(minted == total, "minted what the relay chain burned");
 
 			for hold in &account.holds {
-				<T as Config>::Currency::hold(&hold.reason.into(), who, hold.amount)
+				Self::place_hold(&hold.reason.into(), who, hold.amount)
 					.map_err(|_| Error::<T>::FailedToProcessAccount)?;
 			}
 
 			Ok(minted)
+		}
+
+		/// Place `amount` of `who`'s free balance under `reason` without the account ever sitting
+		/// at zero reserve mid-operation.
+		///
+		/// `MutateHold::hold` decreases the free balance before it books the hold; if that leaves
+		/// a sub-ED free remainder while nothing is reserved yet, pallet-balances dusts the
+		/// remainder. Deposit holders whose liquid dust deliberately travelled here alongside the
+		/// deposit are in exactly that shape, so the two steps run in the reverse (safe) order.
+		/// The low-level primitives keep total issuance untouched, like `hold` itself.
+		fn place_hold(
+			reason: &T::RuntimeHoldReason,
+			who: &T::AccountId,
+			amount: BalanceOf<T>,
+		) -> Result<(), DispatchError> {
+			<T as Config>::Currency::increase_balance_on_hold(reason, who, amount, Precision::Exact)?;
+			<T as Config>::Currency::decrease_balance(
+				who,
+				amount,
+				Precision::Exact,
+				Preservation::Expendable,
+				Fortitude::Force,
+			)?;
+			Ok(())
 		}
 
 		fn do_receive_registrar(paras: Vec<PortableParaInfoOf<T>>, next_free: Option<u32>) {
@@ -539,10 +568,22 @@ pub mod pallet {
 			let attribute = wanted.min(held);
 
 			if !attribute.is_zero() {
-				<T as Config>::Currency::release(&rc_reason, who, attribute, Precision::Exact)
-					.map_err(|_| Error::<T>::FailedToReattribute)?;
-				<T as Config>::Currency::hold(&to.into(), who, attribute)
-					.map_err(|_| Error::<T>::FailedToReattribute)?;
+				// Flip hold-to-hold, never via free: releasing first would dust a sub-ED free
+				// remainder the moment the reserve hits zero (see `place_hold`).
+				<T as Config>::Currency::increase_balance_on_hold(
+					&to.into(),
+					who,
+					attribute,
+					Precision::Exact,
+				)
+				.map_err(|_| Error::<T>::FailedToReattribute)?;
+				<T as Config>::Currency::decrease_balance_on_hold(
+					&rc_reason,
+					who,
+					attribute,
+					Precision::Exact,
+				)
+				.map_err(|_| Error::<T>::FailedToReattribute)?;
 			}
 			Ok((attribute, wanted.saturating_sub(attribute)))
 		}
@@ -589,7 +630,15 @@ pub mod pallet {
 			let proxy_reason: T::RuntimeHoldReason = HoldReason::ProxyDeposit.into();
 			let migrated = <T as Config>::Currency::balance_on_hold(&proxy_reason, &proxy.delegator);
 			if !migrated.is_zero() {
-				<T as Config>::Currency::release(
+				// Credit free before dropping the hold: `release` decreases the hold first, which
+				// would dust a sub-ED free remainder while the reserve is zero (see `place_hold`).
+				<T as Config>::Currency::increase_balance(
+					&proxy.delegator,
+					migrated,
+					Precision::Exact,
+				)
+				.map_err(|_| Error::<T>::FailedToProcessProxy)?;
+				<T as Config>::Currency::decrease_balance_on_hold(
 					&proxy_reason,
 					&proxy.delegator,
 					migrated,

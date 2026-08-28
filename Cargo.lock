@@ -8774,6 +8774,7 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",
+ "sp-io 46.0.0",
  "sp-runtime 47.0.0",
 ]
 
@@ -10045,10 +10046,12 @@ dependencies = [
  "frame-system",
  "log",
  "migrator-types",
+ "pallet-balances",
  "pallet-proxy",
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",
+ "sp-io 46.0.0",
  "sp-runtime 47.0.0",
 ]
 
@@ -10952,6 +10955,8 @@ dependencies = [
  "polkadot-runtime-common",
  "polkadot-runtime-parachains",
  "scale-info",
+ "sp-core 41.0.0",
+ "sp-io 46.0.0",
  "sp-runtime 47.0.0",
  "staging-xcm",
 ]
