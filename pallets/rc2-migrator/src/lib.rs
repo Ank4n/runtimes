@@ -136,6 +136,14 @@ impl<AccountId, BlockNumber> MigrationStage<AccountId, BlockNumber> {
 	pub fn is_ongoing(&self) -> bool {
 		!matches!(self, Self::Pending | Self::Scheduled { .. } | Self::MigrationDone)
 	}
+
+	/// Whether the migration has begun, and so whether the calls it moves away are closed.
+	///
+	/// A scheduled migration has not begun: the relay chain serves its users normally right up to
+	/// the start block, which is what stops the runtime upgrade itself from being an outage.
+	pub fn has_started(&self) -> bool {
+		self.is_ongoing() || self.is_finished()
+	}
 }
 
 /// Payload of a `Transact` sent to the Coretime chain.

@@ -23,19 +23,41 @@
 //! that did nothing.
 
 use frame_support::traits::Contains;
+use pallet_rc2_migrator::{MigrationStage, RcMigrationStage};
+use polkadot_primitives::HrmpChannelId;
 use polkadot_runtime::{PostAhmFilter, Runtime, RuntimeCall};
 use polkadot_runtime_common::paras_registrar;
-use polkadot_primitives::HrmpChannelId;
 use runtime_parachains::hrmp;
+use sp_runtime::{AccountId32, BuildStorage};
 
-fn allowed(call: RuntimeCall) -> bool {
-	PostAhmFilter::contains(&call)
+type Stage = MigrationStage<AccountId32, u32>;
+
+/// The filter reads the migration stage, so it needs storage. `Pending` is the default, and is
+/// what a fresh runtime upgrade lands in.
+fn allowed_at(stage: Stage, call: &RuntimeCall) -> bool {
+	let mut ext: sp_io::TestExternalities =
+		frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap().into();
+	ext.execute_with(|| {
+		RcMigrationStage::<Runtime>::put(stage);
+		PostAhmFilter::contains(call)
+	})
 }
 
-/// The old user-facing registrar calls are closed. Root is unaffected: it bypasses the base call
-/// filter entirely, which is how governance and the migration still reach these.
+/// For the arms that do not depend on the stage, asserted at `Pending` — the state an upgrade
+/// lands in, and the one where a mistake would be live immediately.
+fn allowed(call: RuntimeCall) -> bool {
+	allowed_at(Stage::Pending, &call)
+}
+
+/// The registrar's own calls: served until the migration starts, closed from then on.
+///
+/// The upgrade must not be the cut-off. The Coretime pallets hold nothing until the migration
+/// hands state over, so closing these at the upgrade would leave users with no registrar on
+/// either chain for as long as governance takes to schedule the start. Root is unaffected
+/// throughout: it bypasses the base call filter entirely, which is how governance and the
+/// migration still reach these.
 #[test]
-fn registrar_calls_are_closed() {
+fn registrar_calls_close_when_the_migration_starts_not_when_the_runtime_upgrades() {
 	for call in [
 		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::reserve {}),
 		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::deregister { id: 2000.into() }),
@@ -46,15 +68,24 @@ fn registrar_calls_are_closed() {
 			other: 2001.into(),
 		}),
 	] {
-		assert!(!allowed(call.clone()), "{call:?} must not be reachable on the relay chain");
+		// Upgraded, and scheduled but not yet begun: business as usual, right up to the start.
+		assert!(allowed_at(Stage::Pending, &call), "{call:?} must survive the upgrade");
+		assert!(
+			allowed_at(Stage::Scheduled { start: 100 }, &call),
+			"{call:?} must stay open until the migration actually begins"
+		);
+		// Running, paused mid-run, and finished: closed in all three.
+		for stage in [Stage::RegistrarInit, Stage::Paused, Stage::MigrationDone] {
+			assert!(!allowed_at(stage.clone(), &call), "{call:?} must be closed at {stage:?}");
+		}
 	}
 }
 
-/// The same for HRMP. This is the actor change: a parachain used to open a channel by
-/// `Transact`ing this call with its own origin, and that origin is filtered like any other
-/// non-Root one.
+/// The same for HRMP, on the same schedule. This is the actor change: a parachain used to open a
+/// channel by `Transact`ing this call with its own origin, and that origin is filtered like any
+/// other non-Root one.
 #[test]
-fn hrmp_calls_are_closed() {
+fn hrmp_calls_close_when_the_migration_starts() {
 	for call in [
 		RuntimeCall::Hrmp(hrmp::Call::<Runtime>::hrmp_init_open_channel {
 			recipient: 2001.into(),
@@ -70,7 +101,15 @@ fn hrmp_calls_are_closed() {
 			open_requests: 1,
 		}),
 	] {
-		assert!(!allowed(call.clone()), "{call:?} must not be reachable on the relay chain");
+		assert!(allowed_at(Stage::Pending, &call), "{call:?} must survive the upgrade");
+		assert!(
+			!allowed_at(Stage::HrmpInit, &call),
+			"{call:?} must be closed once the migration is running"
+		);
+		assert!(
+			!allowed_at(Stage::MigrationDone, &call),
+			"{call:?} must stay closed afterwards"
+		);
 	}
 }
 

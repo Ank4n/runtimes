@@ -244,12 +244,20 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 			// `Transact` that did nothing.
 			RegistrarRelay(..) | HrmpRelay(..) => true,
 
-			// Registrar and HRMP start on the Coretime chain now; see `para_control`. Closing
-			// them here is what stops there being two live control planes, which would diverge
-			// the moment either side acted. Root still reaches both — Root bypasses this filter —
+			// Registrar and HRMP move to the Coretime chain; see `para_control`. Closing them
+			// here is what stops there being two live control planes, which would diverge the
+			// moment either side acted. Root still reaches both — Root bypasses this filter —
 			// which is what governance and the migration need, and the relay-side pallets above
 			// drive them by direct call rather than by dispatch, so they are unaffected.
-			Registrar(..) | Hrmp(..) => false,
+			//
+			// Gated on the migration rather than on the upgrade, and the distinction matters: the
+			// Coretime pallets hold no state until the migration hands it over, so closing these
+			// at the upgrade would leave nobody able to register a para or open a channel on
+			// *either* chain for however long governance takes to schedule the start. A scheduled
+			// migration has not started, so the relay chain serves its users right up to the
+			// start block, and never again after it.
+			Registrar(..) | Hrmp(..) =>
+				!pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started(),
 
 			// Everything else is allowed.
 			_ => true,

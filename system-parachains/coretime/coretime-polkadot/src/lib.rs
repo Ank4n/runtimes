@@ -216,6 +216,25 @@ impl Contains<RuntimeCall> for IsFilteredBrokerCall {
 	}
 }
 
+/// The parachain control plane, before the migration has handed it anything.
+///
+/// These pallets ship with the runtime upgrade but must not serve users until the migration has
+/// moved the relay chain's state across, because until then they contradict it. Concretely: their
+/// `Paras` map is empty and `NextFreeParaId` is 0, so `reserve` would hand out `FirstPublicParaId`
+/// — a parachain that is very much alive on the relay chain. Whoever took it would then park the
+/// real one, which arrives later to find its id occupied.
+///
+/// Only the user-facing calls are closed. The relay chain's reports arrive as Root and bypass this
+/// filter entirely, and the migration hands records over by direct call rather than by dispatch,
+/// so both keep working while this is engaged.
+pub struct ParaControlBeforeMigration;
+impl Contains<RuntimeCall> for ParaControlBeforeMigration {
+	fn contains(c: &RuntimeCall) -> bool {
+		matches!(c, RuntimeCall::RegistrarPara(..) | RuntimeCall::HrmpPara(..)) &&
+			!pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_finished()
+	}
+}
+
 /// Implements [`pallet_broker::BlockToRelayHeightConversion`] for the migration to relay chain
 /// block numbers for the broker pallet.
 pub struct BrokerMigrationV4BlockConversion;
@@ -240,7 +259,7 @@ impl pallet_broker::migration::v4::BlockToRelayHeightConversion<Runtime>
 // Configure FRAME pallets to include in runtime.
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig as frame_system::DefaultConfig)]
 impl frame_system::Config for Runtime {
-	type BaseCallFilter = EverythingBut<IsFilteredBrokerCall>;
+	type BaseCallFilter = EverythingBut<(IsFilteredBrokerCall, ParaControlBeforeMigration)>;
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;
 	/// The nonce type for storing how many extrinsics an account has signed.
@@ -628,11 +647,20 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
 					RuntimeCall::Utility { .. } |
 					RuntimeCall::Multisig { .. }
 			),
-			// TODO: allow the registrar calls (+ Utility/Multisig wrappers) once the parachain
-			// registration pallet lands on this chain. Deliberately allows nothing until then so
-			// migrated `ParaRegistration` proxies keep their exact scope instead of being
-			// escalated.
-			ProxyType::ParaRegistration => false,
+			// Mirrors the relay chain's `ParaRegistration` scope exactly, against the pallet
+			// that serves those calls here. Deliberately narrow, as it is there: a registration
+			// proxy may create a para but not deregister, lock or upgrade one. Widening this
+			// would escalate every proxy that migrated under the old scope, which is the one
+			// thing the migration promised not to do.
+			ProxyType::ParaRegistration => matches!(
+				c,
+				RuntimeCall::RegistrarPara(pallet_registrar_para::Call::reserve { .. }) |
+					RuntimeCall::RegistrarPara(pallet_registrar_para::Call::register { .. }) |
+					RuntimeCall::Utility(pallet_utility::Call::batch { .. }) |
+					RuntimeCall::Utility(pallet_utility::Call::batch_all { .. }) |
+					RuntimeCall::Utility(pallet_utility::Call::force_batch { .. }) |
+					RuntimeCall::Proxy(pallet_proxy::Call::remove_proxy { .. })
+			),
 		}
 	}
 
