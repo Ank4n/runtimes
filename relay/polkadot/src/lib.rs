@@ -147,6 +147,7 @@ use governance::{
 	Treasurer, TreasurySpender,
 };
 pub mod impls;
+pub mod para_control;
 pub mod xcm_config;
 
 /// Default logging target.
@@ -2008,6 +2009,11 @@ construct_runtime! {
 
 		// Relay-chain side of the Minimal Relay migration. Below `MessageQueue` for the same
 		// reason as `RcMigrator`: its `on_initialize` must see the block's inbound messages.
+		// The relay chain's half of the parachain control plane. Driven only by the Coretime
+		// chain and by unsigned code uploads; no signed origin can reach either.
+		RegistrarRelay: pallet_registrar_relay = 250,
+		HrmpRelay: pallet_hrmp_relay = 251,
+
 		Rc2Migrator: pallet_rc2_migrator = 254,
 	}
 }

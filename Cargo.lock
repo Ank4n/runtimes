@@ -3734,6 +3734,7 @@ dependencies = [
  "frame-system-rpc-runtime-api",
  "frame-try-runtime",
  "hex-literal",
+ "hrmp-primitives",
  "log",
  "pallet-aura",
  "pallet-authorship",
@@ -3741,9 +3742,11 @@ dependencies = [
  "pallet-broker",
  "pallet-collator-selection",
  "pallet-ct-migrator",
+ "pallet-hrmp-para",
  "pallet-message-queue",
  "pallet-multisig",
  "pallet-proxy",
+ "pallet-registrar-para",
  "pallet-session",
  "pallet-timestamp",
  "pallet-transaction-payment",
@@ -3756,8 +3759,10 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-core-primitives",
  "polkadot-parachain-primitives",
+ "polkadot-primitives",
  "polkadot-runtime-common",
  "polkadot-runtime-constants",
+ "registrar-primitives",
  "scale-info",
  "serde",
  "serde_json",
@@ -6721,6 +6726,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cc627f471c528ff0c4a49e1d5e60450c8f6461dd6d10ba9dcd3a61d3dff7728d"
 dependencies = [
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "hrmp-primitives"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "scale-info",
+ "sp-runtime 48.0.0",
 ]
 
 [[package]]
@@ -10542,6 +10556,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "pallet-hrmp-para"
+version = "0.1.0"
+dependencies = [
+ "frame-benchmarking",
+ "frame-support",
+ "frame-system",
+ "hrmp-primitives",
+ "log",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-runtime 48.0.0",
+]
+
+[[package]]
+name = "pallet-hrmp-relay"
+version = "0.1.0"
+dependencies = [
+ "frame-benchmarking",
+ "frame-support",
+ "frame-system",
+ "hrmp-primitives",
+ "log",
+ "parity-scale-codec",
+ "scale-info",
+ "sp-runtime 48.0.0",
+]
+
+[[package]]
 name = "pallet-identity"
 version = "49.0.0"
 dependencies = [
@@ -10987,6 +11029,37 @@ dependencies = [
  "serde",
  "sp-arithmetic",
  "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
+]
+
+[[package]]
+name = "pallet-registrar-para"
+version = "0.1.0"
+dependencies = [
+ "frame-benchmarking",
+ "frame-support",
+ "frame-system",
+ "hrmp-primitives",
+ "log",
+ "parity-scale-codec",
+ "registrar-primitives",
+ "scale-info",
+ "sp-core 43.0.0",
+ "sp-runtime 48.0.0",
+]
+
+[[package]]
+name = "pallet-registrar-relay"
+version = "0.1.0"
+dependencies = [
+ "frame-benchmarking",
+ "frame-support",
+ "frame-system",
+ "log",
+ "parity-scale-codec",
+ "registrar-primitives",
+ "scale-info",
+ "sp-core 43.0.0",
  "sp-runtime 48.0.0",
 ]
 
@@ -12395,6 +12468,7 @@ dependencies = [
  "frame-system-rpc-runtime-api",
  "frame-try-runtime",
  "hex-literal",
+ "hrmp-primitives",
  "log",
  "migrator-types",
  "pallet-asset-rate",
@@ -12414,6 +12488,7 @@ dependencies = [
  "pallet-election-provider-support-benchmarking",
  "pallet-fast-unstake",
  "pallet-grandpa",
+ "pallet-hrmp-relay",
  "pallet-indices",
  "pallet-message-queue",
  "pallet-mmr",
@@ -12429,6 +12504,7 @@ dependencies = [
  "pallet-rc-migrator",
  "pallet-rc2-migrator",
  "pallet-referenda",
+ "pallet-registrar-relay",
  "pallet-scheduler",
  "pallet-session",
  "pallet-session-benchmarking",
@@ -12453,6 +12529,7 @@ dependencies = [
  "polkadot-runtime-common",
  "polkadot-runtime-constants",
  "polkadot-runtime-parachains",
+ "registrar-primitives",
  "scale-info",
  "separator",
  "serde_json",
@@ -12518,6 +12595,7 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-primitives",
  "polkadot-runtime-parachains",
+ "registrar-primitives",
  "rustc-hex",
  "scale-info",
  "serde",
@@ -12577,6 +12655,7 @@ dependencies = [
  "frame-election-provider-support",
  "frame-support",
  "frame-system",
+ "hrmp-primitives",
  "impl-trait-for-tuples",
  "log",
  "pallet-authority-discovery",
@@ -13712,6 +13791,16 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "registrar-primitives"
+version = "0.1.0"
+dependencies = [
+ "parity-scale-codec",
+ "scale-info",
+ "sp-core 43.0.0",
+ "sp-runtime 48.0.0",
+]
 
 [[package]]
 name = "reqwest"

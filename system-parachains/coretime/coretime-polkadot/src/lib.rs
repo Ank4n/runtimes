@@ -30,6 +30,7 @@ pub mod genesis_config_presets;
 #[cfg(test)]
 mod tests;
 mod weights;
+pub mod para_control;
 pub mod xcm_config;
 
 use alloc::{borrow::Cow, vec, vec::Vec};
@@ -747,6 +748,12 @@ construct_runtime!(
 
 		// Coretime-chain side of the Minimal Relay migration. The pallet index is encoded into
 		// the calls that `pallet-rc2-migrator` sends here; keep them in sync.
+		// The user-facing half of the parachain control plane. The pallet indices are encoded
+		// into the calls the relay chain sends here; keep them in sync with `para_control` on
+		// both sides.
+		RegistrarPara: pallet_registrar_para = 60,
+		HrmpPara: pallet_hrmp_para = 61,
+
 		CtMigrator: pallet_ct_migrator = 100,
 	}
 );

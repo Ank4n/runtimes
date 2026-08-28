@@ -35,6 +35,10 @@ pallet-balances = { workspace = true }
 pallet-message-queue = { workspace = true }
 pallet-broker = { workspace = true }
 pallet-ct-migrator = { workspace = true }
+pallet-registrar-para = { workspace = true }
+pallet-hrmp-para = { workspace = true }
+registrar-primitives = { workspace = true }
+hrmp-primitives = { workspace = true }
 pallet-multisig = { workspace = true }
 pallet-proxy = { workspace = true }
 pallet-session = { workspace = true }
@@ -60,6 +64,7 @@ pallet-xcm = { workspace = true }
 pallet-xcm-benchmarks = { optional = true, workspace = true }
 polkadot-core-primitives = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
+polkadot-primitives = { workspace = true }
 polkadot-runtime-common = { workspace = true }
 xcm = { workspace = true }
 xcm-builder = { workspace = true }
@@ -112,6 +117,10 @@ std = [
 	"pallet-balances/std",
 	"pallet-broker/std",
 	"pallet-ct-migrator/std",
+	"pallet-registrar-para/std",
+	"pallet-hrmp-para/std",
+	"registrar-primitives/std",
+	"hrmp-primitives/std",
 	"pallet-collator-selection/std",
 	"pallet-message-queue/std",
 	"pallet-multisig/std",
@@ -127,6 +136,7 @@ std = [
 	"parachains-common/std",
 	"polkadot-core-primitives/std",
 	"polkadot-parachain-primitives/std",
+	"polkadot-primitives/std",
 	"polkadot-runtime-common/std",
 	"polkadot-runtime-constants/std",
 	"scale-info/std",
@@ -168,6 +178,10 @@ runtime-benchmarks = [
 	"pallet-balances/runtime-benchmarks",
 	"pallet-broker/runtime-benchmarks",
 	"pallet-ct-migrator/runtime-benchmarks",
+	"pallet-registrar-para/runtime-benchmarks",
+	"pallet-hrmp-para/runtime-benchmarks",
+	"registrar-primitives/runtime-benchmarks",
+	"hrmp-primitives/runtime-benchmarks",
 	"pallet-collator-selection/runtime-benchmarks",
 	"pallet-message-queue/runtime-benchmarks",
 	"pallet-multisig/runtime-benchmarks",
@@ -180,6 +194,7 @@ runtime-benchmarks = [
 	"pallet-xcm/runtime-benchmarks",
 	"parachains-common/runtime-benchmarks",
 	"polkadot-parachain-primitives/runtime-benchmarks",
+	"polkadot-primitives/runtime-benchmarks",
 	"polkadot-runtime-common/runtime-benchmarks",
 	"polkadot-runtime-constants/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
@@ -206,6 +221,8 @@ try-runtime = [
 	"pallet-balances/try-runtime",
 	"pallet-broker/try-runtime",
 	"pallet-ct-migrator/try-runtime",
+	"pallet-registrar-para/try-runtime",
+	"pallet-hrmp-para/try-runtime",
 	"pallet-collator-selection/try-runtime",
 	"pallet-message-queue/try-runtime",
 	"pallet-multisig/try-runtime",
