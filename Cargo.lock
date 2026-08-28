@@ -8869,8 +8869,8 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",
- "sp-io 46.0.0",
- "sp-runtime 47.0.0",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
 ]
 
 [[package]]
@@ -10242,8 +10242,8 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",
- "sp-io 46.0.0",
- "sp-runtime 47.0.0",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
 ]
 
 [[package]]
@@ -11164,9 +11164,9 @@ dependencies = [
  "polkadot-runtime-common",
  "polkadot-runtime-parachains",
  "scale-info",
- "sp-core 41.0.0",
- "sp-io 46.0.0",
- "sp-runtime 47.0.0",
+ "sp-core 43.0.0",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
  "staging-xcm",
 ]
 
@@ -12619,42 +12619,6 @@ dependencies = [
  "sp-consensus-beefy",
  "sp-core 43.0.0",
  "sp-runtime 48.0.0",
-]
-
-[[package]]
-name = "polkadot-integration-tests-minimal-relay"
-version = "0.1.0"
-dependencies = [
- "asset-hub-polkadot-runtime",
- "coretime-polkadot-runtime",
- "cumulus-pallet-parachain-system",
- "cumulus-primitives-core",
- "frame-remote-externalities",
- "frame-support",
- "frame-system",
- "log",
- "migrator-types",
- "pallet-balances",
- "pallet-ct-migrator",
- "pallet-message-queue",
- "pallet-proxy",
- "pallet-rc2-migrator",
- "pallet-session",
- "pallet-xcm",
- "parity-scale-codec",
- "polkadot-primitives",
- "polkadot-runtime",
- "polkadot-runtime-common",
- "polkadot-runtime-constants",
- "polkadot-runtime-parachains",
- "serde_json",
- "sp-core 41.0.0",
- "sp-io 46.0.0",
- "sp-runtime 47.0.0",
- "sp-storage 23.0.0",
- "sp-tracing",
- "staging-xcm",
- "tokio",
 ]
 
 [[package]]
