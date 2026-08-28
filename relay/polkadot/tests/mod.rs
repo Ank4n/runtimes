@@ -16,4 +16,5 @@
 
 mod asset_rate;
 mod beefy_tests;
+mod call_filter;
 mod location_conversion;

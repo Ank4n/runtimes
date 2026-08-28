@@ -17,7 +17,7 @@
 
 use crate::mock::*;
 use codec::{Decode, Encode};
-use frame_support::{assert_ok, traits::fungible::Inspect};
+use frame_support::{assert_ok, traits::{fungible::Inspect, OnInitialize}};
 use migrator_types::PortableProxyType;
 use pallet_rc2_migrator::{RcMigratedBalance, RcMigrationStage};
 use polkadot_runtime_common::paras_registrar;
@@ -1849,4 +1849,83 @@ mod call_encoding {
 			other => panic!("HRMP report decoded as {other:?}"),
 		}
 	}
+}
+
+/// The relay chain answers Coretime, and nobody else.
+///
+/// Two gates stand between a parachain and the relay-side control plane, and neither can do the
+/// other's job: `SystemChildParachainAsNative` decides whether a para gets an origin of its own at
+/// all, and `PostAhmFilter` decides which calls that origin may reach. This drives a real
+/// `Transact` through both, because the failure mode they guard against is invisible — a call the
+/// relay chain refuses inside XCM produces no error anyone sees, just a `Transact` that did
+/// nothing.
+///
+/// The observable is the reply: every relay-side control-plane call reports its verdict back to
+/// Coretime, success or failure. A queued DMP means the call really dispatched.
+#[tokio::test]
+async fn only_a_system_para_can_drive_the_relay_control_plane() {
+	let mut rc = load(Chain::Relay).await;
+	type Rc = polkadot_runtime::Runtime;
+	let coretime: polkadot_primitives::Id = CoretimePolkadot::PARA_ID.into();
+
+	// A deregistration request for a para that does not exist. The verdict does not matter —
+	// what matters is that a verdict is produced at all, which only happens if the call ran.
+	let call = polkadot_runtime::RuntimeCall::RegistrarRelay(
+		pallet_registrar_relay::Call::deregister {
+			message: registrar_primitives::MessageToRelay::V1(
+				registrar_primitives::MessageToRelayV1::Deregister {
+					para_id: 4_999,
+					message_id: 7,
+				},
+			),
+		},
+	);
+	let message = xcm::VersionedXcm::<()>::from(Xcm(vec![
+		UnpaidExecution { weight_limit: Unlimited, check_origin: None },
+		Transact {
+			// How Coretime really sends: as itself, not as a sovereign account.
+			origin_kind: OriginKind::Native,
+			fallback_max_weight: None,
+			call: call.encode().into(),
+		},
+	]))
+	.encode();
+
+	rc.execute_with(|| {
+		// The live snapshot has unrelated traffic queued for Coretime; clear it so the assertions
+		// below are about this message alone.
+		let _ = take_dmp(coretime);
+
+		// WHEN Coretime asks
+		enqueue_ump(coretime, vec![message.clone()]);
+		next_block_rc();
+		assert!(
+			!take_dmp(coretime).is_empty(),
+			"Coretime's request must reach the relay chain and be answered"
+		);
+
+		// WHEN an ordinary parachain sends the identical message. Serviced by hand rather than
+		// through `next_block_rc`, which asserts that nothing fails — here a failure is the
+		// point, and asserting on it is stronger than asserting on a missing reply: it proves the
+		// message was delivered and refused, not merely lost somewhere in the harness.
+		enqueue_ump(2_000.into(), vec![message]);
+		let now = frame_system::Pallet::<Rc>::block_number() + 1;
+		frame_system::Pallet::<Rc>::set_block_number(now);
+		frame_system::Pallet::<Rc>::reset_events();
+		<polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
+
+		let refused = frame_system::Pallet::<Rc>::events().into_iter().any(|record| {
+			matches!(
+				record.event,
+				polkadot_runtime::RuntimeEvent::MessageQueue(
+					pallet_message_queue::Event::Processed { success: false, .. }
+				)
+			)
+		});
+		assert!(refused, "an ordinary parachain's request must be refused, not executed");
+		assert!(
+			take_dmp(coretime).is_empty(),
+			"and it must not produce a verdict, which would mean the call had run"
+		);
+	});
 }

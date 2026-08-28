@@ -235,6 +235,22 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 
 			Coretime(coretime::Call::<Runtime>::request_revenue_at { .. }) => true,
 
+			// The parachain control plane, which must stay reachable. These calls do **not**
+			// arrive as Root and so do not bypass this filter: Coretime's requests convert to
+			// `parachains_origin::Origin::Parachain(BROKER_ID)`, and the two validation-code
+			// uploads are unsigned. Blocking them — by a broader rule added later, or by folding
+			// them in with the pallets below — severs every registrar and HRMP flow on both
+			// chains, and does it silently, because a filtered call inside XCM surfaces only as a
+			// `Transact` that did nothing.
+			RegistrarRelay(..) | HrmpRelay(..) => true,
+
+			// Registrar and HRMP start on the Coretime chain now; see `para_control`. Closing
+			// them here is what stops there being two live control planes, which would diverge
+			// the moment either side acted. Root still reaches both — Root bypasses this filter —
+			// which is what governance and the migration need, and the relay-side pallets above
+			// drive them by direct call rather than by dispatch, so they are unaffected.
+			Registrar(..) | Hrmp(..) => false,
+
 			// Everything else is allowed.
 			_ => true,
 		}

@@ -102,9 +102,9 @@ type LocalOriginConverter = (
 	// If the origin kind is `Sovereign`, then return a `Signed` origin with the account determined
 	// by the `SovereignAccountOf` converter.
 	SovereignSignedViaLocation<SovereignAccountOf, RuntimeOrigin>,
-	// If the origin kind is `Native` and the XCM origin is a child parachain, then we can express
-	// it with the special `parachains_origin::Origin` origin variant.
-	ChildParachainAsNative<parachains_origin::Origin, RuntimeOrigin>,
+	// If the origin kind is `Native` and the XCM origin is a child *system* parachain, then we can
+	// express it with the special `parachains_origin::Origin` origin variant.
+	SystemChildParachainAsNative,
 	// If the origin kind is `Native` and the XCM origin is the `AccountId32` location, then it can
 	// be expressed using the `Signed` origin variant.
 	SignedAccountId32AsNative<ThisNetwork, RuntimeOrigin>,
@@ -113,6 +113,34 @@ type LocalOriginConverter = (
 	// AssetHub can execute as root
 	LocationAsSuperuser<Equals<AssetHubLocation>, RuntimeOrigin>,
 );
+
+/// A child parachain dispatching here as itself — system chains only.
+///
+/// After the Minimal Relay migration this chain serves system chains and nothing else: Asset Hub
+/// drives staking through `EnsureAssetHub`, Coretime drives the parachain control plane through
+/// `EnsureCoretime`, and no other parachain has business dispatching here with an origin of its
+/// own. `ChildParachainAsNative` alone would hand `Origin::Parachain(id)` to *any* child, so the
+/// restriction belongs here rather than in `PostAhmFilter`: a `Contains<RuntimeCall>` cannot see
+/// which origin a call arrived with, only which call it is.
+///
+/// This closes the origin as well as the calls, so a parachain cannot reach a pallet that is
+/// merely forgotten rather than deliberately filtered.
+pub struct SystemChildParachainAsNative;
+
+impl xcm_executor::traits::ConvertOrigin<RuntimeOrigin> for SystemChildParachainAsNative {
+	fn convert_origin(
+		origin: impl Into<Location>,
+		kind: OriginKind,
+	) -> Result<RuntimeOrigin, Location> {
+		let origin: Location = origin.into();
+		if !SystemParachains::contains(&origin) {
+			return Err(origin);
+		}
+		ChildParachainAsNative::<parachains_origin::Origin, RuntimeOrigin>::convert_origin(
+			origin, kind,
+		)
+	}
+}
 
 parameter_types! {
 	/// The amount of weight an XCM operation takes. This is a safe overestimate.
