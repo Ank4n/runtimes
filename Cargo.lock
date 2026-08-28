@@ -12410,6 +12410,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "polkadot-integration-tests-minimal-relay"
+version = "0.1.0"
+dependencies = [
+ "asset-hub-polkadot-runtime",
+ "coretime-polkadot-runtime",
+ "cumulus-pallet-parachain-system",
+ "cumulus-primitives-core",
+ "frame-remote-externalities",
+ "frame-support",
+ "frame-system",
+ "hrmp-primitives",
+ "log",
+ "migrator-types",
+ "pallet-balances",
+ "pallet-ct-migrator",
+ "pallet-hrmp-para",
+ "pallet-hrmp-relay",
+ "pallet-message-queue",
+ "pallet-proxy",
+ "pallet-rc2-migrator",
+ "pallet-registrar-para",
+ "pallet-registrar-relay",
+ "pallet-session",
+ "pallet-xcm",
+ "parity-scale-codec",
+ "polkadot-primitives",
+ "polkadot-runtime",
+ "polkadot-runtime-common",
+ "polkadot-runtime-constants",
+ "polkadot-runtime-parachains",
+ "registrar-primitives",
+ "serde_json",
+ "sp-core 43.0.0",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
+ "sp-storage 25.0.0",
+ "sp-tracing",
+ "staging-xcm",
+ "tokio",
+]
+
+[[package]]
 name = "polkadot-parachain-primitives"
 version = "23.0.0"
 dependencies = [

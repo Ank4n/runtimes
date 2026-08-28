@@ -183,10 +183,11 @@ impl EnsureOrigin<crate::RuntimeOrigin> for EnsureSiblingPara {
 /// Calls on the relay chain, as this chain must encode them.
 ///
 /// Audit: the outer indices are the pallet indices in the relay chain's `construct_runtime!`, the
-/// inner ones the `#[pallet::call_index]` in each pallet. The integration test decodes every
-/// `Transact` this chain sends with the real relay `RuntimeCall`, which catches drift.
+/// inner ones the `#[pallet::call_index]` in each pallet. Nothing here is checked by the compiler,
+/// so `call_encoding` in the minimal-relay integration tests decodes what this chain would send
+/// using the real relay `RuntimeCall` — which is why these types are public.
 #[derive(Encode)]
-enum RelayRuntimePallets {
+pub enum RelayRuntimePallets {
 	#[codec(index = 250)]
 	RegistrarRelay(RegistrarRelayCalls),
 	#[codec(index = 251)]
@@ -194,7 +195,7 @@ enum RelayRuntimePallets {
 }
 
 #[derive(Encode)]
-enum RegistrarRelayCalls {
+pub enum RegistrarRelayCalls {
 	#[codec(index = 0)]
 	AuthorizeCode(registrar_primitives::MessageToRelay<AccountId>),
 	#[codec(index = 2)]
@@ -212,7 +213,7 @@ enum RegistrarRelayCalls {
 }
 
 #[derive(Encode)]
-enum HrmpRelayCalls {
+pub enum HrmpRelayCalls {
 	#[codec(index = 0)]
 	InitOpenChannel(hrmp_primitives::MessageToRelay),
 	#[codec(index = 1)]

@@ -17,7 +17,7 @@
 
 use crate::mock::*;
 use codec::{Decode, Encode};
-use frame_support::traits::fungible::Inspect;
+use frame_support::{assert_ok, traits::fungible::Inspect};
 use migrator_types::PortableProxyType;
 use pallet_rc2_migrator::{RcMigratedBalance, RcMigrationStage};
 use polkadot_runtime_common::paras_registrar;
@@ -812,12 +812,32 @@ async fn full_migration_rc_to_ct() {
 
 	// GIVEN the live registrar and HRMP state of the snapshot, and one cleanly migrating
 	// manager to spot-check the AH teleport leg with.
-	let (paras_before, hrmp_before, requests_before, rc_ti_before, sample) =
-		rc.execute_with(|| {
+	// `paras_before_detail` and `requests_before_detail` carry the facts only this chain can
+	// see — the lifecycle that tells Reserved from Registered, the lock, and whether a request
+	// was confirmed. Coretime cannot rederive any of them, so they are what the post-migration
+	// assertions compare against.
+	let (
+		paras_before,
+		paras_before_detail,
+		hrmp_before,
+		requests_before,
+		requests_before_detail,
+		rc_ti_before,
+		sample,
+	) = rc.execute_with(|| {
 			crate::events::emit_rc_census("before");
 			crate::events::emit_pre_facts();
 			let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
 				.map(|(id, info)| (id.into(), info.deposit))
+				.collect();
+			let detail: Vec<(u32, bool, bool)> = paras_registrar::Paras::<Rc>::iter()
+				.map(|(id, info)| {
+					(
+						id.into(),
+						runtime_parachains::paras::Pallet::<Rc>::lifecycle(id).is_some(),
+						info.locked.unwrap_or(false),
+					)
+				})
 				.collect();
 			let channels: Vec<(_, u128, u128)> = HrmpChannels::<Rc>::iter()
 				.map(|(id, ch)| (id, ch.sender_deposit, ch.recipient_deposit))
@@ -826,15 +846,32 @@ async fn full_migration_rc_to_ct() {
 				runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter()
 					.map(|(_, r)| r.sender_deposit)
 					.collect();
+			let requests_detail: Vec<(u32, u32, bool)> =
+				runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter()
+					.map(|(id, r)| (id.sender.into(), id.recipient.into(), r.confirmed))
+					.collect();
 
 			(
 				paras,
+				detail,
 				channels,
 				requests,
+				requests_detail,
 				pallet_balances::TotalIssuance::<Rc>::get(),
 				find_clean_manager(),
 			)
 		});
+
+	// Pre-migration sanity: the snapshot must actually contain the shapes this test claims to
+	// exercise, or a green run would prove nothing.
+	assert!(
+		paras_before_detail.iter().any(|(_, registered, _)| *registered),
+		"the snapshot must contain at least one onboarded para"
+	);
+	assert!(
+		paras_before_detail.iter().any(|(_, _, locked)| *locked),
+		"the snapshot must contain at least one locked para, or the lock carry is untested"
+	);
 
 	// The sweep stage's inputs — the configured pots plus reapable below-ED dust, all landing
 	// on the sweep beneficiary — and the sibl-format sovereigns, whose balances migrate
@@ -1018,6 +1055,51 @@ async fn full_migration_rc_to_ct() {
 		});
 		ah.commit_all().unwrap();
 
+		// --- during-migration sanity -------------------------------------------------------
+		// Checked every round rather than only at the end, so a transient breach is caught
+		// where it happens rather than being papered over by the final state.
+		let ct_has_para: BTreeMap<u32, bool> = ct.execute_with(|| {
+			// The receiving pallets' invariants must hold at every intermediate step, not just
+			// once the machine stops. A migration that passes through a state where a channel
+			// holds the wrong deposits has a bug, even if it tidies up afterwards.
+			pallet_hrmp_para::Pallet::<Ct>::do_try_state()
+				.expect("HRMP invariants broke mid-migration");
+			pallet_registrar_para::Pallet::<Ct>::do_try_state()
+				.expect("registrar invariants broke mid-migration");
+
+			// Nothing may be handed over twice. Records arrive in batches across many blocks,
+			// and a retried batch that re-inserted would double-charge a deposit.
+			let paras = pallet_registrar_para::Paras::<Ct>::iter().count();
+			assert!(
+				paras <= paras_before.len(),
+				"more paras on CT ({paras}) than the relay chain ever had"
+			);
+			let channels = pallet_hrmp_para::Channels::<Ct>::iter().count();
+			assert!(
+				channels <= hrmp_before.len() + requests_before_detail.len(),
+				"more channels on CT ({channels}) than the relay chain ever had"
+			);
+
+			paras_before_detail
+				.iter()
+				.map(|(id, _, _)| (*id, pallet_registrar_para::Paras::<Ct>::contains_key(*id)))
+				.collect()
+		});
+		ct.commit_all().unwrap();
+
+		// A record that reaches CT must have left the relay chain: the two sides must never
+		// both claim the same para, or there are two control planes for it at once.
+		rc.execute_with(|| {
+			for (para_id, _, _) in &paras_before_detail {
+				let on_rc = paras_registrar::Paras::<Rc>::contains_key(
+					polkadot_primitives::Id::from(*para_id),
+				);
+				let on_ct = ct_has_para.get(para_id).copied().unwrap_or(false);
+				assert!(!(on_rc && on_ct), "para {para_id} is claimed by both chains at once");
+			}
+		});
+		rc.commit_all().unwrap();
+
 		if rc_stage == RcStage::MigrationDone {
 			break;
 		}
@@ -1149,30 +1231,131 @@ async fn full_migration_rc_to_ct() {
 		use pallet_ct_migrator::*;
 		crate::events::emit_ct_census("after");
 
+		use pallet_hrmp_para::ChannelState;
+		use pallet_registrar_para::RegistrationState;
+
 		assert_eq!(CtMigrationStage::<Ct>::get(), MigrationStage::MigrationDone);
-		assert_eq!(RcParas::<Ct>::iter().count(), paras_before.len(), "every para landed");
 		assert!(FailedParas::<Ct>::iter().next().is_none(), "no para may fail to integrate");
 		assert!(
 			FailedHrmpChannels::<Ct>::iter().next().is_none(),
 			"no channel may fail to integrate"
 		);
-		assert!(RcNextFreeParaId::<Ct>::get().is_some(), "NextFreeParaId migrated");
+
+		// --- the registrar pallet actually owns the paras now -----------------------------
 		assert_eq!(
-			RcHrmpChannels::<Ct>::iter().count(),
-			hrmp_before.len(),
-			"every HRMP channel landed"
+			pallet_registrar_para::Paras::<Ct>::iter().count(),
+			paras_before.len(),
+			"every para landed in the registrar pallet"
 		);
+		assert!(
+			pallet_registrar_para::NextFreeParaId::<Ct>::get() > 0,
+			"the id counter migrated"
+		);
+		for (para_id, registered, locked) in &paras_before_detail {
+			let info = pallet_registrar_para::Paras::<Ct>::get(*para_id)
+				.unwrap_or_else(|| panic!("para {para_id} must land"));
+
+			// A live para must arrive locked. Miss this and its manager silently regains the
+			// control the relay chain's lock existed to remove — the whole point of carrying
+			// the flag across.
+			assert_eq!(
+				info.locked, *locked,
+				"para {para_id} must arrive with the relay chain's lock"
+			);
+
+			// Reserved and Registered are told apart by `paras::ParaLifecycles`, which stays on
+			// the relay chain. If that classification were lost, a merely reserved id would
+			// arrive holding a registration deposit it never paid.
+			match (registered, &info.state) {
+				(true, RegistrationState::Registered { .. }) => {},
+				(false, RegistrationState::Reserved) => {},
+				(_, other) => panic!(
+					"para {para_id}: registered={registered} but arrived as {other:?}"
+				),
+			}
+		}
+
+		// --- and the HRMP pallet owns the channels ----------------------------------------
 		assert_eq!(
-			RcHrmpOpenRequests::<Ct>::iter().count(),
-			requests_before.len(),
-			"every pending HRMP request landed"
+			pallet_hrmp_para::Channels::<Ct>::iter().count(),
+			hrmp_before.len() + requests_before_detail.len(),
+			"every channel and pending request landed in the HRMP pallet"
 		);
 		for (id, _, _) in &hrmp_before {
+			let key = hrmp_primitives::ChannelId {
+				sender: id.sender.into(),
+				recipient: id.recipient.into(),
+			};
+			let info = pallet_hrmp_para::Channels::<Ct>::get(key)
+				.unwrap_or_else(|| panic!("channel {key:?} must land"));
+			// An existing channel means both ends paid, so it arrives fully open.
+			assert_eq!(info.state, ChannelState::Open, "channel {key:?} must arrive open");
+		}
+		for (sender, recipient, confirmed) in &requests_before_detail {
+			let key = hrmp_primitives::ChannelId { sender: *sender, recipient: *recipient };
+			let info = pallet_hrmp_para::Channels::<Ct>::get(key)
+				.unwrap_or_else(|| panic!("request {key:?} must land"));
+			// An unconfirmed request is the sender's deposit alone, which is exactly what
+			// `Pending` means here. Getting this wrong would hold money nobody paid.
+			let want = if *confirmed { ChannelState::Open } else { ChannelState::Pending };
+			assert_eq!(info.state, want, "request {key:?} must arrive in the right state");
+		}
+
+		// --- the id counter cannot hand out something already taken ----------------------
+		// After the drain the relay chain's counter is gone, so Coretime's is the only one. If
+		// it arrived below a live id, the next `reserve` would collide with a real parachain.
+		let highest = paras_before_detail.iter().map(|(id, _, _)| *id).max().unwrap_or(0);
+		assert!(
+			pallet_registrar_para::NextFreeParaId::<Ct>::get() > highest,
+			"the id counter must sit above every migrated para"
+		);
+
+		// --- migrated state must be usable, not merely present ---------------------------
+		// The strongest thing this test can say: pick real migrated paras out of the snapshot
+		// and drive them through the pallet as their manager would.
+		let locked_para = paras_before_detail.iter().find(|(_, _, locked)| *locked);
+		if let Some((para_id, _, _)) = locked_para {
+			let manager = pallet_registrar_para::Paras::<Ct>::get(*para_id).unwrap().manager;
+			// A locked para's manager must be shut out. This is the whole reason the lock is
+			// carried across; if it silently failed, the manager would regain control of a live
+			// parachain.
+			let refused = pallet_registrar_para::Pallet::<Ct>::deregister(
+				coretime_polkadot_runtime::RuntimeOrigin::signed(manager.clone()),
+				*para_id,
+			);
+			assert!(refused.is_err(), "a locked migrated para must refuse its manager");
+
+			// And the manager may still lock further: locking is never blocked by a lock.
+			assert_ok!(pallet_registrar_para::Pallet::<Ct>::add_lock(
+				coretime_polkadot_runtime::RuntimeOrigin::signed(manager),
+				*para_id,
+			));
+		}
+
+		let reserved_para = paras_before_detail.iter().find(|(_, registered, locked)| {
+			!*registered && !*locked
+		});
+		if let Some((para_id, _, _)) = reserved_para {
+			let info = pallet_registrar_para::Paras::<Ct>::get(*para_id).unwrap();
+			let before = pallet_balances::Pallet::<Ct>::free_balance(&info.manager);
+			// A reserved id is dropped locally, deposit returned, without ever touching the
+			// relay chain — so it works even though nothing is listening up there any more.
+			assert_ok!(pallet_registrar_para::Pallet::<Ct>::deregister(
+				coretime_polkadot_runtime::RuntimeOrigin::signed(info.manager.clone()),
+				*para_id,
+			));
+			assert!(pallet_registrar_para::Paras::<Ct>::get(*para_id).is_none());
 			assert!(
-				RcHrmpChannels::<Ct>::contains_key((u32::from(id.sender), u32::from(id.recipient))),
-				"channel {id:?} must land under its (sender, recipient) key"
+				pallet_balances::Pallet::<Ct>::free_balance(&info.manager) > before,
+				"dropping a reserved id must return its deposit"
 			);
 		}
+
+		// --- the pallets' own invariants hold across the whole live snapshot --------------
+		// This is the strongest check in the test: it says every channel holds exactly the
+		// deposits its state claims, for real migrated data rather than a fixture.
+		assert_ok!(pallet_hrmp_para::Pallet::<Ct>::do_try_state());
+		assert_ok!(pallet_registrar_para::Pallet::<Ct>::do_try_state());
 
 		// Reconciliation: re-attributed + parked shortfalls == the recorded totals, for both
 		// deposit kinds. Nothing is invented and nothing is silently dropped.
@@ -1214,8 +1397,29 @@ async fn full_migration_rc_to_ct() {
 				}
 			}
 		}
-		assert_eq!(reg_held, reattributed, "RegistrarDeposit holds match the re-attributed total");
-		assert_eq!(hrmp_held, reattributed_hrmp, "HrmpDeposit holds match the re-attributed total");
+		// The migrator no longer re-labels these holds: it releases them and the owning pallet
+		// takes its own `Consideration` at this chain's rates. A remaining hold under the
+		// migrator's reason would mean a record never reached its pallet.
+		assert_eq!(reg_held, 0, "no migrator-held registrar deposit may remain");
+		assert_eq!(hrmp_held, 0, "no migrator-held HRMP deposit may remain");
+
+		// What the pallets took instead. Priced at this chain's rates, so it is not comparable
+		// to the relay chain's recorded amounts — only its existence and attribution are.
+		let mut pallet_held = 0u128;
+		for who in frame_system::Account::<Ct>::iter_keys() {
+			for hold in pallet_balances::Holds::<Ct>::get(&who) {
+				let is_control_plane = matches!(
+					hold.id,
+					coretime_polkadot_runtime::RuntimeHoldReason::RegistrarPara(_) |
+						coretime_polkadot_runtime::RuntimeHoldReason::HrmpPara(_)
+				);
+				if is_control_plane {
+					pallet_held += hold.amount;
+				}
+			}
+		}
+		assert!(pallet_held > 0, "the control-plane pallets must hold their own deposits");
+		println!("control-plane deposits held on CT: {:.4} DOT", dot(pallet_held));
 		// Every migrated proxy deposit is resized (released and re-reserved at this chain's
 		// rates) when its definitions arrive; a remaining hold would mean defs never followed.
 		assert_eq!(proxy_held, 0, "no unresized proxy deposit may remain");
@@ -1347,4 +1551,240 @@ async fn full_migration_rc_to_ct() {
 		// without are multisigs, controllable on every chain by their members, so their teleport
 		// here needs no per-account control check.
 	});
+}
+
+/// The hand-written cross-chain call encodings must match the runtimes that receive them.
+///
+/// Each chain encodes the other's calls by hand, as a pallet index followed by a call index and the
+/// SCALE payload (`para_control.rs` on both sides). The compiler checks none of it. Reorder a
+/// `construct_runtime!`, renumber a `#[pallet::call_index]`, or change a message's shape, and every
+/// message becomes an undecodable blob at the destination — which surfaces as XCM that silently
+/// does nothing, not as a build failure.
+///
+/// So decode what each chain would actually send, using the real `RuntimeCall` of the chain that
+/// receives it. These are pure encoding tests and need no snapshot.
+mod call_encoding {
+	use codec::{Decode, Encode};
+	use coretime_polkadot_runtime::para_control::{
+		HrmpRelayCalls, RegistrarRelayCalls, RelayRuntimePallets,
+	};
+	use hrmp_primitives::{ChannelId, MessageToRelayV1 as HrmpToRelay};
+	use polkadot_runtime::para_control::{
+		CoretimeRuntimePallets, HrmpParaCalls, RegistrarParaCalls,
+	};
+	use registrar_primitives::MessageToRelayV1 as RegistrarToRelay;
+	use sp_core::H256;
+
+	type RelayCall = polkadot_runtime::RuntimeCall;
+	type CoretimeCall = coretime_polkadot_runtime::RuntimeCall;
+	type AccountId = sp_runtime::AccountId32;
+
+	const PARA: u32 = 2000;
+	const OTHER: u32 = 2001;
+	const MSG_ID: u64 = 7;
+
+	fn channel() -> ChannelId {
+		ChannelId { sender: PARA, recipient: OTHER }
+	}
+
+	fn manager() -> AccountId {
+		AccountId::new([1u8; 32])
+	}
+
+	/// Every registrar message Coretime can send, paired with the relay call it must decode as.
+	#[test]
+	fn coretime_registrar_calls_decode_on_the_relay_chain() {
+		let cases: Vec<(RegistrarRelayCalls, &str)> = vec![
+			(
+				RegistrarRelayCalls::AuthorizeCode(registrar_primitives::MessageToRelay::V1(
+					RegistrarToRelay::Register {
+						para_id: PARA,
+						message_id: MSG_ID,
+						manager: manager(),
+						genesis_head: vec![1, 2, 3],
+						code_hash: H256::repeat_byte(9),
+						code_len: 42,
+					},
+				)),
+				"authorize_code",
+			),
+			(
+				RegistrarRelayCalls::CancelAuthorization(registrar_primitives::MessageToRelay::V1(
+					RegistrarToRelay::CancelRegistration { para_id: PARA, message_id: MSG_ID },
+				)),
+				"cancel_authorization",
+			),
+			(
+				RegistrarRelayCalls::Deregister(registrar_primitives::MessageToRelay::V1(
+					RegistrarToRelay::Deregister { para_id: PARA, message_id: MSG_ID },
+				)),
+				"deregister",
+			),
+			(
+				RegistrarRelayCalls::CancelDeregistration(
+					registrar_primitives::MessageToRelay::V1(
+						RegistrarToRelay::CancelDeregistration { para_id: PARA, message_id: MSG_ID },
+					),
+				),
+				"cancel_deregistration",
+			),
+			(
+				RegistrarRelayCalls::AuthorizeCodeUpgrade(registrar_primitives::MessageToRelay::V1(
+					RegistrarToRelay::AuthorizeCodeUpgrade {
+						para_id: PARA,
+						message_id: MSG_ID,
+						code_hash: H256::repeat_byte(3),
+						code_len: 11,
+					},
+				)),
+				"authorize_code_upgrade",
+			),
+			(
+				RegistrarRelayCalls::SetCurrentHead(registrar_primitives::MessageToRelay::V1(
+					RegistrarToRelay::SetCurrentHead {
+						para_id: PARA,
+						message_id: MSG_ID,
+						head: vec![4, 5],
+					},
+				)),
+				"set_current_head",
+			),
+			(
+				RegistrarRelayCalls::RemoveUpgradeCooldown(
+					registrar_primitives::MessageToRelay::V1(
+						RegistrarToRelay::RemoveUpgradeCooldown {
+							para_id: PARA,
+							message_id: MSG_ID,
+						},
+					),
+				),
+				"remove_upgrade_cooldown",
+			),
+		];
+
+		for (call, expected) in cases {
+			let encoded = RelayRuntimePallets::RegistrarRelay(call).encode();
+			let decoded = RelayCall::decode(&mut &encoded[..])
+				.unwrap_or_else(|e| panic!("{expected} does not decode on the relay chain: {e:?}"));
+			let RelayCall::RegistrarRelay(inner) = decoded else {
+				panic!("{expected} decoded into the wrong pallet: {decoded:?}");
+			};
+			let got = match inner {
+				pallet_registrar_relay::Call::authorize_code { .. } => "authorize_code",
+				pallet_registrar_relay::Call::cancel_authorization { .. } =>
+					"cancel_authorization",
+				pallet_registrar_relay::Call::deregister { .. } => "deregister",
+				pallet_registrar_relay::Call::cancel_deregistration { .. } =>
+					"cancel_deregistration",
+				pallet_registrar_relay::Call::authorize_code_upgrade { .. } =>
+					"authorize_code_upgrade",
+				pallet_registrar_relay::Call::set_current_head { .. } => "set_current_head",
+				pallet_registrar_relay::Call::remove_upgrade_cooldown { .. } =>
+					"remove_upgrade_cooldown",
+				other => panic!("{expected} decoded as an unexpected call: {other:?}"),
+			};
+			assert_eq!(got, expected, "call index drift: {expected} arrives as {got}");
+		}
+	}
+
+	/// Every HRMP message Coretime can send, paired with the relay call it must decode as.
+	#[test]
+	fn coretime_hrmp_calls_decode_on_the_relay_chain() {
+		let cases: Vec<(HrmpRelayCalls, &str)> = vec![
+			(
+				HrmpRelayCalls::InitOpenChannel(hrmp_primitives::MessageToRelay::V1(
+					HrmpToRelay::InitOpenChannel {
+						channel: channel(),
+						message_id: MSG_ID,
+						max_capacity: 8,
+						max_message_size: 1024,
+					},
+				)),
+				"init_open_channel",
+			),
+			(
+				HrmpRelayCalls::AcceptOpenChannel(hrmp_primitives::MessageToRelay::V1(
+					HrmpToRelay::AcceptOpenChannel { channel: channel(), message_id: MSG_ID },
+				)),
+				"accept_open_channel",
+			),
+			(
+				HrmpRelayCalls::CloseChannel(hrmp_primitives::MessageToRelay::V1(
+					HrmpToRelay::CloseChannel {
+						channel: channel(),
+						message_id: MSG_ID,
+						initiator: PARA,
+					},
+				)),
+				"close_channel",
+			),
+			(
+				HrmpRelayCalls::CancelOpenRequest(hrmp_primitives::MessageToRelay::V1(
+					HrmpToRelay::CancelOpenRequest { channel: channel(), message_id: MSG_ID },
+				)),
+				"cancel_open_request",
+			),
+			(
+				HrmpRelayCalls::EstablishSystemChannel(hrmp_primitives::MessageToRelay::V1(
+					HrmpToRelay::EstablishSystemChannel { channel: channel(), message_id: MSG_ID },
+				)),
+				"establish_system_channel",
+			),
+		];
+
+		for (call, expected) in cases {
+			let encoded = RelayRuntimePallets::HrmpRelay(call).encode();
+			let decoded = RelayCall::decode(&mut &encoded[..])
+				.unwrap_or_else(|e| panic!("{expected} does not decode on the relay chain: {e:?}"));
+			let RelayCall::HrmpRelay(inner) = decoded else {
+				panic!("{expected} decoded into the wrong pallet: {decoded:?}");
+			};
+			let got = match inner {
+				pallet_hrmp_relay::Call::init_open_channel { .. } => "init_open_channel",
+				pallet_hrmp_relay::Call::accept_open_channel { .. } => "accept_open_channel",
+				pallet_hrmp_relay::Call::close_channel { .. } => "close_channel",
+				pallet_hrmp_relay::Call::cancel_open_request { .. } => "cancel_open_request",
+				pallet_hrmp_relay::Call::establish_system_channel { .. } =>
+					"establish_system_channel",
+				other => panic!("{expected} decoded as an unexpected call: {other:?}"),
+			};
+			assert_eq!(got, expected, "call index drift: {expected} arrives as {got}");
+		}
+	}
+
+	/// The relay chain's replies. Both pallets take every response through a single `receive`, so
+	/// what matters here is that the pallet and call indices land, and that the payload survives.
+	#[test]
+	fn relay_reports_decode_on_coretime() {
+		let registrar_report = registrar_primitives::MessageToPara::V1(
+			registrar_primitives::MessageToParaV1::RegisterResponse {
+				para_id: PARA,
+				message_id: MSG_ID,
+				outcome: Err(registrar_primitives::FailureReason::CannotUpgrade),
+			},
+		);
+		let encoded = CoretimeRuntimePallets::RegistrarPara(RegistrarParaCalls::Receive(
+			registrar_report.clone(),
+		))
+		.encode();
+		match CoretimeCall::decode(&mut &encoded[..]).expect("registrar report does not decode") {
+			CoretimeCall::RegistrarPara(pallet_registrar_para::Call::receive { message }) =>
+				assert_eq!(message, registrar_report),
+			other => panic!("registrar report decoded as {other:?}"),
+		}
+
+		let hrmp_report =
+			hrmp_primitives::MessageToPara::V1(hrmp_primitives::MessageToParaV1::OpenResponse {
+				channel: channel(),
+				message_id: MSG_ID,
+				outcome: Ok(()),
+			});
+		let encoded =
+			CoretimeRuntimePallets::HrmpPara(HrmpParaCalls::Receive(hrmp_report.clone())).encode();
+		match CoretimeCall::decode(&mut &encoded[..]).expect("HRMP report does not decode") {
+			CoretimeCall::HrmpPara(pallet_hrmp_para::Call::receive { message }) =>
+				assert_eq!(message, hrmp_report),
+			other => panic!("HRMP report decoded as {other:?}"),
+		}
+	}
 }

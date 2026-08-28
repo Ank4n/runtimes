@@ -562,41 +562,6 @@ pub mod pallet {
 			Self::deposit_event(Event::RegistrarReceived { count_good, count_bad });
 		}
 
-		/// Flip `min(wanted, held-as-RcMigratedReserve)` on `who` to the attributed reason `to`.
-		///
-		/// Returns `(attributed, shortfall)`. A shortfall means the recorded deposit was not
-		/// (fully) backed by a live reserve on the relay chain, or the depositor's account was
-		/// kept there; callers park it, it is never minted.
-		fn reattribute_hold(
-			who: &T::AccountId,
-			wanted: BalanceOf<T>,
-			to: HoldReason,
-		) -> Result<(BalanceOf<T>, BalanceOf<T>), Error<T>> {
-			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
-			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, who);
-			let attribute = wanted.min(held);
-
-			if !attribute.is_zero() {
-				// Flip hold-to-hold, never via free: releasing first would dust a sub-ED free
-				// remainder the moment the reserve hits zero (see `place_hold`).
-				<T as Config>::Currency::increase_balance_on_hold(
-					&to.into(),
-					who,
-					attribute,
-					Precision::Exact,
-				)
-				.map_err(|_| Error::<T>::FailedToReattribute)?;
-				<T as Config>::Currency::decrease_balance_on_hold(
-					&rc_reason,
-					who,
-					attribute,
-					Precision::Exact,
-				)
-				.map_err(|_| Error::<T>::FailedToReattribute)?;
-			}
-			Ok((attribute, wanted.saturating_sub(attribute)))
-		}
-
 		/// Hand one migrated registration to the registrar pallet.
 		///
 		/// The relay chain's recorded deposit is *released*, not re-attributed: the receiving
@@ -773,29 +738,6 @@ pub mod pallet {
 				}
 			}
 			Self::deposit_event(Event::HrmpRequestsReceived { count });
-		}
-
-		/// Re-attribute the HRMP deposit that arrived held on `para`'s sibling sovereign (the
-		/// accounts stage translates child sovereigns) to a `HrmpDeposit` hold, tracking the
-		/// total and parking any shortfall under `key` (`(sender, recipient, is_sender_side)`).
-		fn reattribute_hrmp_deposit(
-			para: u32,
-			key: (u32, u32, bool),
-			wanted: BalanceOf<T>,
-		) -> Result<(), Error<T>> {
-			let sovereign: T::AccountId = sibling_account(para);
-			let (attributed, shortfall) =
-				Self::reattribute_hold(&sovereign, wanted, HoldReason::HrmpDeposit)?;
-			ReattributedHrmpDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
-			if !shortfall.is_zero() {
-				ParkedHrmpShortfalls::<T>::insert(key, shortfall);
-				Self::deposit_event(Event::HrmpShortfallParked {
-					sender: key.0,
-					recipient: key.1,
-					shortfall,
-				});
-			}
-			Ok(())
 		}
 
 		/// Release the HRMP deposit that arrived held on `para`'s sibling sovereign, so the HRMP

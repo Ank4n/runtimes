@@ -421,9 +421,17 @@ fn emit_ct_block() {
 			"minted": planck(pallet_ct_migrator::CtMintedTotal::<Ct>::get()),
 			"reattributed": planck(pallet_ct_migrator::ReattributedDeposits::<Ct>::get()),
 			"reattributed_hrmp": planck(pallet_ct_migrator::ReattributedHrmpDeposits::<Ct>::get()),
-			"paras": pallet_ct_migrator::RcParas::<Ct>::iter_keys().count(),
-			"hrmp_channels": pallet_ct_migrator::RcHrmpChannels::<Ct>::iter_keys().count(),
-			"hrmp_requests": pallet_ct_migrator::RcHrmpOpenRequests::<Ct>::iter_keys().count(),
+			// Read from the pallets that own the state, not from the migrator: it hands records
+			// over rather than parking them, so counting its storage would report zero forever.
+			// A channel the relay chain already had arrives `Open`; an unconfirmed request
+			// arrives `Pending`, which is the same split the relay-chain census reports.
+			"paras": pallet_registrar_para::Paras::<Ct>::iter_keys().count(),
+			"hrmp_channels": pallet_hrmp_para::Channels::<Ct>::iter_values()
+				.filter(|c| matches!(c.state, pallet_hrmp_para::ChannelState::Open))
+				.count(),
+			"hrmp_requests": pallet_hrmp_para::Channels::<Ct>::iter_values()
+				.filter(|c| !matches!(c.state, pallet_hrmp_para::ChannelState::Open))
+				.count(),
 			"failed_accounts": pallet_ct_migrator::FailedAccounts::<Ct>::iter_keys().count(),
 			"failed_paras": pallet_ct_migrator::FailedParas::<Ct>::iter_keys().count(),
 			"failed_hrmp": pallet_ct_migrator::FailedHrmpChannels::<Ct>::iter_keys().count(),

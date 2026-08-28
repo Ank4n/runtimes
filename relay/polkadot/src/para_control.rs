@@ -78,10 +78,11 @@ impl EnsureOrigin<RuntimeOrigin> for EnsureCoretime {
 /// Calls on the Coretime chain, as this chain must encode them.
 ///
 /// Audit: the outer indices are the pallet indices in the Coretime `construct_runtime!`, and the
-/// inner ones are `#[pallet::call_index]` of `receive` in each pallet. The integration test decodes
-/// every `Transact` this chain sends with the real Coretime `RuntimeCall`, which catches drift.
+/// inner ones are `#[pallet::call_index]` of `receive` in each pallet. Nothing here is checked by
+/// the compiler, so `call_encoding` in the minimal-relay integration tests decodes what this chain
+/// would send using the real Coretime `RuntimeCall` — which is why these types are public.
 #[derive(Encode)]
-enum CoretimeRuntimePallets {
+pub enum CoretimeRuntimePallets {
 	#[codec(index = 60)]
 	RegistrarPara(RegistrarParaCalls),
 	#[codec(index = 61)]
@@ -89,13 +90,13 @@ enum CoretimeRuntimePallets {
 }
 
 #[derive(Encode)]
-enum RegistrarParaCalls {
+pub enum RegistrarParaCalls {
 	#[codec(index = 3)]
 	Receive(registrar_primitives::MessageToPara),
 }
 
 #[derive(Encode)]
-enum HrmpParaCalls {
+pub enum HrmpParaCalls {
 	#[codec(index = 4)]
 	Receive(hrmp_primitives::MessageToPara),
 }
