@@ -28,6 +28,11 @@ pub mod hrmp;
 pub mod proxy;
 pub mod registrar;
 
+#[cfg(test)]
+mod mock;
+#[cfg(test)]
+mod tests;
+
 pub use pallet::*;
 
 use alloc::{vec, vec::Vec};
@@ -138,14 +143,14 @@ impl<AccountId, BlockNumber> MigrationStage<AccountId, BlockNumber> {
 /// Manual call encoding: the enum indices must match `CtMigrator`'s pallet index in the Coretime
 /// `construct_runtime` and the `#[pallet::call_index]` attributes in `pallet-ct-migrator`. The
 /// integration test decodes every sent `Transact` with the real Coretime `RuntimeCall`, which
-/// catches drift.
-#[derive(Encode)]
+/// catches drift. `Decode` exists so tests can assert on captured messages.
+#[derive(Encode, Decode, PartialEq, Eq, Debug)]
 pub enum CtRuntimeCall {
 	#[codec(index = 100)]
 	CtMigrator(CtMigratorCall),
 }
 
-#[derive(Encode)]
+#[derive(Encode, Decode, PartialEq, Eq, Debug)]
 pub enum CtMigratorCall {
 	#[codec(index = 0)]
 	ReceiveAccounts { accounts: Vec<PortableAccount<AccountId32, u128>> },
@@ -453,8 +458,11 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::ProxyInit => {
-					Self::transition(MigrationStage::ProxyOngoing { last_key: None });
-					T::DbWeight::get().reads_writes(1, 1)
+					Self::migrate_stage_once(
+						proxy::ProxyMigrator::<T>::drain_announcements,
+						MigrationStage::ProxyOngoing { last_key: None },
+					);
+					T::DbWeight::get().reads_writes(100, 100)
 				},
 				MigrationStage::ProxyOngoing { last_key } => {
 					Self::migrate_stage_step(

@@ -224,3 +224,58 @@ pub struct PortableProxy<AccountId> {
 	pub delegator: AccountId,
 	pub delegates: BoundedVec<PortableProxyDelegate<AccountId>, ConstU32<32>>,
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use sp_runtime::AccountId32;
+
+	#[test]
+	fn sibling_account_derivation_is_the_wire_contract() {
+		// The relay chain sends deposits to this address and the receiving chain looks for them
+		// on it. Pinned to raw bytes so a change in either derivation crate shows up here.
+		let sov: AccountId32 = sibling_account(2000);
+		let bytes: &[u8] = sov.as_ref();
+		assert!(bytes.starts_with(b"sibl"));
+		assert_eq!(bytes[4..8], 2000u32.to_le_bytes());
+		assert!(bytes[8..].iter().all(|b| *b == 0));
+	}
+
+	#[test]
+	fn with_rollback_commits_ok_and_rolls_back_err() {
+		sp_io::TestExternalities::default().execute_with(|| {
+			let key = b"test:key";
+
+			let r: Result<(), ()> = with_rollback(|| {
+				frame_support::storage::unhashed::put(key, &1u32);
+				Ok(())
+			});
+			assert_eq!(r, Ok(()));
+			assert_eq!(frame_support::storage::unhashed::get::<u32>(key), Some(1));
+
+			let r: Result<(), ()> = with_rollback(|| {
+				frame_support::storage::unhashed::put(key, &2u32);
+				Err(())
+			});
+			assert_eq!(r, Err(()));
+			assert_eq!(
+				frame_support::storage::unhashed::get::<u32>(key),
+				Some(1),
+				"an Err must roll every write back"
+			);
+
+			// Nesting: an inner commit is still undone by an outer rollback — the per-account /
+			// per-block isolation the migrators stack on top of each other.
+			let r: Result<(), ()> = with_rollback(|| {
+				let inner: Result<(), ()> = with_rollback(|| {
+					frame_support::storage::unhashed::put(key, &3u32);
+					Ok(())
+				});
+				assert_eq!(inner, Ok(()));
+				Err(())
+			});
+			assert_eq!(r, Err(()));
+			assert_eq!(frame_support::storage::unhashed::get::<u32>(key), Some(1));
+		});
+	}
+}

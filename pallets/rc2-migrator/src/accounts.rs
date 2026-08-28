@@ -57,6 +57,7 @@ pub type AccountInfoFor<T> = frame_system::AccountInfo<
 const UNMIGRATED_PREFIXES: [&[u8]; 1] = [b"modl"];
 
 /// Where the pieces of one withdrawn account go.
+#[derive(Debug, PartialEq, Eq)]
 pub struct Withdrawal {
 	/// Deposit hold plus working buffer, minted on the Coretime chain.
 	pub ct: Option<PortableAccount<AccountId32, u128>>,
@@ -126,6 +127,12 @@ impl<T: Config> AccountsMigrator<T> {
 		// the sender sovereigns' request deposits are CT-bound like channel deposits.
 		for (id, request) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<T>::iter() {
 			add_ct(id.sender.into_account_truncating(), request.sender_deposit);
+			records += 1;
+		}
+		// Proxy announcement deposits, reserved on the announcer (the delegate). Announcements
+		// are not migrated — their purpose ends with this chain — so the deposit is refunded.
+		for (announcer, (_, deposit)) in pallet_proxy::Announcements::<T>::iter() {
+			add_refund(announcer, deposit);
 			records += 1;
 		}
 		records
