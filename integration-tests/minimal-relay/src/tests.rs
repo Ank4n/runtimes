@@ -1074,10 +1074,16 @@ async fn full_migration_rc_to_ct() {
 				paras <= paras_before.len(),
 				"more paras on CT ({paras}) than the relay chain ever had"
 			);
-			let channels = pallet_hrmp_para::Channels::<Ct>::iter().count();
+			// Only migrated channels are bounded by what the relay chain held. The control
+			// channels this chain opens for each para it takes over are new by construction, and
+			// re-establishing one is a deliberate no-op rather than a double charge.
+			let self_id: u32 = <Ct as pallet_hrmp_para::Config>::SelfParaId::get();
+			let channels = pallet_hrmp_para::Channels::<Ct>::iter_keys()
+				.filter(|c| c.sender != self_id && c.recipient != self_id)
+				.count();
 			assert!(
 				channels <= hrmp_before.len() + requests_before_detail.len(),
-				"more channels on CT ({channels}) than the relay chain ever had"
+				"more migrated channels on CT ({channels}) than the relay chain ever had"
 			);
 
 			paras_before_detail
@@ -1250,16 +1256,26 @@ async fn full_migration_rc_to_ct() {
 		);
 
 		// --- the registrar pallet actually owns the paras now -----------------------------
+		// System chains are deliberately not among them: they are not registered through this
+		// pallet, hold no deposit here, and its own `do_try_state` rejects ids below the floor.
+		let floor: u32 =
+			<Ct as pallet_registrar_para::Config>::FirstPublicParaId::get();
+		let expected: Vec<_> =
+			paras_before_detail.iter().filter(|(id, _, _)| *id >= floor).collect();
+		assert!(
+			expected.len() < paras_before_detail.len(),
+			"the snapshot must contain system paras, or the skip rule is untested"
+		);
 		assert_eq!(
 			pallet_registrar_para::Paras::<Ct>::iter().count(),
-			paras_before.len(),
-			"every para landed in the registrar pallet"
+			expected.len(),
+			"every public para landed in the registrar pallet, and no system para did"
 		);
 		assert!(
 			pallet_registrar_para::NextFreeParaId::<Ct>::get() > 0,
 			"the id counter migrated"
 		);
-		for (para_id, registered, locked) in &paras_before_detail {
+		for (para_id, registered, locked) in &expected {
 			let info = pallet_registrar_para::Paras::<Ct>::get(*para_id)
 				.unwrap_or_else(|| panic!("para {para_id} must land"));
 
@@ -1284,10 +1300,48 @@ async fn full_migration_rc_to_ct() {
 		}
 
 		// --- and the HRMP pallet owns the channels ----------------------------------------
+		// Migrated channels and requests, plus both directions of a deposit-free control channel
+		// for every para that arrived already registered. Those are what let a migrated para
+		// speak for itself here — without them a locked para (which every live para is) would
+		// need Coretime governance for anything at all.
+		let self_id: u32 = <Ct as pallet_hrmp_para::Config>::SelfParaId::get();
+		for (para_id, registered, _) in &expected {
+			if !registered {
+				continue;
+			}
+			for key in [
+				hrmp_primitives::ChannelId { sender: self_id, recipient: *para_id },
+				hrmp_primitives::ChannelId { sender: *para_id, recipient: self_id },
+			] {
+				let info = pallet_hrmp_para::Channels::<Ct>::get(key)
+					.unwrap_or_else(|| panic!("control channel {key:?} must exist"));
+				assert_eq!(info.state, ChannelState::Open);
+				// A system channel holds no deposit at either end; charging one would take money
+				// from a sovereign account for a route the control plane needs to exist.
+				assert!(info.sender_ticket.is_none() && info.recipient_ticket.is_none());
+			}
+		}
+
+		// Nothing exists that is not either migrated or a control channel. A set union rather
+		// than a sum, because the two overlap: a para that already had a channel with this chain
+		// arrives twice and is deduplicated on the way in.
+		let mut want: std::collections::BTreeSet<_> = hrmp_before
+			.iter()
+			.map(|(id, _, _)| (u32::from(id.sender), u32::from(id.recipient)))
+			.chain(requests_before_detail.iter().map(|(s, r, _)| (*s, *r)))
+			.collect();
+		for (para_id, registered, _) in &expected {
+			if *registered {
+				want.insert((self_id, *para_id));
+				want.insert((*para_id, self_id));
+			}
+		}
+		let have: std::collections::BTreeSet<_> = pallet_hrmp_para::Channels::<Ct>::iter_keys()
+			.map(|c| (c.sender, c.recipient))
+			.collect();
 		assert_eq!(
-			pallet_hrmp_para::Channels::<Ct>::iter().count(),
-			hrmp_before.len() + requests_before_detail.len(),
-			"every channel and pending request landed in the HRMP pallet"
+			have, want,
+			"the HRMP pallet holds exactly the migrated channels plus the control channels"
 		);
 		for (id, _, _) in &hrmp_before {
 			let key = hrmp_primitives::ChannelId {
