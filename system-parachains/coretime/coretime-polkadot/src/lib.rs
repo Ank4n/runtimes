@@ -694,6 +694,10 @@ impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeHoldReason = RuntimeHoldReason;
 	// Relay blocks are 6s, this chain's are 12s: migrated proxy delays halve.
 	type RcBlockTimeRatio = ConstU32<2>;
+	// Migrated records are handed straight to the pallets that own them, which take their own
+	// deposits at this chain's rates rather than inheriting the relay chain's amounts.
+	type RegistrarReceiver = RegistrarPara;
+	type HrmpReceiver = HrmpPara;
 }
 
 /// What each hold migrated from the relay chain becomes on this chain.

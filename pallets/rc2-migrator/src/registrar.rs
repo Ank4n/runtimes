@@ -22,6 +22,7 @@
 //! message; `PendingSwap` is deliberately left behind.
 
 use crate::*;
+use runtime_parachains::paras;
 
 pub struct RegistrarMigrator<T>(PhantomData<T>);
 
@@ -59,6 +60,13 @@ impl<T: Config> RegistrarMigrator<T> {
 					manager: info.manager,
 					deposit: info.deposit,
 					locked: info.locked,
+					// Both read here because only this chain can: the lifecycle map and the head
+					// data stay behind, and the destination prices the arriving registration from
+					// the head length exactly as it would price a fresh one.
+					registered: paras::Pallet::<T>::lifecycle(*para_id).is_some(),
+					head_len: paras::Heads::<T>::get(para_id)
+						.map(|head| head.0.len() as u32)
+						.unwrap_or_default(),
 				}
 			},
 			|batch| Pallet::<T>::send_registrar(batch, None),

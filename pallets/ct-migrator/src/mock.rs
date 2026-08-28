@@ -134,12 +134,63 @@ impl pallet_proxy::Config for Test {
 	type BlockNumberProvider = System;
 }
 
+frame_support::parameter_types! {
+	/// Registrations handed to the registrar pallet, oldest first.
+	pub static ReceivedParas: Vec<registrar_primitives::MigratedPara<sp_runtime::AccountId32>> = Vec::new();
+	/// The id counter this chain adopted, if one arrived.
+	pub static ReceivedNextFreeParaId: Option<u32> = None;
+	/// Channels handed to the HRMP pallet, oldest first.
+	pub static ReceivedChannels: Vec<hrmp_primitives::MigratedChannel> = Vec::new();
+	/// When set, the next hand-over is refused, so the parking path can be exercised.
+	pub static ReceiveFails: bool = false;
+}
+
+/// Stands in for `pallet-registrar-para`.
+///
+/// A recorder rather than the real pallet: these tests are about what the migrator hands over and
+/// what it does when a hand-over is refused. That the receiving pallet then holds the right
+/// deposits in the right state is its own business, and its own tests.
+pub struct RecordingRegistrar;
+
+impl registrar_primitives::ReceiveMigratedParas for RecordingRegistrar {
+	type AccountId = sp_runtime::AccountId32;
+
+	fn receive_para(
+		para: registrar_primitives::MigratedPara<sp_runtime::AccountId32>,
+	) -> sp_runtime::DispatchResult {
+		if ReceiveFails::get() {
+			return Err(sp_runtime::DispatchError::Other("receiver refused"));
+		}
+		ReceivedParas::mutate(|v| v.push(para));
+		Ok(())
+	}
+
+	fn receive_next_free_para_id(para_id: u32) {
+		ReceivedNextFreeParaId::set(Some(para_id));
+	}
+}
+
+/// Stands in for `pallet-hrmp-para`. See [`RecordingRegistrar`].
+pub struct RecordingHrmp;
+
+impl hrmp_primitives::ReceiveMigratedChannels for RecordingHrmp {
+	fn receive_channel(channel: hrmp_primitives::MigratedChannel) -> sp_runtime::DispatchResult {
+		if ReceiveFails::get() {
+			return Err(sp_runtime::DispatchError::Other("receiver refused"));
+		}
+		ReceivedChannels::mutate(|v| v.push(channel));
+		Ok(())
+	}
+}
+
 impl pallet_ct_migrator::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
 	// Sender block time 6s, this chain 12s: migrated delays halve.
 	type RcBlockTimeRatio = ConstU32<2>;
+	type RegistrarReceiver = RecordingRegistrar;
+	type HrmpReceiver = RecordingHrmp;
 }
 
 /// What each migrated hold becomes locally; mirrors the Coretime runtime's mapping.
@@ -157,6 +208,12 @@ impl From<PortableHoldReason> for RuntimeHoldReason {
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
+	// The recorders are thread locals and outlive a single test, so clear them here.
+	ReceivedParas::set(Vec::new());
+	ReceivedNextFreeParaId::set(None);
+	ReceivedChannels::set(Vec::new());
+	ReceiveFails::set(false);
+
 	let t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 	let mut ext = sp_io::TestExternalities::new(t);
 	// Block 1 so deposited events are recorded.

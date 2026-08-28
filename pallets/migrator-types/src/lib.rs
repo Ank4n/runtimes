@@ -136,6 +136,17 @@ pub struct PortableParaInfo<AccountId, Balance> {
 	pub deposit: Balance,
 	/// Whether the para is locked from manager control.
 	pub locked: Option<bool>,
+	/// Whether the para is actually onboarded, or merely has its id reserved.
+	///
+	/// The discriminator is `paras::ParaLifecycles`, which stays on the relay chain — so the
+	/// destination cannot work this out for itself and it has to travel.
+	pub registered: bool,
+	/// Length of the para's current head data, in bytes.
+	///
+	/// Carried so the arriving registration can be priced exactly the way a fresh one is on the
+	/// destination, rather than at some worst case. Only the sending chain can measure it. Zero
+	/// for a para that is merely reserved.
+	pub head_len: u32,
 }
 
 /// HRMP channel record in portable format.

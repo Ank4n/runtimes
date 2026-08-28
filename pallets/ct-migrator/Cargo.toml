@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 migrator-types = { workspace = true }
+registrar-primitives = { workspace = true }
+hrmp-primitives = { workspace = true }
 codec = { workspace = true, features = ["max-encoded-len"] }
 scale-info = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
@@ -26,6 +28,8 @@ sp-io = { workspace = true, features = ["std"] }
 default = ["std"]
 std = [
 	"migrator-types/std",
+	"registrar-primitives/std",
+	"hrmp-primitives/std",
 	"codec/std",
 	"frame-support/std",
 	"frame-system/std",

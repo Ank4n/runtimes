@@ -93,13 +93,24 @@ fn sub_ed_free_survives_hold_placement_and_reattribution() {
 		// survives the hold flip too.
 		assert_ok!(CtMigrator::receive_registrar(
 			root(),
-			vec![PortableParaInfo { para_id: 2000, manager: bob.clone(), deposit: 40, locked: None }],
+			vec![PortableParaInfo {
+				para_id: 2000,
+				manager: bob.clone(),
+				deposit: 40,
+				locked: None,
+				registered: true,
+				head_len: 32,
+			}],
 			None,
 		));
-		assert_eq!(free(&bob), 2);
-		assert_eq!(held(HoldReason::RegistrarDeposit, &bob), 40);
+		// The deposit is released to free so the registrar pallet can take its own at this
+		// chain's rates — and crucially the sub-ED dust survives the release. Releasing the naive
+		// way would take the hold through zero while free was still below ED, and
+		// pallet-balances would burn the remainder; `release_hold` credits free first.
+		assert_eq!(free(&bob), 42);
+		assert_eq!(held(HoldReason::RegistrarDeposit, &bob), 0);
 		assert_eq!(held(HoldReason::RcMigratedReserve, &bob), 0);
-		assert_eq!(total_issuance(), 42, "no dust may be burned by re-attribution");
+		assert_eq!(total_issuance(), 42, "no dust may be burned by the hand-over");
 	});
 }
 
@@ -158,7 +169,7 @@ fn receive_accounts_parks_bad_account_without_poisoning_batch() {
 }
 
 #[test]
-fn receive_registrar_reattributes_and_stores() {
+fn receive_registrar_releases_the_deposit_and_hands_the_para_over() {
 	new_test_ext().execute_with(|| {
 		let alice = acc(1); // parachain manager
 		give_hold(&alice, HoldReason::RcMigratedReserve, 500);
@@ -167,20 +178,35 @@ fn receive_registrar_reattributes_and_stores() {
 			manager: alice.clone(),
 			deposit: 300,
 			locked: Some(false),
+			registered: true,
+			head_len: 32,
 		};
 
 		let ti_before = total_issuance();
 		assert_ok!(CtMigrator::receive_registrar(root(), vec![para.clone()], Some(3000)));
 
-		// THEN the deposit flips reason for exactly the recorded amount; the rest stays parked
-		// under the generic migrated reason.
-		assert_eq!(held(HoldReason::RegistrarDeposit, &alice), 300);
+		// THEN the recorded deposit is *released* rather than re-labelled: the registrar pallet
+		// holds its deposits as `Consideration` tickets, which can only be minted by taking
+		// funds, and it prices them at this chain's rates. Anything beyond the recorded amount
+		// stays parked under the generic migrated reason.
+		assert_eq!(held(HoldReason::RegistrarDeposit, &alice), 0);
 		assert_eq!(held(HoldReason::RcMigratedReserve, &alice), 200);
 		assert_eq!(ReattributedDeposits::<Test>::get(), 300);
-		assert_eq!(RcParas::<Test>::get(2000), Some(para));
-		assert_eq!(RcNextFreeParaId::<Test>::get(), Some(3000));
 		assert!(ParkedDepositShortfalls::<Test>::iter().next().is_none());
-		// AND re-attribution never mints.
+
+		// AND the para itself was handed to the registrar pallet, carrying the state and lock the
+		// relay chain recorded.
+		let received = ReceivedParas::get();
+		assert_eq!(received.len(), 1);
+		assert_eq!(received[0].para_id, 2000);
+		assert_eq!(received[0].manager, alice);
+		assert!(!received[0].locked);
+		assert_eq!(
+			received[0].state,
+			registrar_primitives::MigratedParaState::Registered { head_len: 32 }
+		);
+		assert_eq!(ReceivedNextFreeParaId::get(), Some(3000));
+		// AND releasing never mints.
 		assert_eq!(total_issuance(), ti_before);
 		assert!(migrator_events()
 			.contains(&Event::RegistrarReceived { count_good: 1, count_bad: 0 }));
@@ -198,16 +224,22 @@ fn registrar_shortfall_is_parked_never_minted() {
 			manager: alice.clone(),
 			deposit: 250,
 			locked: None,
+			registered: false,
+			head_len: 0,
 		};
 		let ti_before = total_issuance();
 		assert_ok!(CtMigrator::receive_registrar(root(), vec![para.clone()], None));
 
-		assert_eq!(held(HoldReason::RegistrarDeposit, &alice), 100);
+		assert_eq!(held(HoldReason::RegistrarDeposit, &alice), 0);
 		assert_eq!(held(HoldReason::RcMigratedReserve, &alice), 0);
 		assert_eq!(ParkedDepositShortfalls::<Test>::get(2000), Some(150));
 		assert_eq!(total_issuance(), ti_before);
-		// The record still lands: a shortfall is an accounting gap, not a failed record.
-		assert_eq!(RcParas::<Test>::get(2000), Some(para));
+		// The para still lands: a shortfall is an accounting gap, not a failed record. It is a
+		// merely reserved id here, so it arrives as `Reserved` rather than `Registered`.
+		let received = ReceivedParas::get();
+		assert_eq!(received.len(), 1);
+		assert_eq!(received[0].para_id, 2000);
+		assert_eq!(received[0].state, registrar_primitives::MigratedParaState::Reserved);
 		assert!(migrator_events()
 			.contains(&Event::DepositShortfallParked { para_id: 2000, shortfall: 150 }));
 	});
@@ -223,15 +255,24 @@ fn multi_para_manager_attribution_is_capped_by_what_arrived() {
 			manager: alice.clone(),
 			deposit: 300,
 			locked: None,
+			registered: true,
+			head_len: 32,
 		};
 
 		assert_ok!(CtMigrator::receive_registrar(root(), vec![para(2100), para(2200)], None));
 
-		// First para attributes in full, the second gets the remainder, the gap parks under it.
-		assert_eq!(held(HoldReason::RegistrarDeposit, &alice), 500);
+		// The first para's deposit is released in full, the second gets only the remainder, and
+		// the gap parks under it. What arrived caps what can be handed over, however many paras
+		// share a manager.
+		assert_eq!(held(HoldReason::RcMigratedReserve, &alice), 0);
 		assert_eq!(ReattributedDeposits::<Test>::get(), 500);
 		assert_eq!(ParkedDepositShortfalls::<Test>::get(2100), None);
 		assert_eq!(ParkedDepositShortfalls::<Test>::get(2200), Some(100));
+		// Both paras still reach the registrar pallet; a shortfall is an accounting gap.
+		assert_eq!(
+			ReceivedParas::get().iter().map(|p| p.para_id).collect::<Vec<_>>(),
+			vec![2100, 2200]
+		);
 	});
 }
 
@@ -254,11 +295,23 @@ fn receive_hrmp_reattributes_both_sides_on_sibling_sovereigns() {
 		};
 		assert_ok!(CtMigrator::receive_hrmp(root(), vec![channel.clone()]));
 
-		assert_eq!(held(HoldReason::HrmpDeposit, &sov_sender), 100);
-		assert_eq!(held(HoldReason::HrmpDeposit, &sov_recipient), 50);
+		// Released rather than re-labelled, for the same reason as the registrar's: the HRMP
+		// pallet mints its own `Consideration` tickets at this chain's rates.
+		assert_eq!(held(HoldReason::HrmpDeposit, &sov_sender), 0);
+		assert_eq!(held(HoldReason::HrmpDeposit, &sov_recipient), 0);
+		assert_eq!(held(HoldReason::RcMigratedReserve, &sov_sender), 0);
 		assert_eq!(ReattributedHrmpDeposits::<Test>::get(), 150);
-		assert_eq!(RcHrmpChannels::<Test>::get((2000, 2001)), Some(channel));
 		assert!(ParkedHrmpShortfalls::<Test>::iter().next().is_none());
+
+		// A channel that exists on the relay chain arrives confirmed, so the receiving pallet
+		// takes both ends' deposits.
+		assert_eq!(
+			ReceivedChannels::get(),
+			vec![hrmp_primitives::MigratedChannel {
+				channel: hrmp_primitives::ChannelId { sender: 2000, recipient: 2001 },
+				confirmed: true,
+			}]
+		);
 		assert!(migrator_events().contains(&Event::HrmpReceived { count_good: 1, count_bad: 0 }));
 
 		// Hypothetically, had the recipient deposit not (fully) arrived, the gap parks under the
@@ -301,11 +354,15 @@ fn receive_hrmp_requests_relabels_and_always_stores() {
 			vec![request(2001, 60), request(2002, 40)],
 		));
 
-		// THEN the covered deposit re-labels, the uncovered one parks — and BOTH records store.
-		assert_eq!(held(HoldReason::HrmpDeposit, &sov), 60);
+		// THEN the covered deposit is released, the uncovered one parks — and BOTH records are
+		// still handed over, because a shortfall is an accounting gap and not a failed record.
+		assert_eq!(held(HoldReason::HrmpDeposit, &sov), 0);
 		assert_eq!(ParkedHrmpShortfalls::<Test>::get((2000, 2002, true)), Some(40));
-		assert!(RcHrmpOpenRequests::<Test>::contains_key((2000, 2001)));
-		assert!(RcHrmpOpenRequests::<Test>::contains_key((2000, 2002)));
+		let handed: Vec<(u32, u32)> = ReceivedChannels::get()
+			.into_iter()
+			.map(|c| (c.channel.sender, c.channel.recipient))
+			.collect();
+		assert_eq!(handed, vec![(2000, 2001), (2000, 2002)]);
 		assert!(migrator_events().contains(&Event::HrmpRequestsReceived { count: 2 }));
 	});
 }

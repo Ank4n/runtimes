@@ -36,6 +36,8 @@ mod mock;
 mod tests;
 
 use alloc::vec::Vec;
+use hrmp_primitives::{MigratedChannel, ReceiveMigratedChannels};
+use registrar_primitives::{MigratedPara, MigratedParaState, ReceiveMigratedParas};
 use frame_support::{
 	defensive_assert,
 	pallet_prelude::*,
@@ -122,6 +124,15 @@ pub mod pallet {
 		/// migrated proxy delays (relay: 6s blocks; this chain: 12s → ratio 2).
 		#[pallet::constant]
 		type RcBlockTimeRatio: Get<u32>;
+
+		/// Where migrated registrations are handed over. Normally `pallet-registrar-para`.
+		///
+		/// A seam rather than direct storage writes: which deposit a registration holds in which
+		/// state is the receiving pallet's invariant, and rebuilding it out here is how it drifts.
+		type RegistrarReceiver: ReceiveMigratedParas<AccountId = Self::AccountId>;
+
+		/// Where migrated HRMP channels are handed over. Normally `pallet-hrmp-para`.
+		type HrmpReceiver: ReceiveMigratedChannels;
 	}
 
 	#[pallet::composite_enum]
@@ -175,30 +186,10 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type CtMintedTotal<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
 
-	// NOTE: The storage items below are DUMMY stand-ins for the future registrar/HRMP pallets on
-	// this chain, which do not exist yet. They hold the migrated records verbatim so the
-	// migration pipeline is exercisable end to end; the real pallets replace each map and the
-	// `do_receive_*` arm that fills it, nothing else.
-
-	/// Dummy stand-in for the future registrar pallet's `Paras` storage.
-	#[pallet::storage]
-	pub type RcParas<T: Config> =
-		StorageMap<_, Twox64Concat, u32, PortableParaInfoOf<T>, OptionQuery>;
-
-	/// Dummy stand-in for the future registrar pallet's `NextFreeParaId`.
-	#[pallet::storage]
-	pub type RcNextFreeParaId<T: Config> = StorageValue<_, u32, OptionQuery>;
-
-	/// Dummy stand-in for the future HRMP pallet's `HrmpChannels`, keyed by `(sender, recipient)`.
-	#[pallet::storage]
-	pub type RcHrmpChannels<T: Config> =
-		StorageMap<_, Twox64Concat, (u32, u32), PortableHrmpChannelOf<T>, OptionQuery>;
-
-	/// Dummy stand-in for the future HRMP pallet's pending open-channel requests, keyed by
-	/// `(sender, recipient)`. The future system decides whether these handshakes can finish.
-	#[pallet::storage]
-	pub type RcHrmpOpenRequests<T: Config> =
-		StorageMap<_, Twox64Concat, (u32, u32), PortableHrmpRequestOf<T>, OptionQuery>;
+	// The migrated registrar and HRMP records are handed straight to the pallets that own them
+	// (`Config::RegistrarReceiver` / `Config::HrmpReceiver`) rather than being parked in stand-in
+	// storage here. Only records that *fail* to integrate are kept, in the `Failed*` maps below,
+	// so nothing is lost and a failure can be inspected.
 
 	/// Registrar records that failed to integrate, parked verbatim for manual recovery.
 	#[pallet::storage]
@@ -516,6 +507,24 @@ pub mod pallet {
 		/// remainder. Deposit holders whose liquid dust deliberately travelled here alongside the
 		/// deposit are in exactly that shape, so the two steps run in the reverse (safe) order.
 		/// The low-level primitives keep total issuance untouched, like `hold` itself.
+		/// The inverse of [`Self::place_hold`]: move `amount` from a hold back to free balance.
+		///
+		/// Same hazard, same fix in reverse. `release` decreases the hold first, and if that
+		/// takes it to zero while the free part is still sub-ED, pallet-balances dusts the
+		/// remainder — which is exactly the shape a deposit holder whose liquid dust travelled
+		/// here alongside the deposit is in. Crediting the free part *first* means the hold never
+		/// passes through zero while free is below ED. The two primitives are mint-and-burn of
+		/// the same amount, so total issuance is untouched, just as `release` would be.
+		fn release_hold(
+			reason: &T::RuntimeHoldReason,
+			who: &T::AccountId,
+			amount: BalanceOf<T>,
+		) -> Result<(), DispatchError> {
+			<T as Config>::Currency::increase_balance(who, amount, Precision::Exact)?;
+			<T as Config>::Currency::decrease_balance_on_hold(reason, who, amount, Precision::Exact)?;
+			Ok(())
+		}
+
 		fn place_hold(
 			reason: &T::RuntimeHoldReason,
 			who: &T::AccountId,
@@ -534,7 +543,7 @@ pub mod pallet {
 
 		fn do_receive_registrar(paras: Vec<PortableParaInfoOf<T>>, next_free: Option<u32>) {
 			if let Some(id) = next_free {
-				RcNextFreeParaId::<T>::put(id);
+				T::RegistrarReceiver::receive_next_free_para_id(id);
 			}
 
 			let (count_good, count_bad) = Self::receive_batch(
@@ -588,10 +597,28 @@ pub mod pallet {
 			Ok((attribute, wanted.saturating_sub(attribute)))
 		}
 
+		/// Hand one migrated registration to the registrar pallet.
+		///
+		/// The relay chain's recorded deposit is *released*, not re-attributed: the receiving
+		/// pallet holds its deposits as `Consideration` tickets, which can only be minted by
+		/// taking funds, and it prices them at this chain's own rates. So the migrated hold
+		/// becomes free balance and the pallet takes what it needs back out of it. The rates here
+		/// are far lower than the relay chain's, so the remainder stays with the manager.
+		///
+		/// Anything the migrated hold does not cover is a shortfall, parked and reported exactly
+		/// as before — the manager may then be unable to pay, in which case the whole record is
+		/// parked rather than half-applied.
 		fn do_receive_para(para: &PortableParaInfoOf<T>) -> Result<(), Error<T>> {
-			let (attributed, shortfall) =
-				Self::reattribute_hold(&para.manager, para.deposit, HoldReason::RegistrarDeposit)?;
-			ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(attributed));
+			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
+			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, &para.manager);
+			let shortfall = para.deposit.saturating_sub(held);
+			let release = para.deposit.min(held);
+
+			if !release.is_zero() {
+				Self::release_hold(&rc_reason, &para.manager, release)
+					.map_err(|_| Error::<T>::FailedToReattribute)?;
+			}
+			ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(release));
 			if !shortfall.is_zero() {
 				ParkedDepositShortfalls::<T>::insert(para.para_id, shortfall);
 				Self::deposit_event(Event::DepositShortfallParked {
@@ -600,7 +627,19 @@ pub mod pallet {
 				});
 			}
 
-			RcParas::<T>::insert(para.para_id, para.clone());
+			T::RegistrarReceiver::receive_para(MigratedPara {
+				para_id: para.para_id,
+				manager: para.manager.clone(),
+				state: if para.registered {
+					MigratedParaState::Registered { head_len: para.head_len }
+				} else {
+					MigratedParaState::Reserved
+				},
+				// Every live para arrives locked; the relay chain set that at its first head.
+				locked: para.locked.unwrap_or(false),
+			})
+			.map_err(|_| Error::<T>::FailedToReattribute)?;
+
 			Ok(())
 		}
 
@@ -703,20 +742,35 @@ pub mod pallet {
 		fn do_receive_hrmp_requests(requests: Vec<PortableHrmpRequestOf<T>>) {
 			let count = requests.len() as u32;
 			for request in requests {
-				// A failed re-label parks nothing: the record always stores, the deposit simply
-				// stays under `RcMigratedReserve` and surfaces in the parked-shortfall checks.
-				if let Err(e) = Self::reattribute_hrmp_deposit(
+				// A failed release parks nothing: the deposit simply stays under
+				// `RcMigratedReserve` and surfaces in the parked-shortfall checks.
+				if let Err(e) = Self::release_hrmp_deposit(
 					request.sender,
 					(request.sender, request.recipient, true),
 					request.sender_deposit,
 				) {
 					log::error!(
 						target: LOG_TARGET,
-						"Failed to re-label request deposit {}->{}: {e:?}",
+						"Failed to release request deposit {}->{}: {e:?}",
 						request.sender, request.recipient,
 					);
 				}
-				RcHrmpOpenRequests::<T>::insert((request.sender, request.recipient), request);
+				// `confirmed` decides how many deposits are owed: an unconfirmed request is the
+				// sender's alone, which is exactly the distinction the receiving pallet draws
+				// between its `Pending` and `Open` states.
+				if let Err(e) = T::HrmpReceiver::receive_channel(MigratedChannel {
+					channel: hrmp_primitives::ChannelId {
+						sender: request.sender,
+						recipient: request.recipient,
+					},
+					confirmed: request.confirmed,
+				}) {
+					log::error!(
+						target: LOG_TARGET,
+						"Failed to hand over request {}->{}: {e:?}",
+						request.sender, request.recipient,
+					);
+				}
 			}
 			Self::deposit_event(Event::HrmpRequestsReceived { count });
 		}
@@ -744,19 +798,61 @@ pub mod pallet {
 			Ok(())
 		}
 
+		/// Release the HRMP deposit that arrived held on `para`'s sibling sovereign, so the HRMP
+		/// pallet can take its own at this chain's rates.
+		///
+		/// Same reasoning as the registrar's: a `Consideration` ticket can only be minted by
+		/// taking funds, so the migrated hold has to become free balance first. A shortfall is
+		/// parked and reported exactly as it was when the hold was merely re-labelled.
+		fn release_hrmp_deposit(
+			para: u32,
+			key: (u32, u32, bool),
+			wanted: BalanceOf<T>,
+		) -> Result<(), Error<T>> {
+			let sovereign: T::AccountId = sibling_account(para);
+			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
+			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, &sovereign);
+			let release = wanted.min(held);
+			let shortfall = wanted.saturating_sub(held);
+
+			if !release.is_zero() {
+				Self::release_hold(&rc_reason, &sovereign, release)
+					.map_err(|_| Error::<T>::FailedToReattribute)?;
+			}
+			ReattributedHrmpDeposits::<T>::mutate(|t| *t = t.saturating_add(release));
+			if !shortfall.is_zero() {
+				ParkedHrmpShortfalls::<T>::insert(key, shortfall);
+				Self::deposit_event(Event::HrmpShortfallParked {
+					sender: key.0,
+					recipient: key.1,
+					shortfall,
+				});
+			}
+			Ok(())
+		}
+
 		fn do_receive_channel(channel: &PortableHrmpChannelOf<T>) -> Result<(), Error<T>> {
 			for (para, wanted, side) in [
 				(channel.sender, channel.sender_deposit, true),
 				(channel.recipient, channel.recipient_deposit, false),
 			] {
-				Self::reattribute_hrmp_deposit(
+				Self::release_hrmp_deposit(
 					para,
 					(channel.sender, channel.recipient, side),
 					wanted,
 				)?;
 			}
 
-			RcHrmpChannels::<T>::insert((channel.sender, channel.recipient), channel.clone());
+			// A channel that exists on the relay chain arrives fully open, so the receiving
+			// pallet takes both ends' deposits.
+			T::HrmpReceiver::receive_channel(MigratedChannel {
+				channel: hrmp_primitives::ChannelId {
+					sender: channel.sender,
+					recipient: channel.recipient,
+				},
+				confirmed: true,
+			})
+			.map_err(|_| Error::<T>::FailedToReattribute)?;
 			Ok(())
 		}
 

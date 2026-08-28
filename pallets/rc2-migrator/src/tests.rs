@@ -594,6 +594,10 @@ fn registrar_stage_moves_next_free_id_and_drains_records() {
 					manager: alice,
 					deposit: 300,
 					locked: None,
+					// The test para has a registrar record but was never onboarded, so it has no
+					// lifecycle and no head data — it travels as a reserved id.
+					registered: false,
+					head_len: 0,
 				}],
 				next_free_para_id: None,
 			}]
