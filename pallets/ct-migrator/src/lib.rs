@@ -580,8 +580,14 @@ pub mod pallet {
 			let release = para.deposit.min(held);
 
 			if !release.is_zero() {
-				Self::release_hold(&rc_reason, &para.manager, release)
-					.map_err(|_| Error::<T>::FailedToReattribute)?;
+				Self::release_hold(&rc_reason, &para.manager, release).map_err(|e| {
+					log::error!(
+						target: LOG_TARGET,
+						"para {}: releasing {release:?} of {held:?} held failed: {e:?}",
+						para.para_id,
+					);
+					Error::<T>::FailedToReattribute
+				})?;
 			}
 			ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(release));
 			if !shortfall.is_zero() {
@@ -603,7 +609,17 @@ pub mod pallet {
 				// Every live para arrives locked; the relay chain set that at its first head.
 				locked: para.locked.unwrap_or(false),
 			})
-			.map_err(|_| Error::<T>::FailedToReattribute)?;
+			.map_err(|e| {
+				log::error!(
+					target: LOG_TARGET,
+					"para {}: registrar refused it: {e:?} (rc deposit {:?}, released {release:?}, \
+					 shortfall {shortfall:?}, manager free {:?})",
+					para.para_id,
+					para.deposit,
+					<T as Config>::Currency::balance(&para.manager),
+				);
+				Error::<T>::FailedToReattribute
+			})?;
 
 			Ok(())
 		}

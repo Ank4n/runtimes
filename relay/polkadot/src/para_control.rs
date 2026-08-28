@@ -25,6 +25,7 @@
 //! `OriginKind::Superuser`, which Coretime converts to Root — the origin both para-side pallets
 //! accept as their `RelayOrigin`.
 
+use alloc::{vec, vec::Vec};
 use crate::{parachains_origin, Hrmp, Registrar, Runtime, RuntimeEvent, RuntimeOrigin};
 use codec::Encode;
 use frame_support::{parameter_types, traits::EnsureOrigin};

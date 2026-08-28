@@ -1235,10 +1235,18 @@ async fn full_migration_rc_to_ct() {
 		use pallet_registrar_para::RegistrationState;
 
 		assert_eq!(CtMigrationStage::<Ct>::get(), MigrationStage::MigrationDone);
-		assert!(FailedParas::<Ct>::iter().next().is_none(), "no para may fail to integrate");
+		let failed_paras: Vec<u32> = FailedParas::<Ct>::iter_keys().collect();
 		assert!(
-			FailedHrmpChannels::<Ct>::iter().next().is_none(),
-			"no channel may fail to integrate"
+			failed_paras.is_empty(),
+			"{} of {} paras failed to integrate: {failed_paras:?}",
+			failed_paras.len(),
+			paras_before.len(),
+		);
+		let failed_channels: Vec<_> = FailedHrmpChannels::<Ct>::iter_keys().collect();
+		assert!(
+			failed_channels.is_empty(),
+			"{} channels failed to integrate: {failed_channels:?}",
+			failed_channels.len(),
 		);
 
 		// --- the registrar pallet actually owns the paras now -----------------------------

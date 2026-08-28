@@ -28,6 +28,7 @@
 //! `Origin::Parachain(BROKER_ID)` — the origin its `ParaOrigin` accepts. Verdicts come back with
 //! `OriginKind::Superuser`, landing here as Root, which is what `RelayOrigin` accepts.
 
+use alloc::{vec, vec::Vec};
 use crate::{
 	xcm_config::LocationToAccountId, AccountId, Balance, Balances, Runtime, RuntimeEvent,
 	RuntimeHoldReason,
