@@ -15,5 +15,6 @@
 // along with Polkadot.  If not, see <http://www.gnu.org/licenses/>.
 
 mod asset_rate;
+mod call_filter;
 mod location_conversion;
 mod treasury_burn_handler;

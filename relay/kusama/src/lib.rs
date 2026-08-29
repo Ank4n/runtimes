@@ -154,6 +154,7 @@ mod bag_thresholds;
 mod past_payouts;
 
 // XCM configurations.
+pub mod para_control;
 pub mod xcm_config;
 
 // Governance configurations.
@@ -245,6 +246,23 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 
 			// Coretime: request_revenue_at is allowed, rest handled by catch-all.
 			Coretime(coretime::Call::<Runtime>::request_revenue_at { .. }) => true,
+
+			// The parachain control plane, which must stay reachable. These calls do **not**
+			// arrive as Root and so do not bypass this filter: Coretime's requests convert to
+			// `parachains_origin::Origin::Parachain(BROKER_ID)`, and the two validation-code
+			// uploads are unsigned. Blocking them — by a broader rule added later, or by folding
+			// them in with the pallets below — severs every registrar and HRMP flow on both
+			// chains, and does it silently, because a filtered call inside XCM surfaces only as a
+			// `Transact` that did nothing.
+			RegistrarRelay(..) | HrmpRelay(..) => true,
+
+			// Registrar and HRMP move to the Coretime chain; see `para_control`. Gated on the
+			// migration rather than on the upgrade: the Coretime pallets hold no state until the
+			// migration hands it over, so closing these at the upgrade would leave nobody able to
+			// register a para or open a channel on *either* chain for however long governance
+			// takes to schedule the start. A scheduled migration has not started.
+			Registrar(..) | Hrmp(..) =>
+				!pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started(),
 
 			// Fellowship and its preimages explicitly allowed.
 			FellowshipCollective(..) | FellowshipReferenda(..) | Preimage(..) => true,
@@ -1353,6 +1371,32 @@ impl From<TransparentProxyType> for ProxyType {
 	}
 }
 
+/// Which of Kusama's proxy types survive the move to the Coretime chain.
+///
+/// The portable set is the same on both networks — it is a property of what the destination can
+/// represent, not of the source. Kusama's extra variants (`Society`, `Spokesperson`) join
+/// `Governance`, `Staking` and the rest as non-portable: their deposits are unreserved during the
+/// accounts stage and the definitions are simply not recreated.
+impl TryFrom<TransparentProxyType> for migrator_types::PortableProxyType {
+	type Error = ();
+
+	fn try_from(t: TransparentProxyType) -> Result<Self, ()> {
+		use migrator_types::PortableProxyType as P;
+		match t.0 {
+			ProxyType::Any => Ok(P::Any),
+			ProxyType::NonTransfer => Ok(P::NonTransfer),
+			ProxyType::CancelProxy => Ok(P::CancelProxy),
+			ProxyType::ParaRegistration => Ok(P::ParaRegistration),
+			ProxyType::Governance |
+			ProxyType::Staking |
+			ProxyType::Auction |
+			ProxyType::Society |
+			ProxyType::Spokesperson |
+			ProxyType::NominationPools => Err(()),
+		}
+	}
+}
+
 impl scale_info::TypeInfo for TransparentProxyType {
 	type Identity = <ProxyType as TypeInfo>::Identity;
 
@@ -1616,6 +1660,35 @@ impl parachains_scheduler::Config for Runtime {}
 
 parameter_types! {
 	pub const BrokerId: u32 = system_parachain::BROKER_ID;
+	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
+	/// Leftover pots emptied by the migration's `Sweep` stage.
+	///
+	/// Kusama's list is not Polkadot's: there is no retired direct-allocation pot here, and the
+	/// Society pot is Kusama-only. Each entry is a pot whose balance has no owner to migrate it
+	/// to, so it is swept rather than left stranded on a chain that will hold no DOT/KSM.
+	pub SweepAccounts: Vec<AccountId> = vec![
+		TreasuryPalletId::get().into_account_truncating(),
+		SocietyPalletId::get().into_account_truncating(),
+		OnDemandPalletId::get().into_account_truncating(),
+	];
+	/// Where swept pots and dust land on Asset Hub. Kusama sweeps to the treasury; Polkadot
+	/// sweeps to its DAP buffer. Same `PalletId` derivation, so the same address on both sides.
+	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
+	/// Audited issuance held by no account ("phantom issuance"), burned at the end of the
+	/// migration.
+	///
+	/// TODO: **must be measured on Kusama before any real run.** The `balance_census` test prints
+	/// the exact value at a given block; the number below is a placeholder of zero, which burns
+	/// nothing and is the only safe default — over-burning is unrecoverable.
+	pub const TiCorrection: u128 = 0;
+	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
+	/// One KSM, mirroring Polkadot's one DOT — the two are different amounts of money, and the
+	/// point is a usable buffer on each chain rather than a matching number.
+	pub const CtFreeBuffer: Balance = UNITS;
+	/// Asset Hub's existential deposit; mirrors
+	/// `system_parachains_constants::kusama::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
+	/// without pulling that crate into the relay runtime.
+	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
 	pub const BrokerPalletId: PalletId = PalletId(*b"py/broke");
 	pub MaxXcmTransactWeight: Weight = Weight::from_parts(
 		250 * WEIGHT_REF_TIME_PER_MICROS,
@@ -1955,6 +2028,19 @@ impl pallet_rc_migrator::Config for Runtime {
 	type Currency = Balances;
 }
 
+impl pallet_rc2_migrator::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type SendXcm = xcm_config::XcmRouter;
+	type CtParaId = BrokerId;
+	type AhParaId = AssetHubId;
+	type CtFreeBuffer = CtFreeBuffer;
+	type AhExistentialDeposit = AhExistentialDeposit;
+	type SweepAccounts = SweepAccounts;
+	type SweepBeneficiary = SweepBeneficiary;
+	type TiCorrection = TiCorrection;
+}
+
 construct_runtime! {
 	pub enum Runtime
 	{
@@ -2087,6 +2173,13 @@ construct_runtime! {
 		// Relay Chain Migrator
 		// The pallet must be located below `MessageQueue` to get the XCM message acknowledgements
 		// from Asset Hub before we get the `RcMigrator` `on_initialize` executed.
+		// The parachain control plane's relay-chain half. Driven only by the Coretime chain
+		// over XCM; see `para_control`. Indices match Polkadot's so both networks encode the
+		// same bytes.
+		RegistrarRelay: pallet_registrar_relay = 250,
+		HrmpRelay: pallet_hrmp_relay = 251,
+
+		Rc2Migrator: pallet_rc2_migrator = 254,
 		RcMigrator: pallet_rc_migrator = 255,
 	}
 }

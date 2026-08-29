@@ -30,6 +30,7 @@ pub mod genesis_config_presets;
 #[cfg(test)]
 mod tests;
 mod weights;
+pub mod para_control;
 pub mod xcm_config;
 
 use alloc::{borrow::Cow, vec, vec::Vec};
@@ -208,6 +209,25 @@ impl Contains<RuntimeCall> for IsFilteredBrokerCall {
 	}
 }
 
+/// The parachain control plane, before the migration has handed it anything.
+///
+/// These pallets ship with the runtime upgrade but must not serve users until the migration has
+/// moved the relay chain's state across, because until then they contradict it. Concretely: their
+/// `Paras` map is empty and `NextFreeParaId` is 0, so `reserve` would hand out `FirstPublicParaId`
+/// — a parachain that is very much alive on the relay chain. Whoever took it would then park the
+/// real one, which arrives later to find its id occupied.
+///
+/// Only the user-facing calls are closed. The relay chain's reports arrive as Root and bypass this
+/// filter entirely, and the migration hands records over by direct call rather than by dispatch,
+/// so both keep working while this is engaged.
+pub struct ParaControlBeforeMigration;
+impl Contains<RuntimeCall> for ParaControlBeforeMigration {
+	fn contains(c: &RuntimeCall) -> bool {
+		matches!(c, RuntimeCall::RegistrarPara(..) | RuntimeCall::HrmpPara(..)) &&
+			!pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_finished()
+	}
+}
+
 /// Implements [`pallet_broker::BlockToRelayHeightConversion`] for the migration to relay chain
 /// block numbers for the broker pallet.
 pub struct BrokerMigrationV4BlockConversion;
@@ -232,7 +252,7 @@ impl pallet_broker::migration::v4::BlockToRelayHeightConversion<Runtime>
 // Configure FRAME pallets to include in runtime.
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig as frame_system::DefaultConfig)]
 impl frame_system::Config for Runtime {
-	type BaseCallFilter = EverythingBut<IsFilteredBrokerCall>;
+	type BaseCallFilter = EverythingBut<(IsFilteredBrokerCall, ParaControlBeforeMigration)>;
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;
 	/// The nonce type for storing how many extrinsics an account has signed.
@@ -543,6 +563,11 @@ pub enum ProxyType {
 	OnDemandPurchaser,
 	/// Collator selection proxy. Can execute calls related to collator selection mechanism.
 	Collator,
+	/// Proxy for parachain registration operations.
+	///
+	/// Migrated from the relay chain (AHM v2) together with the registrar pallet, preserving the
+	/// permission's exact scope.
+	ParaRegistration,
 }
 
 impl InstanceFilter<RuntimeCall> for ProxyType {
@@ -604,6 +629,20 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
 					RuntimeCall::Utility { .. } |
 					RuntimeCall::Multisig { .. }
 			),
+			// Mirrors the relay chain's `ParaRegistration` scope exactly, against the pallet
+			// that serves those calls here. Deliberately narrow, as it is there: a registration
+			// proxy may create a para but not deregister, lock or upgrade one. Widening this
+			// would escalate every proxy that migrated under the old scope, which is the one
+			// thing the migration promised not to do.
+			ProxyType::ParaRegistration => matches!(
+				c,
+				RuntimeCall::RegistrarPara(pallet_registrar_para::Call::reserve { .. }) |
+					RuntimeCall::RegistrarPara(pallet_registrar_para::Call::register { .. }) |
+					RuntimeCall::Utility(pallet_utility::Call::batch { .. }) |
+					RuntimeCall::Utility(pallet_utility::Call::batch_all { .. }) |
+					RuntimeCall::Utility(pallet_utility::Call::force_batch { .. }) |
+					RuntimeCall::Proxy(pallet_proxy::Call::remove_proxy { .. })
+			),
 		}
 	}
 
@@ -655,6 +694,46 @@ impl pallet_utility::Config for Runtime {
 	type WeightInfo = weights::pallet_utility::WeightInfo<Runtime>;
 }
 
+impl pallet_ct_migrator::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type RuntimeHoldReason = RuntimeHoldReason;
+	// Relay blocks are 6s, this chain's are 12s: migrated proxy delays halve.
+	type RcBlockTimeRatio = ConstU32<2>;
+	// Migrated records are handed straight to the pallets that own them, which take their own
+	// deposits at this chain's rates rather than inheriting the relay chain's amounts.
+	type RegistrarReceiver = RegistrarPara;
+	type HrmpReceiver = HrmpPara;
+}
+
+/// What each hold migrated from the relay chain becomes on this chain.
+impl From<pallet_ct_migrator::PortableHoldReason> for RuntimeHoldReason {
+	fn from(reason: pallet_ct_migrator::PortableHoldReason) -> Self {
+		match reason {
+			pallet_ct_migrator::PortableHoldReason::UnnamedReserve =>
+				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::RcMigratedReserve),
+			pallet_ct_migrator::PortableHoldReason::ProxyDeposit =>
+				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::ProxyDeposit),
+			pallet_ct_migrator::PortableHoldReason::UnattributedReserve =>
+				RuntimeHoldReason::CtMigrator(pallet_ct_migrator::HoldReason::UnattributedReserve),
+		}
+	}
+}
+
+/// What each migrated relay-chain proxy permission becomes locally. Total by construction: the
+/// relay side only sends permissions this chain represents.
+impl From<pallet_ct_migrator::PortableProxyType> for ProxyType {
+	fn from(portable: pallet_ct_migrator::PortableProxyType) -> Self {
+		use pallet_ct_migrator::PortableProxyType as P;
+		match portable {
+			P::Any => ProxyType::Any,
+			P::NonTransfer => ProxyType::NonTransfer,
+			P::CancelProxy => ProxyType::CancelProxy,
+			P::ParaRegistration => ProxyType::ParaRegistration,
+		}
+	}
+}
+
 // Create the runtime by composing the FRAME pallets that were previously configured.
 construct_runtime!(
 	pub enum Runtime
@@ -690,6 +769,13 @@ construct_runtime!(
 
 		// The main stage.
 		Broker: pallet_broker = 50,
+
+		// The parachain control plane. Indices match Polkadot's so both networks encode the
+		// same bytes; see `para_control`.
+		RegistrarPara: pallet_registrar_para = 60,
+		HrmpPara: pallet_hrmp_para = 61,
+
+		CtMigrator: pallet_ct_migrator = 100,
 	}
 );
 

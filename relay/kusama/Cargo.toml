@@ -12,6 +12,12 @@ version.workspace = true
 
 # Asset Hub Migration concerning deps
 pallet-rc-migrator = { workspace = true }
+migrator-types = { workspace = true }
+pallet-rc2-migrator = { workspace = true }
+pallet-registrar-relay = { workspace = true }
+pallet-hrmp-relay = { workspace = true }
+registrar-primitives = { workspace = true }
+hrmp-primitives = { workspace = true }
 # End: Asset Hub Migration concerning deps
 
 codec = { features = ["derive", "max-encoded-len"], workspace = true }
@@ -131,6 +137,12 @@ default = ["std"]
 no_std = []
 kusama-ahm = ["pallet-rc-migrator/kusama-ahm"]
 std = [
+	"migrator-types/std",
+	"pallet-rc2-migrator/std",
+	"pallet-registrar-relay/std",
+	"pallet-hrmp-relay/std",
+	"registrar-primitives/std",
+	"hrmp-primitives/std",
 	"authority-discovery-primitives/std",
 	"babe-primitives/std",
 	"beefy-primitives/std",
@@ -229,6 +241,9 @@ std = [
 	"xcm/std",
 ]
 runtime-benchmarks = [
+	"pallet-rc2-migrator/runtime-benchmarks",
+	"registrar-primitives/runtime-benchmarks",
+	"hrmp-primitives/runtime-benchmarks",
 	"frame-benchmarking/runtime-benchmarks",
 	"frame-election-provider-support/runtime-benchmarks",
 	"frame-support/runtime-benchmarks",
@@ -290,6 +305,9 @@ runtime-benchmarks = [
 	"xcm/runtime-benchmarks",
 ]
 try-runtime = [
+	"pallet-rc2-migrator/try-runtime",
+	"pallet-registrar-relay/try-runtime",
+	"pallet-hrmp-relay/try-runtime",
 	"frame-election-provider-support/try-runtime",
 	"frame-executive/try-runtime",
 	"frame-support/try-runtime",

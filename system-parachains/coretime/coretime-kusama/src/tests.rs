@@ -278,3 +278,106 @@ fn governance_authorize_upgrade_works() {
 		RuntimeOrigin,
 	>(GovernanceOrigin::Location(AssetHubLocation::get())));
 }
+
+/// A migrated `ParaRegistration` proxy keeps the scope it had on the relay chain — no more, no
+/// less.
+///
+/// The migration's promise about proxies is that a delegate's authority is preserved, not
+/// reinterpreted. Widening this set escalates every proxy that migrated under the old scope;
+/// narrowing it (it allowed nothing at all until the registrar pallet landed here) silently
+/// strands every para manager who registers through a delegate.
+#[test]
+fn para_registration_proxies_keep_their_relay_chain_scope() {
+	use frame_support::traits::InstanceFilter;
+
+	let reserve = RuntimeCall::RegistrarPara(pallet_registrar_para::Call::reserve {});
+	let register = RuntimeCall::RegistrarPara(pallet_registrar_para::Call::register {
+		para_id: 2000,
+		genesis_head: vec![1, 2, 3],
+		code_len: 42,
+		code_hash: sp_core::H256::repeat_byte(1),
+	});
+	let batch = RuntimeCall::Utility(pallet_utility::Call::batch { calls: vec![reserve.clone()] });
+	let remove_proxy = RuntimeCall::Proxy(pallet_proxy::Call::remove_proxy {
+		delegate: sp_runtime::MultiAddress::Id(ALICE.into()),
+		proxy_type: ProxyType::ParaRegistration,
+		delay: 0,
+	});
+
+	for call in [&reserve, &register, &batch, &remove_proxy] {
+		assert!(
+			ProxyType::ParaRegistration.filter(call),
+			"a registration proxy must still be able to {call:?}"
+		);
+	}
+
+	// And nothing beyond it. A registration proxy may create a para, never dispose of one or
+	// change one that exists — the same asymmetry the relay chain has.
+	let deregister = RuntimeCall::RegistrarPara(pallet_registrar_para::Call::deregister {
+		para_id: 2000,
+	});
+	let add_lock =
+		RuntimeCall::RegistrarPara(pallet_registrar_para::Call::add_lock { para_id: 2000 });
+	let transfer = RuntimeCall::Balances(pallet_balances::Call::transfer_allow_death {
+		dest: sp_runtime::MultiAddress::Id(ALICE.into()),
+		value: 1,
+	});
+
+	for call in [&deregister, &add_lock, &transfer] {
+		assert!(
+			!ProxyType::ParaRegistration.filter(call),
+			"a registration proxy must not be able to {call:?}"
+		);
+	}
+}
+
+/// The parachain control plane stays inert until the migration has handed it the relay chain's
+/// state.
+///
+/// This is not tidiness. Before the migration runs, `Paras` here is empty and `NextFreeParaId` is
+/// 0, so `reserve` would hand out `FirstPublicParaId` — a parachain that is alive on the relay
+/// chain. Whoever took it would park the real one, which arrives later to find its id occupied,
+/// and the Coretime deposit is around a hundredth of the relay chain's, so doing it in bulk is
+/// cheap. The gate is what makes the window not exist.
+#[test]
+fn the_para_control_plane_is_inert_until_the_migration_finishes() {
+	use frame_support::traits::Contains;
+	use pallet_ct_migrator::{CtMigrationStage, MigrationStage};
+
+	let reserve = RuntimeCall::RegistrarPara(pallet_registrar_para::Call::reserve {});
+	let open_channel = RuntimeCall::HrmpPara(pallet_hrmp_para::Call::open_channel {
+		sender: 2000,
+		recipient: 2001,
+		max_capacity: 8,
+		max_message_size: 1024,
+	});
+	// An unrelated call, to show the gate is scoped to these two pallets and not a global freeze.
+	let unrelated = RuntimeCall::System(frame_system::Call::remark { remark: vec![1] });
+
+	ExtBuilder::<Runtime>::default().build().execute_with(|| {
+		type Filter = <Runtime as frame_system::Config>::BaseCallFilter;
+
+		for stage in [MigrationStage::Pending, MigrationStage::DataMigrationOngoing] {
+			CtMigrationStage::<Runtime>::put(stage.clone());
+			assert!(!Filter::contains(&reserve), "reserve must be inert at {stage:?}");
+			assert!(!Filter::contains(&open_channel), "open_channel must be inert at {stage:?}");
+			assert!(Filter::contains(&unrelated), "the gate must not freeze the whole chain");
+		}
+
+		// Once the state is here, the pallets serve users.
+		CtMigrationStage::<Runtime>::put(MigrationStage::MigrationDone);
+		assert!(Filter::contains(&reserve));
+		assert!(Filter::contains(&open_channel));
+	});
+}
+
+/// The relay chain encodes this chain's calls by hand, as pallet index + call index, using the
+/// same numbers on both networks. See the mirror of this test on the relay side.
+#[test]
+fn the_control_plane_pallets_sit_where_the_relay_chain_expects() {
+	use frame_support::traits::PalletInfo;
+
+	type Info = <Runtime as frame_system::Config>::PalletInfo;
+	assert_eq!(Info::index::<crate::RegistrarPara>(), Some(60));
+	assert_eq!(Info::index::<crate::HrmpPara>(), Some(61));
+}
