@@ -12440,6 +12440,7 @@ dependencies = [
  "pallet-registrar-para",
  "pallet-registrar-relay",
  "pallet-session",
+ "pallet-society",
  "pallet-xcm",
  "parity-scale-codec",
  "polkadot-primitives",
@@ -12454,6 +12455,7 @@ dependencies = [
  "sp-runtime 48.0.0",
  "sp-storage 25.0.0",
  "sp-tracing",
+ "staging-kusama-runtime",
  "staging-xcm",
  "tokio",
 ]

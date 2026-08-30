@@ -44,4 +44,6 @@ xcm = { workspace = true, default-features = true }
 asset-hub-polkadot-runtime = { workspace = true, default-features = true }
 coretime-polkadot-runtime = { workspace = true, default-features = true }
 polkadot-runtime = { workspace = true, default-features = true }
+kusama-runtime = { workspace = true, default-features = true }
+pallet-society = { workspace = true, default-features = true }
 polkadot-runtime-constants = { workspace = true, default-features = true }

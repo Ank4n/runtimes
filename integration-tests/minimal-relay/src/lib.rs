@@ -25,5 +25,6 @@
 #![cfg(test)]
 
 pub mod events;
+pub mod kusama_probe;
 pub mod mock;
 pub mod tests;
