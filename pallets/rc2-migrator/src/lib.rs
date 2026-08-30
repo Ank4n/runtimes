@@ -40,7 +40,7 @@ use frame_support::{
 	defensive,
 	pallet_prelude::*,
 	traits::{
-		fungible::{Inspect, Mutate},
+		fungible::{Inspect, Mutate, Unbalanced},
 		ReservableCurrency,
 	},
 };
@@ -82,6 +82,24 @@ pub const MAX_TELEPORTS_PER_XCM: u32 = 40;
 /// How long the migration parks in `CoolOff` for manual verification before finishing.
 pub const COOL_OFF_BLOCKS: u32 = 10;
 
+/// The expected composition of one account's reserved balance. See `ExpectedReserves`.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, Copy, Default, PartialEq, Eq, Debug, TypeInfo,
+	MaxEncodedLen,
+)]
+pub struct ExpectedReserve {
+	/// Continues on the Coretime chain as an `UnnamedReserve` hold: registrar deposits recorded
+	/// for the account as manager, HRMP channel and request deposits recorded for it as (child)
+	/// para sovereign.
+	pub ct: u128,
+	/// Continues on the Coretime chain as a `ProxyDeposit` hold (resized when the definitions
+	/// arrive): proxy deposits of delegators with at least one portable definition.
+	pub proxy: u128,
+	/// Released and teleported to Asset Hub as free balance: deposits whose purpose ends with
+	/// this chain (untranslatable proxy sets, multisig operations, announcements).
+	pub refund: u128,
+}
+
 /// Progress of the migration. Advanced by `on_initialize`.
 #[derive(Encode, Decode, DecodeWithMemTracking, Clone, Default, PartialEq, Eq, Debug, TypeInfo)]
 pub enum MigrationStage<AccountId, BlockNumber> {
@@ -116,9 +134,14 @@ pub enum MigrationStage<AccountId, BlockNumber> {
 		last_key: Option<HrmpChannelId>,
 	},
 	HrmpDone,
-	/// Empty the configured leftover pots (old treasury, …) and reap below-ED dust; everything
-	/// teleports to `Config::SweepBeneficiary` on Asset Hub.
+	/// Empty the configured leftover pots (old treasury, …); the proceeds teleport to
+	/// `Config::SweepBeneficiary` on Asset Hub.
 	Sweep,
+	/// Reap below-ED dust and stale husks, cursored like the data stages — the accounts stage
+	/// deliberately leaves every below-ED record behind, so this walks most of the account map.
+	SweepDust {
+		last_key: Option<AccountId>,
+	},
 	/// Burn the audited amount of issuance that no account holds (see `Config::TiCorrection`).
 	TiCorrection,
 	/// All data sent; waiting for manual verification before finishing.
@@ -295,30 +318,16 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances<u128>, ValueQuery>;
 
-	/// How much reserved balance each account is expected to carry to the Coretime chain:
-	/// the registrar deposits recorded for it as manager plus the HRMP channel deposits recorded
-	/// for it as (child) para sovereign. Built by `AccountsInit` from the owning pallets' state —
-	/// the recorded deposit fields are the routing source of truth, the anonymous reserves are
-	/// only trusted up to this amount.
+	/// What each account's reserved balance is expected to be made of, built by `AccountsInit`
+	/// from the owning pallets' recorded deposit fields. The recorded fields are the routing
+	/// source of truth; the anonymous reserves are only trusted up to these amounts, and anything
+	/// beyond them travels as an unattributed hold, parked at the destination.
+	///
+	/// One record per account rather than one map per kind: the three amounts are always built
+	/// together and always read together in the withdrawal split.
 	#[pallet::storage]
-	pub type ExpectedCtReserve<T: Config> =
-		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
-
-	/// How much reserved balance each account carries to the Coretime chain as a
-	/// [`PortableHoldReason::ProxyDeposit`] hold: the proxy deposits of delegators with at least
-	/// one portable definition. Resized on the Coretime chain when the definitions arrive. Built
-	/// by `AccountsInit` like [`ExpectedCtReserve`].
-	#[pallet::storage]
-	pub type ExpectedProxyReserve<T: Config> =
-		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
-
-	/// How much reserved balance each account gets *refunded* (released and teleported to Asset
-	/// Hub as free): the proxy deposits of delegators none of whose definitions travel — nothing
-	/// is recreated, so the deposit's purpose ends here. Built by `AccountsInit` like
-	/// [`ExpectedCtReserve`].
-	#[pallet::storage]
-	pub type ExpectedRefundReserve<T: Config> =
-		StorageMap<_, Twox64Concat, T::AccountId, u128, ValueQuery>;
+	pub type ExpectedReserves<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, ExpectedReserve, ValueQuery>;
 
 	#[pallet::error]
 	pub enum Error<T> {
@@ -443,21 +452,30 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::AccountsInit => {
-					// Before anything is measured: drop every preimage deposit, so accounts that
-					// hold one are not skipped by `can_migrate`.
-					accounts::AccountsMigrator::<T>::release_preimage_deposits();
-					let total_issuance = <T as Config>::Currency::total_issuance();
-					RcMigratedBalance::<T>::put(MigratedBalances {
-						kept: total_issuance,
-						..Default::default()
-					});
-					let indexed = accounts::AccountsMigrator::<T>::build_expected_reserves();
-					log::info!(
-						target: LOG_TARGET,
-						"Indexed expected reserves from {indexed} records"
+					// Same rollback-and-retry discipline as every other one-shot stage, so a
+					// fallible step added here later inherits it instead of silently lacking it.
+					Self::migrate_stage_once(
+						|| {
+							// Before anything is measured: drop every preimage deposit, so
+							// accounts that hold one are not skipped by `can_migrate`.
+							accounts::AccountsMigrator::<T>::release_preimage_deposits();
+							let total_issuance = <T as Config>::Currency::total_issuance();
+							RcMigratedBalance::<T>::put(MigratedBalances {
+								kept: total_issuance,
+								..Default::default()
+							});
+							let indexed =
+								accounts::AccountsMigrator::<T>::build_expected_reserves();
+							log::info!(
+								target: LOG_TARGET,
+								"Indexed expected reserves from {indexed} records"
+							);
+							Ok(())
+						},
+						MigrationStage::AccountsOngoing { last_key: None },
 					);
-					Self::transition(MigrationStage::AccountsOngoing { last_key: None });
-					T::DbWeight::get().reads_writes(2, 2)
+					// Full scans of the deposit-owning maps plus the preimage sweep.
+					Self::placeholder_weight(MAX_RECORDS_PER_BLOCK)
 				},
 				MigrationStage::AccountsOngoing { last_key } => {
 					// All of this block's withdrawals commit or roll back together, so a failed
@@ -469,6 +487,9 @@ pub mod pallet {
 					);
 					Self::placeholder_weight(MAX_ACCOUNTS_PER_BLOCK)
 				},
+				// The `*Done` stages are one-block checkpoints rather than direct `*Init`
+				// transitions: each boundary is a visible `StageTransition` event the migration
+				// monitor keys on, and a clean force-set target for rewinding a single stage.
 				MigrationStage::AccountsDone => {
 					Self::transition(MigrationStage::ProxyInit);
 					T::DbWeight::get().reads_writes(1, 1)
@@ -531,9 +552,19 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::Sweep => {
-					Self::migrate_stage_once(Self::sweep_leftovers, MigrationStage::TiCorrection);
-					// Placeholder: iterates every remaining account once for the dust pass.
-					T::DbWeight::get().reads_writes(10_000, 500)
+					Self::migrate_stage_once(
+						Self::sweep_pots,
+						MigrationStage::SweepDust { last_key: None },
+					);
+					T::DbWeight::get().reads_writes(10, 10)
+				},
+				MigrationStage::SweepDust { last_key } => {
+					Self::migrate_stage_step(
+						|| Self::sweep_dust(last_key),
+						MigrationStage::TiCorrection,
+						|last_key| MigrationStage::SweepDust { last_key: Some(last_key) },
+					);
+					Self::placeholder_weight(MAX_ACCOUNTS_PER_BLOCK)
 				},
 				MigrationStage::TiCorrection => {
 					Self::migrate_stage_once(
@@ -584,12 +615,13 @@ pub mod pallet {
 		}
 
 		/// One block of a record-drain stage: pull `(key, record)` pairs from `iter`, convert and
-		/// remove each via `drain`, flush batches of [`MAX_RECORDS_PER_XCM`] through `send`, and
-		/// stop after [`MAX_RECORDS_PER_BLOCK`] records. Returns the cursor to continue from, or
-		/// `None` once the map is exhausted.
+		/// remove each via `drain` (`Ok(None)` handles a record entirely locally, with nothing to
+		/// send; an `Err` aborts the block for the caller's rollback), flush batches of
+		/// [`MAX_RECORDS_PER_XCM`] through `send`, and stop after [`MAX_RECORDS_PER_BLOCK`]
+		/// records. Returns the cursor to continue from, or `None` once the map is exhausted.
 		pub(crate) fn drain_records<K, V, P>(
 			mut iter: impl Iterator<Item = (K, V)>,
-			mut drain: impl FnMut(&K, V) -> P,
+			mut drain: impl FnMut(&K, V) -> Result<Option<P>, Error<T>>,
 			send: impl Fn(Vec<P>) -> Result<(), Error<T>>,
 		) -> Result<Option<K>, Error<T>> {
 			let mut batch = Vec::new();
@@ -597,7 +629,9 @@ pub mod pallet {
 			let maybe_last_key = loop {
 				let Some((key, record)) = iter.next() else { break None };
 				processed += 1;
-				batch.push(drain(&key, record));
+				if let Some(payload) = drain(&key, record)? {
+					batch.push(payload);
+				}
 
 				if batch.len() >= MAX_RECORDS_PER_XCM as usize {
 					send(core::mem::take(&mut batch))?;
@@ -677,9 +711,9 @@ pub mod pallet {
 			Self::send_to_ct(CtMigratorCall::FinishMigration { rc_kept, rc_migrated })
 		}
 
-		/// Empty the configured leftover pots and reap below-ED dust; teleport the proceeds to
-		/// the sweep beneficiary on Asset Hub.
-		fn sweep_leftovers() -> Result<(), Error<T>> {
+		/// Empty the configured leftover pots; teleport the proceeds to the sweep beneficiary
+		/// on Asset Hub. One-shot: the pot list is a short config item.
+		fn sweep_pots() -> Result<(), Error<T>> {
 			use frame_support::traits::tokens::{Fortitude, Precision, Preservation};
 			let mut total: u128 = 0;
 
@@ -698,69 +732,91 @@ pub mod pallet {
 				)
 				.map_err(|_| Error::<T>::FailedToWithdrawAccount)?;
 				// Pot balances book-kept as inactive issuance (the treasury) must reactivate on
-				// leaving so the issuance accounting stays consistent. Applied saturating to
-				// every pot: a pot that was never deactivated just floors the counter toward
-				// its true end state — zero, since no pot survives the sweep.
-				pallet_balances::InactiveIssuance::<T>::mutate(|i| *i = i.saturating_sub(burned));
+				// leaving so the issuance accounting stays consistent. Applied to every pot: one
+				// that was never deactivated just floors the counter (reactivate saturates)
+				// toward its true end state — zero, since no pot survives the sweep.
+				<pallet_balances::Pallet<T> as Unbalanced<T::AccountId>>::reactivate(burned);
 				total = total.checked_add(burned).ok_or(Error::<T>::BalanceAccounting)?;
 				Self::deposit_event(Event::AccountSwept { who, amount: burned });
 			}
+			Self::book_and_teleport_swept(total)
+		}
 
-			// Below-ED dust: below the existential deposit nothing meaningful can still be
-			// backed by the balance on a retiring chain, so any hold or reserve is killed —
-			// including the consumer reference the backing carried — and the account zeroed.
-			// The fungible APIs refuse to touch referenced or held-against accounts, hence the
-			// direct write (same pattern as the accounts-stage shell drain). Zero-balance
-			// provider-ref husks are reaped along the way. A record survives only while
-			// something still references it (session key-holders being the known case) or it
-			// is a module account.
+		/// One block of the dust pass: reap below-ED accounts and stale husks from the cursor
+		/// on, teleporting the block's proceeds. Returns the cursor to continue from, or `None`
+		/// once the account map is exhausted.
+		///
+		/// Below the existential deposit nothing meaningful can still be backed by the balance
+		/// on a retiring chain, so any hold or reserve is killed — including the consumer
+		/// reference the backing carried — and the account zeroed. The fungible APIs refuse to
+		/// touch referenced or held-against accounts, hence the direct write (same pattern as
+		/// the accounts-stage shell drain). A record survives only while something still
+		/// references it (session key-holders being the known case) or it is a module account.
+		fn sweep_dust(last_key: Option<T::AccountId>) -> Result<Option<T::AccountId>, Error<T>> {
+			let mut iter = match &last_key {
+				Some(last_key) => frame_system::Account::<T>::iter_from_key(last_key.clone()),
+				None => frame_system::Account::<T>::iter(),
+			};
+
 			let (mut dust_count, mut dust_amount, mut husk_count) = (0u32, 0u128, 0u32);
 			let ed = <T as Config>::Currency::minimum_balance();
-			for (who, info) in frame_system::Account::<T>::iter() {
+			let mut processed = 0u32;
+			let maybe_last_key = loop {
+				let Some((who, info)) = iter.next() else { break None };
+				processed += 1;
+				let cursor = who.clone();
+
 				let d = &info.data;
 				let amount = d.free.saturating_add(d.reserved);
-				let bytes: &[u8] = who.as_ref();
-				if amount >= ed || bytes.starts_with(b"modl") {
-					continue;
-				}
-				if amount == 0 {
-					// A husk: exists only via a stale provider reference. `dec_providers`
-					// refuses whenever something still references the account.
-					if info.consumers == 0 &&
-						frame_system::Pallet::<T>::dec_providers(&who).is_ok()
-					{
-						husk_count += 1;
+				if amount < ed && !accounts::AccountsMigrator::<T>::is_unmigrated(&who) {
+					if amount == 0 {
+						// A husk: exists only via a stale provider reference. `dec_providers`
+						// refuses whenever something still references the account.
+						if info.consumers == 0 &&
+							frame_system::Pallet::<T>::dec_providers(&who).is_ok()
+						{
+							husk_count += 1;
+						}
+					} else {
+						let holds = pallet_balances::Holds::<T>::take(&who);
+						let backed = !d.reserved.is_zero() || !holds.is_empty();
+						frame_system::Account::<T>::mutate(&who, |a| {
+							a.data.free = 0;
+							a.data.reserved = 0;
+						});
+						pallet_balances::TotalIssuance::<T>::mutate(|ti| {
+							*ti = ti.saturating_sub(amount)
+						});
+						// Reserves and holds collectively carry one consumer reference; killing
+						// the backing drops it, so the record does not survive as a stale-ref
+						// shell.
+						if backed && info.consumers > 0 {
+							frame_system::Pallet::<T>::dec_consumers(&who);
+						}
+						let _ = frame_system::Pallet::<T>::dec_providers(&who);
+						dust_count += 1;
+						dust_amount = dust_amount
+							.checked_add(amount)
+							.ok_or(Error::<T>::BalanceAccounting)?;
 					}
-					continue;
 				}
-				let backed = !d.reserved.is_zero() ||
-					!pallet_balances::Holds::<T>::get(&who).is_empty();
-				pallet_balances::Holds::<T>::remove(&who);
-				frame_system::Account::<T>::mutate(&who, |a| {
-					a.data.free = 0;
-					a.data.reserved = 0;
-				});
-				pallet_balances::TotalIssuance::<T>::mutate(|ti| {
-					*ti = ti.saturating_sub(amount)
-				});
-				// Reserves and holds collectively carry one consumer reference; killing the
-				// backing drops it, so the record does not survive as a stale-ref shell.
-				if backed && info.consumers > 0 {
-					frame_system::Pallet::<T>::dec_consumers(&who);
+
+				if processed >= MAX_ACCOUNTS_PER_BLOCK {
+					break Some(cursor);
 				}
-				let _ = frame_system::Pallet::<T>::dec_providers(&who);
-				dust_count += 1;
-				dust_amount =
-					dust_amount.checked_add(amount).ok_or(Error::<T>::BalanceAccounting)?;
-			}
+			};
 			if husk_count > 0 {
 				Self::deposit_event(Event::HusksReaped { count: husk_count });
 			}
 			if dust_count > 0 {
-				total = total.checked_add(dust_amount).ok_or(Error::<T>::BalanceAccounting)?;
 				Self::deposit_event(Event::DustSwept { count: dust_count, amount: dust_amount });
 			}
+			Self::book_and_teleport_swept(dust_amount)?;
+			Ok(maybe_last_key)
+		}
 
+		/// Book `total` swept out of the kept balance and teleport it to the sweep beneficiary.
+		fn book_and_teleport_swept(total: u128) -> Result<(), Error<T>> {
 			if total == 0 {
 				return Ok(());
 			}

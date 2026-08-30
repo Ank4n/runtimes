@@ -25,7 +25,10 @@
 //! - The ingress/egress indexes are not migrated.
 
 use crate::*;
-use runtime_parachains::hrmp::HrmpChannels;
+use runtime_parachains::hrmp::{
+	HrmpAcceptedChannelRequestCount, HrmpChannels, HrmpOpenChannelRequestCount,
+	HrmpOpenChannelRequests, HrmpOpenChannelRequestsList,
+};
 
 pub struct HrmpMigrator<T>(PhantomData<T>);
 
@@ -36,11 +39,6 @@ impl<T: Config> HrmpMigrator<T> {
 	/// One-shot, called by `HrmpInit`; the request count is small (dozens). The caller wraps
 	/// this in a storage transaction so a failed send rolls everything back for a retry.
 	pub fn drain_open_requests() -> Result<(), Error<T>> {
-		use runtime_parachains::hrmp::{
-			HrmpAcceptedChannelRequestCount, HrmpOpenChannelRequestCount, HrmpOpenChannelRequests,
-			HrmpOpenChannelRequestsList,
-		};
-
 		let mut batch = Vec::new();
 		for id in HrmpOpenChannelRequestsList::<T>::take() {
 			if let Some(request) = HrmpOpenChannelRequests::<T>::take(&id) {
@@ -59,8 +57,9 @@ impl<T: Config> HrmpMigrator<T> {
 		let _ = HrmpAcceptedChannelRequestCount::<T>::clear(u32::MAX, None);
 
 		let count = batch.len() as u32;
-		for chunk in batch.chunks(MAX_RECORDS_PER_XCM as usize) {
-			Pallet::<T>::send_hrmp_requests(chunk.to_vec())?;
+		while !batch.is_empty() {
+			let rest = batch.split_off(batch.len().min(MAX_RECORDS_PER_XCM as usize));
+			Pallet::<T>::send_hrmp_requests(core::mem::replace(&mut batch, rest))?;
 		}
 		Pallet::<T>::deposit_event(Event::HrmpRequestsSent { count });
 		Ok(())
@@ -75,8 +74,7 @@ impl<T: Config> HrmpMigrator<T> {
 		last_key: Option<HrmpChannelId>,
 	) -> Result<Option<HrmpChannelId>, Error<T>> {
 		let iter = match &last_key {
-			Some(last_key) =>
-				HrmpChannels::<T>::iter_from(HrmpChannels::<T>::hashed_key_for(last_key)),
+			Some(last_key) => HrmpChannels::<T>::iter_from_key(last_key),
 			None => HrmpChannels::<T>::iter(),
 		};
 
@@ -84,7 +82,7 @@ impl<T: Config> HrmpMigrator<T> {
 			iter,
 			|channel_id, channel| {
 				HrmpChannels::<T>::remove(channel_id);
-				PortableHrmpChannel {
+				Ok(Some(PortableHrmpChannel {
 					sender: channel_id.sender.into(),
 					recipient: channel_id.recipient.into(),
 					max_capacity: channel.max_capacity,
@@ -92,7 +90,7 @@ impl<T: Config> HrmpMigrator<T> {
 					max_message_size: channel.max_message_size,
 					sender_deposit: channel.sender_deposit,
 					recipient_deposit: channel.recipient_deposit,
-				}
+				}))
 			},
 			Pallet::<T>::send_hrmp,
 		)

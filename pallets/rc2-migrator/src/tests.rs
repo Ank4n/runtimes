@@ -100,14 +100,14 @@ fn build_expected_reserves_indexes_every_deposit_source() {
 		// portable proxy deposits travel under their own reason, everything whose purpose ends
 		// with this chain is refunded.
 		assert_eq!(records, 8, "para + channel + request + 3 proxies + multisig + announcement");
-		assert_eq!(ExpectedCtReserve::<Test>::get(&alice), 300);
-		assert_eq!(ExpectedCtReserve::<Test>::get(child_sov(2000)), 70 + 25);
-		assert_eq!(ExpectedCtReserve::<Test>::get(child_sov(2001)), 30);
-		assert_eq!(ExpectedProxyReserve::<Test>::get(&bob), 44);
-		assert_eq!(ExpectedProxyReserve::<Test>::get(&frank), 44);
-		assert_eq!(ExpectedRefundReserve::<Test>::get(&carol), 44);
-		assert_eq!(ExpectedRefundReserve::<Test>::get(&dave), 40);
-		assert_eq!(ExpectedRefundReserve::<Test>::get(&eve), 31);
+		assert_eq!(ExpectedReserves::<Test>::get(&alice).ct, 300);
+		assert_eq!(ExpectedReserves::<Test>::get(child_sov(2000)).ct, 70 + 25);
+		assert_eq!(ExpectedReserves::<Test>::get(child_sov(2001)).ct, 30);
+		assert_eq!(ExpectedReserves::<Test>::get(&bob).proxy, 44);
+		assert_eq!(ExpectedReserves::<Test>::get(&frank).proxy, 44);
+		assert_eq!(ExpectedReserves::<Test>::get(&carol).refund, 44);
+		assert_eq!(ExpectedReserves::<Test>::get(&dave).refund, 40);
+		assert_eq!(ExpectedReserves::<Test>::get(&eve).refund, 31);
 	});
 }
 
@@ -191,9 +191,10 @@ fn withdraw_attributes_shortfall_in_priority_order() {
 		<Balances as ReservableCurrency<AccountId32>>::reserve(&dave, 100).unwrap();
 		// Recorded expectations exceed the live 100: CT-bound deposits are made whole first,
 		// proxy deposits second, refunds last. (Set directly: only the split math is under test.)
-		ExpectedCtReserve::<Test>::insert(&dave, 50);
-		ExpectedProxyReserve::<Test>::insert(&dave, 30);
-		ExpectedRefundReserve::<Test>::insert(&dave, 40);
+		ExpectedReserves::<Test>::insert(
+			&dave,
+			ExpectedReserve { ct: 50, proxy: 30, refund: 40 },
+		);
 
 		let w = withdraw(&dave).expect("migrates");
 
@@ -249,7 +250,7 @@ fn withdraw_keeps_sub_ah_ed_dust_with_the_deposit() {
 		let heidi = acc(8); // deposit holder whose teleport remainder would be below AH's ED
 		fund(&heidi, 404);
 		<Balances as ReservableCurrency<AccountId32>>::reserve(&heidi, 300).unwrap();
-		ExpectedCtReserve::<Test>::insert(&heidi, 300);
+		ExpectedReserves::<Test>::insert(&heidi, ExpectedReserve { ct: 300, ..Default::default() });
 
 		let w = withdraw(&heidi).expect("migrates");
 
@@ -292,7 +293,7 @@ fn withdraw_drains_consumer_referenced_accounts_to_shells() {
 		let ida = acc(11); // validator-like account: session keys hold a consumer reference
 		fund(&ida, 1_000);
 		<Balances as ReservableCurrency<AccountId32>>::reserve(&ida, 300).unwrap();
-		ExpectedCtReserve::<Test>::insert(&ida, 300);
+		ExpectedReserves::<Test>::insert(&ida, ExpectedReserve { ct: 300, ..Default::default() });
 		// The extra reference some pallet (session keys in production) holds on the account.
 		frame_system::Pallet::<Test>::inc_consumers(&ida).unwrap();
 		let ti_before = total_issuance();
@@ -549,7 +550,7 @@ fn announcement_records_of_migrated_announcers_are_dropped() {
 		);
 		AccountsMigrator::<Test>::build_expected_reserves();
 		// Announcement deposits are refunds: they teleport to AH with the announcer's balance.
-		assert_eq!(ExpectedRefundReserve::<Test>::get(&eve), 31);
+		assert_eq!(ExpectedReserves::<Test>::get(&eve).refund, 31);
 		seed_tracker();
 		migrator_types::with_rollback(|| AccountsMigrator::<Test>::migrate_many(None)).unwrap();
 		assert!(!frame_system::Account::<Test>::contains_key(&eve));
@@ -593,7 +594,7 @@ fn registrar_stage_moves_next_free_id_and_drains_records() {
 					para_id: 2000,
 					manager: alice,
 					deposit: 300,
-					locked: None,
+					locked: false,
 					// The test para has a registrar record but was never onboarded, so it has no
 					// lifecycle and no head data — it travels as a reserved id.
 					registered: false,
@@ -684,6 +685,10 @@ fn sweep_empties_pots_reaps_dust_and_teleports_to_the_beneficiary() {
 
 		assert_ok!(Rc2Migrator::force_set_stage(root(), Stage::Sweep));
 		migrator_events();
+		// Pots and dust are separate stages: one block empties the pots, the next pages the
+		// dust (everything here fits one page), and the machine lands on TiCorrection.
+		run_block();
+		assert_eq!(RcMigrationStage::<Test>::get(), Stage::SweepDust { last_key: None });
 		run_block();
 
 		assert_eq!(RcMigrationStage::<Test>::get(), Stage::TiCorrection);
@@ -700,9 +705,12 @@ fn sweep_empties_pots_reaps_dust_and_teleports_to_the_beneficiary() {
 		assert!(events.contains(&Event::DustSwept { count: 2, amount: 4 + 5 }));
 		assert!(events.contains(&Event::HusksReaped { count: 1 }));
 
-		// Everything swept teleports to the beneficiary in one message, and the ledger moves
-		// with it.
-		assert_eq!(decode_teleports(&take_sent_xcm()), vec![vec![(acc(200), 509)]]);
+		// Each stage teleports its own proceeds — the pots (500), then the dust page (4 + 5) —
+		// and the ledger moves with them.
+		assert_eq!(
+			decode_teleports(&take_sent_xcm()),
+			vec![vec![(acc(200), 500)], vec![(acc(200), 9)]]
+		);
 		let tracker = RcMigratedBalance::<Test>::get();
 		assert_eq!(tracker.ah_free, 509);
 		assert_eq!(total_issuance(), tracker.kept);
@@ -802,9 +810,10 @@ fn full_stage_machine_drains_the_chain_to_zero() {
 			run_block();
 		}
 
-		// THEN it finishes on schedule: 15 working blocks + the cool-off window.
+		// THEN it finishes on schedule: 16 working blocks (the dust pass is its own stage) +
+		// the cool-off window.
 		assert_eq!(RcMigrationStage::<Test>::get(), Stage::MigrationDone);
-		assert_eq!(System::block_number(), 16 + COOL_OFF_BLOCKS);
+		assert_eq!(System::block_number(), 17 + COOL_OFF_BLOCKS);
 
 		// Every record is drained...
 		assert!(paras_registrar::Paras::<Test>::iter().next().is_none());

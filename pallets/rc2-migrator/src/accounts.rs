@@ -81,21 +81,18 @@ impl<T: Config> AccountsMigrator<T> {
 	/// Called once by `AccountsInit`. Returns the number of records indexed.
 	pub fn build_expected_reserves() -> u32 {
 		let mut records = 0u32;
-		let add_ct = |who: T::AccountId, amount: u128| {
+		// One record per account; `slot` picks which expectation the amount accrues to.
+		let add = |who: T::AccountId, amount: u128, slot: fn(&mut ExpectedReserve) -> &mut u128| {
 			if !amount.is_zero() {
-				ExpectedCtReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
+				ExpectedReserves::<T>::mutate(&who, |e| {
+					let v = slot(e);
+					*v = v.saturating_add(amount);
+				});
 			}
 		};
-		let add_proxy = |who: T::AccountId, amount: u128| {
-			if !amount.is_zero() {
-				ExpectedProxyReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
-			}
-		};
-		let add_refund = |who: T::AccountId, amount: u128| {
-			if !amount.is_zero() {
-				ExpectedRefundReserve::<T>::mutate(&who, |v| *v = v.saturating_add(amount));
-			}
-		};
+		let add_ct = |who, amount| add(who, amount, |e| &mut e.ct);
+		let add_proxy = |who, amount| add(who, amount, |e| &mut e.proxy);
+		let add_refund = |who, amount| add(who, amount, |e| &mut e.refund);
 
 		for (_, info) in paras_registrar::Paras::<T>::iter() {
 			add_ct(info.manager, info.deposit);
@@ -141,13 +138,10 @@ impl<T: Config> AccountsMigrator<T> {
 
 	/// The account id under which `who`'s balances continue on the destination chains.
 	///
-	/// Child para sovereigns become sibling sovereigns (the same para as seen from a sibling
-	/// parachain); everyone else keeps their address.
+	/// Thin alias for [`migrator_types::translate_destination`], where the rule lives as part of
+	/// the wire contract.
 	pub fn translate_destination(who: &T::AccountId) -> AccountId32 {
-		match ParaId::try_from_account(who) {
-			Some(para_id) => migrator_types::sibling_account(para_id.into()),
-			None => who.clone(),
-		}
+		migrator_types::translate_destination(who)
 	}
 
 	/// Migrate accounts until the per-block limit is reached.
@@ -245,14 +239,10 @@ impl<T: Config> AccountsMigrator<T> {
 		// when no definition travels). Anything beyond is money whose origin is unknown (a true
 		// anomaly): it travels too — nothing stays behind — but under its own hold reason, parked
 		// at the destination for investigation.
-		let (expected_ct, expected_proxy, expected_refund) = if reserved.is_zero() {
-			(0, 0, 0)
+		let expected = if reserved.is_zero() {
+			ExpectedReserve::default()
 		} else {
-			(
-				ExpectedCtReserve::<T>::get(who),
-				ExpectedProxyReserve::<T>::get(who),
-				ExpectedRefundReserve::<T>::get(who),
-			)
+			ExpectedReserves::<T>::get(who)
 		};
 
 		// A reserve is supposed to be backed by a consumer reference; accounts where it is not
@@ -315,12 +305,18 @@ impl<T: Config> AccountsMigrator<T> {
 		// Exception: a never-signed delegator granting an `Any` proxy is (or must be treated as)
 		// a keyless pure proxy. Its delegate keeps full control only on the Coretime chain, where
 		// the proxy stage recreates the definitions, so ALL of its liquid balance goes there.
-		let ct_hold = reserved.min(expected_ct);
-		let proxy_hold = reserved.saturating_sub(ct_hold).min(expected_proxy);
-		let refunded =
-			reserved.saturating_sub(ct_hold).saturating_sub(proxy_hold).min(expected_refund);
-		let unattributed =
-			reserved.saturating_sub(ct_hold).saturating_sub(proxy_hold).saturating_sub(refunded);
+		// Priority order of the split: CT deposits, then proxy deposits, then refunds; whatever
+		// the expectations do not cover is unattributed. Each line consumes from one remainder.
+		let mut remainder = reserved;
+		let mut consume = |cap: u128| {
+			let taken = remainder.min(cap);
+			remainder -= taken;
+			taken
+		};
+		let ct_hold = consume(expected.ct);
+		let proxy_hold = consume(expected.proxy);
+		let refunded = consume(expected.refund);
+		let unattributed = remainder;
 		if !refunded.is_zero() {
 			Pallet::<T>::deposit_event(Event::DepositRefunded {
 				who: who.clone(),
@@ -367,7 +363,7 @@ impl<T: Config> AccountsMigrator<T> {
 			}
 			Some(PortableAccount { who: dest.clone(), free: ct_free, holds })
 		};
-		let ah = (!ah_free.is_zero()).then(|| (dest, ah_free));
+		let ah = (!ah_free.is_zero()).then_some((dest, ah_free));
 
 		Ok(Some(Withdrawal { ct, ah }))
 	}
@@ -425,9 +421,15 @@ impl<T: Config> AccountsMigrator<T> {
 
 	/// Whether the account migrates at all. The rejections here are deliberate policy, not
 	/// failures.
-	pub fn can_migrate(who: &T::AccountId, info: &AccountInfoFor<T>) -> bool {
+	/// Whether `who` is an account class the migration never touches (module accounts). The
+	/// sweep's dust pass consults this too, so one prefix list rules both.
+	pub fn is_unmigrated(who: &T::AccountId) -> bool {
 		let bytes: &[u8] = who.as_ref();
-		if UNMIGRATED_PREFIXES.iter().any(|prefix| bytes.starts_with(prefix)) {
+		UNMIGRATED_PREFIXES.iter().any(|prefix| bytes.starts_with(prefix))
+	}
+
+	pub fn can_migrate(who: &T::AccountId, info: &AccountInfoFor<T>) -> bool {
+		if Self::is_unmigrated(who) {
 			log::info!(target: LOG_TARGET, "Keeping sovereign/module account {who:?} on the RC");
 			return false;
 		}

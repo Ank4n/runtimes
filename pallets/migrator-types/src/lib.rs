@@ -58,6 +58,20 @@ where
 	Sibling::from(ParaId::from(para_id)).into_account_truncating()
 }
 
+/// The account id under which `who`'s balances and records continue on the destination chains.
+///
+/// A child para sovereign (`para…`) becomes the sibling sovereign (`sibl…`) — the same parachain
+/// as seen from a sibling chain; everyone else keeps their address. Part of the wire contract for
+/// the same reason as [`sibling_account`]: the accounts stage moves the *money* to the translated
+/// address, so any stage that ships a record under the raw relay-chain key splits that record from
+/// its backing. Every account-typed field that leaves the relay chain must come through here.
+pub fn translate_destination(who: &sp_runtime::AccountId32) -> sp_runtime::AccountId32 {
+	match ParaId::try_from_account(who) {
+		Some(para_id) => sibling_account(para_id.into()),
+		None => who.clone(),
+	}
+}
+
 /// Account balance payload in portable format.
 ///
 /// The relay chain withdraws an account into this shape and the receiving chain integrates it
@@ -135,7 +149,10 @@ pub struct PortableParaInfo<AccountId, Balance> {
 	/// arrived held during the accounts stage; never trusted on its own.
 	pub deposit: Balance,
 	/// Whether the para is locked from manager control.
-	pub locked: Option<bool>,
+	///
+	/// The registrar's own field is `Option<bool>` (unset until the first head), but the
+	/// destination treats unset as unlocked, so the wire carries the collapsed value.
+	pub locked: bool,
 	/// Whether the para is actually onboarded, or merely has its id reserved.
 	///
 	/// The discriminator is `paras::ParaLifecycles`, which stays on the relay chain — so the

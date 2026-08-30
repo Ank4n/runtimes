@@ -44,9 +44,7 @@ impl<T: Config> RegistrarMigrator<T> {
 	/// block's removals.
 	pub fn migrate_many(last_key: Option<ParaId>) -> Result<Option<ParaId>, Error<T>> {
 		let iter = match last_key {
-			Some(last_key) => paras_registrar::Paras::<T>::iter_from(
-				paras_registrar::Paras::<T>::hashed_key_for(last_key),
-			),
+			Some(last_key) => paras_registrar::Paras::<T>::iter_from_key(last_key),
 			None => paras_registrar::Paras::<T>::iter(),
 		};
 
@@ -55,17 +53,15 @@ impl<T: Config> RegistrarMigrator<T> {
 			|para_id, info| {
 				// Removing the current key while iterating a map is sound.
 				paras_registrar::Paras::<T>::remove(para_id);
-				PortableParaInfo {
+				Ok(Some(PortableParaInfo {
 					para_id: (*para_id).into(),
-					// Same translation as the accounts stage applies to the deposit itself: a
-					// manager that is a para sovereign is a different address on the destination,
-					// and recording the relay-chain key would leave the registration pointing at
-					// an account that holds nothing and that nobody controls there.
-					manager: super::accounts::AccountsMigrator::<T>::translate_destination(
-						&info.manager,
-					),
+					// Account ids on the wire are always the destination's address for them —
+					// see `migrator_types::translate_destination`.
+					manager: migrator_types::translate_destination(&info.manager),
 					deposit: info.deposit,
-					locked: info.locked,
+					// The registrar leaves the flag unset until a para's first head; the
+					// destination treats unset as unlocked, so collapse it on the way out.
+					locked: info.locked.unwrap_or(false),
 					// Both read here because only this chain can: the lifecycle map and the head
 					// data stay behind, and the destination prices the arriving registration from
 					// the head length exactly as it would price a fresh one.
@@ -73,7 +69,7 @@ impl<T: Config> RegistrarMigrator<T> {
 					head_len: paras::Heads::<T>::get(para_id)
 						.map(|head| head.0.len() as u32)
 						.unwrap_or_default(),
-				}
+				}))
 			},
 			|batch| Pallet::<T>::send_registrar(batch, None),
 		)

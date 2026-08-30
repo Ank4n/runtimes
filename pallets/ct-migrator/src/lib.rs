@@ -234,8 +234,6 @@ pub mod pallet {
 	pub enum Error<T> {
 		/// Failed to integrate a migrated account.
 		FailedToProcessAccount,
-		/// Failed to integrate a migrated registrar record.
-		FailedToProcessPara,
 		/// Failed to flip a migrated reserve to its attributed hold reason.
 		FailedToReattribute,
 		/// Failed to integrate a migrated proxy set.
@@ -499,18 +497,10 @@ pub mod pallet {
 			Ok(minted)
 		}
 
-		/// Place `amount` of `who`'s free balance under `reason` without the account ever sitting
-		/// at zero reserve mid-operation.
-		///
-		/// `MutateHold::hold` decreases the free balance before it books the hold; if that leaves
-		/// a sub-ED free remainder while nothing is reserved yet, pallet-balances dusts the
-		/// remainder. Deposit holders whose liquid dust deliberately travelled here alongside the
-		/// deposit are in exactly that shape, so the two steps run in the reverse (safe) order.
-		/// The low-level primitives keep total issuance untouched, like `hold` itself.
 		/// The inverse of [`Self::place_hold`]: move `amount` from a hold back to free balance.
 		///
-		/// Same hazard, same fix in reverse. `release` decreases the hold first, and if that
-		/// takes it to zero while the free part is still sub-ED, pallet-balances dusts the
+		/// Same hazard as there, same fix in reverse. `release` decreases the hold first, and if
+		/// that takes it to zero while the free part is still sub-ED, pallet-balances dusts the
 		/// remainder — which is exactly the shape a deposit holder whose liquid dust travelled
 		/// here alongside the deposit is in. Crediting the free part *first* means the hold never
 		/// passes through zero while free is below ED. The two primitives are mint-and-burn of
@@ -525,6 +515,39 @@ pub mod pallet {
 			Ok(())
 		}
 
+		/// Release `min(wanted, actually-held)` of `who`'s migrated `RcMigratedReserve` hold to
+		/// free balance, returning `(released, shortfall)`.
+		///
+		/// The reconciliation rule of the whole receive side: recorded deposits are honoured up
+		/// to what actually arrived held, and the difference is the caller's to park under its
+		/// own key. One implementation so every deposit kind reconciles identically.
+		fn release_rc_reserve(
+			who: &T::AccountId,
+			wanted: BalanceOf<T>,
+		) -> Result<(BalanceOf<T>, BalanceOf<T>), Error<T>> {
+			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
+			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, who);
+			let release = wanted.min(held);
+			if !release.is_zero() {
+				Self::release_hold(&rc_reason, who, release).map_err(|e| {
+					log::error!(
+						target: LOG_TARGET,
+						"releasing {release:?} of {held:?} held on {who:?} failed: {e:?}",
+					);
+					Error::<T>::FailedToReattribute
+				})?;
+			}
+			Ok((release, wanted.saturating_sub(held)))
+		}
+
+		/// Place `amount` of `who`'s free balance under `reason` without the account ever sitting
+		/// at zero reserve mid-operation.
+		///
+		/// `MutateHold::hold` decreases the free balance before it books the hold; if that leaves
+		/// a sub-ED free remainder while nothing is reserved yet, pallet-balances dusts the
+		/// remainder. Deposit holders whose liquid dust deliberately travelled here alongside the
+		/// deposit are in exactly that shape, so the two steps run in the reverse (safe) order.
+		/// The low-level primitives keep total issuance untouched, like `hold` itself.
 		fn place_hold(
 			reason: &T::RuntimeHoldReason,
 			who: &T::AccountId,
@@ -574,21 +597,7 @@ pub mod pallet {
 		/// as before — the manager may then be unable to pay, in which case the whole record is
 		/// parked rather than half-applied.
 		fn do_receive_para(para: &PortableParaInfoOf<T>) -> Result<(), Error<T>> {
-			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
-			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, &para.manager);
-			let shortfall = para.deposit.saturating_sub(held);
-			let release = para.deposit.min(held);
-
-			if !release.is_zero() {
-				Self::release_hold(&rc_reason, &para.manager, release).map_err(|e| {
-					log::error!(
-						target: LOG_TARGET,
-						"para {}: releasing {release:?} of {held:?} held failed: {e:?}",
-						para.para_id,
-					);
-					Error::<T>::FailedToReattribute
-				})?;
-			}
+			let (release, shortfall) = Self::release_rc_reserve(&para.manager, para.deposit)?;
 			ReattributedDeposits::<T>::mutate(|t| *t = t.saturating_add(release));
 			if !shortfall.is_zero() {
 				ParkedDepositShortfalls::<T>::insert(para.para_id, shortfall);
@@ -607,7 +616,7 @@ pub mod pallet {
 					MigratedParaState::Reserved
 				},
 				// Every live para arrives locked; the relay chain set that at its first head.
-				locked: para.locked.unwrap_or(false),
+				locked: para.locked,
 			})
 			.map_err(|e| {
 				log::error!(
@@ -650,30 +659,17 @@ pub mod pallet {
 			let proxy_reason: T::RuntimeHoldReason = HoldReason::ProxyDeposit.into();
 			let migrated = <T as Config>::Currency::balance_on_hold(&proxy_reason, &proxy.delegator);
 			if !migrated.is_zero() {
-				// Credit free before dropping the hold: `release` decreases the hold first, which
-				// would dust a sub-ED free remainder while the reserve is zero (see `place_hold`).
-				<T as Config>::Currency::increase_balance(
-					&proxy.delegator,
-					migrated,
-					Precision::Exact,
-				)
-				.map_err(|_| Error::<T>::FailedToProcessProxy)?;
-				<T as Config>::Currency::decrease_balance_on_hold(
-					&proxy_reason,
-					&proxy.delegator,
-					migrated,
-					Precision::Exact,
-				)
-				.map_err(|_| Error::<T>::FailedToProcessProxy)?;
+				Self::release_hold(&proxy_reason, &proxy.delegator, migrated)
+					.map_err(|_| Error::<T>::FailedToProcessProxy)?;
 			}
+			let delay_ratio = T::RcBlockTimeRatio::get().max(1);
 
 			pallet_proxy::Proxies::<T>::try_mutate(&proxy.delegator, |(defs, deposit)| {
 				for delegate in proxy.delegates.iter() {
 					let def = pallet_proxy::ProxyDefinition {
 						delegate: delegate.delegate.clone(),
 						proxy_type: delegate.proxy_type.into(),
-						delay: (delegate.delay / T::RcBlockTimeRatio::get().max(1))
-							.saturated_into(),
+						delay: (delegate.delay / delay_ratio).saturated_into(),
 					};
 					if !defs.contains(&def) {
 						defs.try_push(def).map_err(|_| Error::<T>::FailedToProcessProxy)?;
@@ -681,11 +677,10 @@ pub mod pallet {
 				}
 
 				// Back the entry at this chain's rates (normally from the released deposit
-				// above), topping up whatever is already reserved for pre-existing local proxies.
-				let required = <T as pallet_proxy::Config>::ProxyDepositBase::get().saturating_add(
-					<T as pallet_proxy::Config>::ProxyDepositFactor::get()
-						.saturating_mul((defs.len() as u32).into()),
-				);
+				// above), topping up whatever is already reserved for pre-existing local
+				// proxies. Priced by the proxy pallet itself, so a migrated entry can never
+				// diverge from what the pallet would charge.
+				let required = pallet_proxy::Pallet::<T>::deposit(defs.len() as u32);
 				let top_up = required.saturating_sub(*deposit);
 				if !top_up.is_zero() {
 					match <T as pallet_proxy::Config>::Currency::reserve(&proxy.delegator, top_up) {
@@ -768,15 +763,7 @@ pub mod pallet {
 			wanted: BalanceOf<T>,
 		) -> Result<(), Error<T>> {
 			let sovereign: T::AccountId = sibling_account(para);
-			let rc_reason: T::RuntimeHoldReason = HoldReason::RcMigratedReserve.into();
-			let held = <T as Config>::Currency::balance_on_hold(&rc_reason, &sovereign);
-			let release = wanted.min(held);
-			let shortfall = wanted.saturating_sub(held);
-
-			if !release.is_zero() {
-				Self::release_hold(&rc_reason, &sovereign, release)
-					.map_err(|_| Error::<T>::FailedToReattribute)?;
-			}
+			let (release, shortfall) = Self::release_rc_reserve(&sovereign, wanted)?;
 			ReattributedHrmpDeposits::<T>::mutate(|t| *t = t.saturating_add(release));
 			if !shortfall.is_zero() {
 				ParkedHrmpShortfalls::<T>::insert(key, shortfall);
