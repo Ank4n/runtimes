@@ -197,34 +197,17 @@ pub enum RelayRuntimePallets {
 
 #[derive(Encode)]
 pub enum RegistrarRelayCalls {
+	/// `#[pallet::call_index]` of `receive` in `pallet-registrar-relay`: one entry point for
+	/// every message variant, so this router needs no routing.
 	#[codec(index = 0)]
-	AuthorizeCode(registrar_primitives::MessageToRelay<AccountId>),
-	#[codec(index = 2)]
-	CancelAuthorization(registrar_primitives::MessageToRelay<AccountId>),
-	#[codec(index = 3)]
-	Deregister(registrar_primitives::MessageToRelay<AccountId>),
-	#[codec(index = 4)]
-	CancelDeregistration(registrar_primitives::MessageToRelay<AccountId>),
-	#[codec(index = 5)]
-	AuthorizeCodeUpgrade(registrar_primitives::MessageToRelay<AccountId>),
-	#[codec(index = 7)]
-	SetCurrentHead(registrar_primitives::MessageToRelay<AccountId>),
-	#[codec(index = 9)]
-	RemoveUpgradeCooldown(registrar_primitives::MessageToRelay<AccountId>),
+	Receive(registrar_primitives::MessageToRelay<AccountId>),
 }
 
 #[derive(Encode)]
 pub enum HrmpRelayCalls {
+	/// `#[pallet::call_index]` of `receive` in `pallet-hrmp-relay`.
 	#[codec(index = 0)]
-	InitOpenChannel(hrmp_primitives::MessageToRelay),
-	#[codec(index = 1)]
-	AcceptOpenChannel(hrmp_primitives::MessageToRelay),
-	#[codec(index = 2)]
-	CloseChannel(hrmp_primitives::MessageToRelay),
-	#[codec(index = 3)]
-	CancelOpenRequest(hrmp_primitives::MessageToRelay),
-	#[codec(index = 4)]
-	EstablishSystemChannel(hrmp_primitives::MessageToRelay),
+	Receive(hrmp_primitives::MessageToRelay),
 }
 
 /// Hand a `Transact` to the relay chain.
@@ -253,22 +236,9 @@ impl pallet_registrar_para::SendToRelay for RegistrarRequestToRelay {
 	type AccountId = AccountId;
 
 	fn send(message: registrar_primitives::MessageToRelay<AccountId>) -> Result<(), ()> {
-		use registrar_primitives::MessageToRelayV1::*;
-		// One call per message on the far side, so the transport picks the index the variant
-		// belongs to.
-		let call = match message {
-			registrar_primitives::MessageToRelay::V1(ref v) => match v {
-				Register { .. } => RegistrarRelayCalls::AuthorizeCode(message),
-				CancelRegistration { .. } => RegistrarRelayCalls::CancelAuthorization(message),
-				Deregister { .. } => RegistrarRelayCalls::Deregister(message),
-				CancelDeregistration { .. } => RegistrarRelayCalls::CancelDeregistration(message),
-				AuthorizeCodeUpgrade { .. } => RegistrarRelayCalls::AuthorizeCodeUpgrade(message),
-				SetCurrentHead { .. } => RegistrarRelayCalls::SetCurrentHead(message),
-				RemoveUpgradeCooldown { .. } =>
-					RegistrarRelayCalls::RemoveUpgradeCooldown(message),
-			},
-		};
-		send_to_relay(RelayRuntimePallets::RegistrarRelay(call).encode())
+		send_to_relay(
+			RelayRuntimePallets::RegistrarRelay(RegistrarRelayCalls::Receive(message)).encode(),
+		)
 	}
 }
 
@@ -277,17 +247,7 @@ pub struct HrmpRequestToRelay;
 
 impl pallet_hrmp_para::SendToRelay for HrmpRequestToRelay {
 	fn send(message: hrmp_primitives::MessageToRelay) -> Result<(), ()> {
-		use hrmp_primitives::MessageToRelayV1::*;
-		let call = match message {
-			hrmp_primitives::MessageToRelay::V1(ref v) => match v {
-				InitOpenChannel { .. } => HrmpRelayCalls::InitOpenChannel(message),
-				AcceptOpenChannel { .. } => HrmpRelayCalls::AcceptOpenChannel(message),
-				CloseChannel { .. } => HrmpRelayCalls::CloseChannel(message),
-				CancelOpenRequest { .. } => HrmpRelayCalls::CancelOpenRequest(message),
-				EstablishSystemChannel { .. } => HrmpRelayCalls::EstablishSystemChannel(message),
-			},
-		};
-		send_to_relay(RelayRuntimePallets::HrmpRelay(call).encode())
+		send_to_relay(RelayRuntimePallets::HrmpRelay(HrmpRelayCalls::Receive(message)).encode())
 	}
 }
 

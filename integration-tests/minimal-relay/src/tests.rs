@@ -1785,18 +1785,18 @@ async fn full_migration_rc_to_ct() {
 /// receives it. These are pure encoding tests and need no snapshot.
 mod call_encoding {
 	use codec::{Decode, Encode};
-	use crate::mock::network::ct::para_control::{
+	use coretime_polkadot_runtime::para_control::{
 		HrmpRelayCalls, RegistrarRelayCalls, RelayRuntimePallets,
 	};
 	use hrmp_primitives::{ChannelId, MessageToRelayV1 as HrmpToRelay};
-	use crate::mock::network::relay::para_control::{
+	use polkadot_runtime::para_control::{
 		CoretimeRuntimePallets, HrmpParaCalls, RegistrarParaCalls,
 	};
 	use registrar_primitives::MessageToRelayV1 as RegistrarToRelay;
 	use sp_core::H256;
 
-	type RelayCall = crate::mock::network::relay::RuntimeCall;
-	type CoretimeCall = crate::mock::network::ct::RuntimeCall;
+	type RelayCall = polkadot_runtime::RuntimeCall;
+	type CoretimeCall = coretime_polkadot_runtime::RuntimeCall;
 	type AccountId = sp_runtime::AccountId32;
 
 	const PARA: u32 = 2000;
@@ -1811,169 +1811,85 @@ mod call_encoding {
 		AccountId::new([1u8; 32])
 	}
 
-	/// Every registrar message Coretime can send, paired with the relay call it must decode as.
+	/// Every registrar message Coretime can send must decode on the relay chain as `receive`
+	/// carrying the identical payload. Payload equality is the whole check: with one entry point
+	/// there is no per-call routing left to drift, only the pallet index and the message bytes.
 	#[test]
 	fn coretime_registrar_calls_decode_on_the_relay_chain() {
-		let cases: Vec<(RegistrarRelayCalls, &str)> = vec![
-			(
-				RegistrarRelayCalls::AuthorizeCode(registrar_primitives::MessageToRelay::V1(
-					RegistrarToRelay::Register {
-						para_id: PARA,
-						message_id: MSG_ID,
-						manager: manager(),
-						genesis_head: vec![1, 2, 3],
-						code_hash: H256::repeat_byte(9),
-						code_len: 42,
-					},
-				)),
-				"authorize_code",
-			),
-			(
-				RegistrarRelayCalls::CancelAuthorization(registrar_primitives::MessageToRelay::V1(
-					RegistrarToRelay::CancelRegistration { para_id: PARA, message_id: MSG_ID },
-				)),
-				"cancel_authorization",
-			),
-			(
-				RegistrarRelayCalls::Deregister(registrar_primitives::MessageToRelay::V1(
-					RegistrarToRelay::Deregister { para_id: PARA, message_id: MSG_ID },
-				)),
-				"deregister",
-			),
-			(
-				RegistrarRelayCalls::CancelDeregistration(
-					registrar_primitives::MessageToRelay::V1(
-						RegistrarToRelay::CancelDeregistration { para_id: PARA, message_id: MSG_ID },
-					),
-				),
-				"cancel_deregistration",
-			),
-			(
-				RegistrarRelayCalls::AuthorizeCodeUpgrade(registrar_primitives::MessageToRelay::V1(
-					RegistrarToRelay::AuthorizeCodeUpgrade {
-						para_id: PARA,
-						message_id: MSG_ID,
-						code_hash: H256::repeat_byte(3),
-						code_len: 11,
-					},
-				)),
-				"authorize_code_upgrade",
-			),
-			(
-				RegistrarRelayCalls::SetCurrentHead(registrar_primitives::MessageToRelay::V1(
-					RegistrarToRelay::SetCurrentHead {
-						para_id: PARA,
-						message_id: MSG_ID,
-						head: vec![4, 5],
-					},
-				)),
-				"set_current_head",
-			),
-			(
-				RegistrarRelayCalls::RemoveUpgradeCooldown(
-					registrar_primitives::MessageToRelay::V1(
-						RegistrarToRelay::RemoveUpgradeCooldown {
-							para_id: PARA,
-							message_id: MSG_ID,
-						},
-					),
-				),
-				"remove_upgrade_cooldown",
-			),
+		let messages = vec![
+			RegistrarToRelay::Register {
+				para_id: PARA,
+				message_id: MSG_ID,
+				manager: manager(),
+				genesis_head: vec![1, 2, 3],
+				code_hash: H256::repeat_byte(9),
+				code_len: 42,
+			},
+			RegistrarToRelay::CancelRegistration { para_id: PARA, message_id: MSG_ID },
+			RegistrarToRelay::Deregister { para_id: PARA, message_id: MSG_ID },
+			RegistrarToRelay::CancelDeregistration { para_id: PARA, message_id: MSG_ID },
+			RegistrarToRelay::AuthorizeCodeUpgrade {
+				para_id: PARA,
+				message_id: MSG_ID,
+				code_hash: H256::repeat_byte(3),
+				code_len: 11,
+			},
+			RegistrarToRelay::SetCurrentHead {
+				para_id: PARA,
+				message_id: MSG_ID,
+				head: vec![4, 5],
+			},
+			RegistrarToRelay::RemoveUpgradeCooldown { para_id: PARA, message_id: MSG_ID },
 		];
 
-		for (call, expected) in cases {
-			let encoded = RelayRuntimePallets::RegistrarRelay(call).encode();
-			let decoded = RelayCall::decode(&mut &encoded[..])
-				.unwrap_or_else(|e| panic!("{expected} does not decode on the relay chain: {e:?}"));
-			let RelayCall::RegistrarRelay(inner) = decoded else {
-				panic!("{expected} decoded into the wrong pallet: {decoded:?}");
-			};
-			let got = match inner {
-				pallet_registrar_relay::Call::authorize_code { .. } => "authorize_code",
-				pallet_registrar_relay::Call::cancel_authorization { .. } =>
-					"cancel_authorization",
-				pallet_registrar_relay::Call::deregister { .. } => "deregister",
-				pallet_registrar_relay::Call::cancel_deregistration { .. } =>
-					"cancel_deregistration",
-				pallet_registrar_relay::Call::authorize_code_upgrade { .. } =>
-					"authorize_code_upgrade",
-				pallet_registrar_relay::Call::set_current_head { .. } => "set_current_head",
-				pallet_registrar_relay::Call::remove_upgrade_cooldown { .. } =>
-					"remove_upgrade_cooldown",
-				other => panic!("{expected} decoded as an unexpected call: {other:?}"),
-			};
-			assert_eq!(got, expected, "call index drift: {expected} arrives as {got}");
+		for message in messages {
+			let sent = registrar_primitives::MessageToRelay::V1(message);
+			let encoded =
+				RelayRuntimePallets::RegistrarRelay(RegistrarRelayCalls::Receive(sent.clone()))
+					.encode();
+			match RelayCall::decode(&mut &encoded[..])
+				.unwrap_or_else(|e| panic!("{sent:?} does not decode on the relay chain: {e:?}"))
+			{
+				RelayCall::RegistrarRelay(pallet_registrar_relay::Call::receive { message }) =>
+					assert_eq!(message, sent),
+				other => panic!("{sent:?} decoded as {other:?}"),
+			}
 		}
 	}
 
-	/// Every HRMP message Coretime can send, paired with the relay call it must decode as.
+	/// Every HRMP message Coretime can send, same check.
 	#[test]
 	fn coretime_hrmp_calls_decode_on_the_relay_chain() {
-		let cases: Vec<(HrmpRelayCalls, &str)> = vec![
-			(
-				HrmpRelayCalls::InitOpenChannel(hrmp_primitives::MessageToRelay::V1(
-					HrmpToRelay::InitOpenChannel {
-						channel: channel(),
-						message_id: MSG_ID,
-						max_capacity: 8,
-						max_message_size: 1024,
-					},
-				)),
-				"init_open_channel",
-			),
-			(
-				HrmpRelayCalls::AcceptOpenChannel(hrmp_primitives::MessageToRelay::V1(
-					HrmpToRelay::AcceptOpenChannel { channel: channel(), message_id: MSG_ID },
-				)),
-				"accept_open_channel",
-			),
-			(
-				HrmpRelayCalls::CloseChannel(hrmp_primitives::MessageToRelay::V1(
-					HrmpToRelay::CloseChannel {
-						channel: channel(),
-						message_id: MSG_ID,
-						initiator: PARA,
-					},
-				)),
-				"close_channel",
-			),
-			(
-				HrmpRelayCalls::CancelOpenRequest(hrmp_primitives::MessageToRelay::V1(
-					HrmpToRelay::CancelOpenRequest { channel: channel(), message_id: MSG_ID },
-				)),
-				"cancel_open_request",
-			),
-			(
-				HrmpRelayCalls::EstablishSystemChannel(hrmp_primitives::MessageToRelay::V1(
-					HrmpToRelay::EstablishSystemChannel { channel: channel(), message_id: MSG_ID },
-				)),
-				"establish_system_channel",
-			),
+		let messages = vec![
+			HrmpToRelay::InitOpenChannel {
+				channel: channel(),
+				message_id: MSG_ID,
+				max_capacity: 8,
+				max_message_size: 1024,
+			},
+			HrmpToRelay::AcceptOpenChannel { channel: channel(), message_id: MSG_ID },
+			HrmpToRelay::CloseChannel { channel: channel(), message_id: MSG_ID, initiator: PARA },
+			HrmpToRelay::CancelOpenRequest { channel: channel(), message_id: MSG_ID },
+			HrmpToRelay::EstablishSystemChannel { channel: channel(), message_id: MSG_ID },
 		];
 
-		for (call, expected) in cases {
-			let encoded = RelayRuntimePallets::HrmpRelay(call).encode();
-			let decoded = RelayCall::decode(&mut &encoded[..])
-				.unwrap_or_else(|e| panic!("{expected} does not decode on the relay chain: {e:?}"));
-			let RelayCall::HrmpRelay(inner) = decoded else {
-				panic!("{expected} decoded into the wrong pallet: {decoded:?}");
-			};
-			let got = match inner {
-				pallet_hrmp_relay::Call::init_open_channel { .. } => "init_open_channel",
-				pallet_hrmp_relay::Call::accept_open_channel { .. } => "accept_open_channel",
-				pallet_hrmp_relay::Call::close_channel { .. } => "close_channel",
-				pallet_hrmp_relay::Call::cancel_open_request { .. } => "cancel_open_request",
-				pallet_hrmp_relay::Call::establish_system_channel { .. } =>
-					"establish_system_channel",
-				other => panic!("{expected} decoded as an unexpected call: {other:?}"),
-			};
-			assert_eq!(got, expected, "call index drift: {expected} arrives as {got}");
+		for message in messages {
+			let sent = hrmp_primitives::MessageToRelay::V1(message);
+			let encoded =
+				RelayRuntimePallets::HrmpRelay(HrmpRelayCalls::Receive(sent.clone())).encode();
+			match RelayCall::decode(&mut &encoded[..])
+				.unwrap_or_else(|e| panic!("{sent:?} does not decode on the relay chain: {e:?}"))
+			{
+				RelayCall::HrmpRelay(pallet_hrmp_relay::Call::receive { message }) =>
+					assert_eq!(message, sent),
+				other => panic!("{sent:?} decoded as {other:?}"),
+			}
 		}
 	}
 
-	/// The relay chain's replies. Both pallets take every response through a single `receive`, so
-	/// what matters here is that the pallet and call indices land, and that the payload survives.
+	/// The relay chain's replies. Both para pallets take every response through a single
+	/// `receive`, so what matters here is that the pallet and call indices land, and that the
+	/// payload survives.
 	#[test]
 	fn relay_reports_decode_on_coretime() {
 		let registrar_report = registrar_primitives::MessageToPara::V1(
@@ -2029,7 +1945,7 @@ async fn only_a_system_para_can_drive_the_relay_control_plane() {
 	// A deregistration request for a para that does not exist. The verdict does not matter —
 	// what matters is that a verdict is produced at all, which only happens if the call ran.
 	let call = crate::mock::network::relay::RuntimeCall::RegistrarRelay(
-		pallet_registrar_relay::Call::deregister {
+		pallet_registrar_relay::Call::receive {
 			message: registrar_primitives::MessageToRelay::V1(
 				registrar_primitives::MessageToRelayV1::Deregister {
 					para_id: 4_999,

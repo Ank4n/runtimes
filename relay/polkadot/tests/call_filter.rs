@@ -128,16 +128,10 @@ fn the_control_plane_stays_open() {
 	);
 
 	for call in [
-		RuntimeCall::RegistrarRelay(pallet_registrar_relay::Call::<Runtime>::deregister {
-			message: registrar_msg.clone(),
-		}),
-		RuntimeCall::RegistrarRelay(pallet_registrar_relay::Call::<Runtime>::authorize_code {
+		RuntimeCall::RegistrarRelay(pallet_registrar_relay::Call::<Runtime>::receive {
 			message: registrar_msg,
 		}),
-		RuntimeCall::HrmpRelay(pallet_hrmp_relay::Call::<Runtime>::accept_open_channel {
-			message: hrmp_msg.clone(),
-		}),
-		RuntimeCall::HrmpRelay(pallet_hrmp_relay::Call::<Runtime>::establish_system_channel {
+		RuntimeCall::HrmpRelay(pallet_hrmp_relay::Call::<Runtime>::receive {
 			message: hrmp_msg,
 		}),
 	] {
