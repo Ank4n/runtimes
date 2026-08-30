@@ -57,7 +57,13 @@ impl<T: Config> RegistrarMigrator<T> {
 				paras_registrar::Paras::<T>::remove(para_id);
 				PortableParaInfo {
 					para_id: (*para_id).into(),
-					manager: info.manager,
+					// Same translation as the accounts stage applies to the deposit itself: a
+					// manager that is a para sovereign is a different address on the destination,
+					// and recording the relay-chain key would leave the registration pointing at
+					// an account that holds nothing and that nobody controls there.
+					manager: super::accounts::AccountsMigrator::<T>::translate_destination(
+						&info.manager,
+					),
 					deposit: info.deposit,
 					locked: info.locked,
 					// Both read here because only this chain can: the lifecycle map and the head

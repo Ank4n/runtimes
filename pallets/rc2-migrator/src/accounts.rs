@@ -38,6 +38,7 @@
 //! sibling id (`sibl…`) that represents the same para on a parachain.
 
 use crate::*;
+use frame_support::traits::StorePreimage;
 use frame_support::{
 	defensive_assert,
 	traits::tokens::{Fortitude, Precision, Preservation},
@@ -334,10 +335,7 @@ impl<T: Config> AccountsMigrator<T> {
 		}
 		let held = ct_hold.saturating_add(proxy_hold).saturating_add(unattributed);
 		let liquid = free.saturating_add(refunded);
-		let pure_like = info.nonce.is_zero() &&
-			pallet_proxy::Proxies::<T>::get(who).0.iter().any(|def| {
-				matches!(def.proxy_type.clone().try_into(), Ok(PortableProxyType::Any))
-			});
+		let pure_like = Self::is_pure_like(who, &info);
 		let mut ct_free = if pure_like {
 			liquid
 		} else if held.is_zero() {
@@ -374,6 +372,57 @@ impl<T: Config> AccountsMigrator<T> {
 		Ok(Some(Withdrawal { ct, ah }))
 	}
 
+	/// Release every preimage deposit on this chain.
+	///
+	/// [`Self::can_migrate`] refuses any account holding a *named* hold, so a single preimage
+	/// deposit strands that account's entire balance — on Kusama a para manager with 539 KSM of
+	/// registrar deposits, held back by a 1.34 KSM preimage. Nothing carries these across: the
+	/// relay chain keeps hosting preimages, and the deposit behind one is the last thing tying a
+	/// user's money to a chain that is meant to end with none.
+	///
+	/// Only preimages that actually hold a ticket are touched, and the distinction matters:
+	///
+	/// - `Unrequested` — nobody wants it. Deleted, deposit returned.
+	/// - `Requested` **with** a ticket — the blob is kept and only the ticket dropped, so a
+	///   referendum that depends on it still resolves.
+	/// - `Requested` **without** a ticket — already deposit-free, and unnoting it here would
+	///   *unrequest* it (see `do_unnote_preimage`), which can delete a blob live governance is
+	///   waiting on. Skipped.
+	pub fn release_preimage_deposits() {
+		let with_deposit: Vec<_> = pallet_preimage::RequestStatusFor::<T>::iter()
+			.filter(|(_, status)| match status {
+				pallet_preimage::RequestStatus::Unrequested { .. } => true,
+				pallet_preimage::RequestStatus::Requested { maybe_ticket, .. } =>
+					maybe_ticket.is_some(),
+			})
+			.map(|(hash, _)| hash)
+			.collect();
+
+		let count = with_deposit.len();
+		for hash in with_deposit {
+			// The trait's manager path: no origin, no ownership check. Calling the extrinsic as
+			// Root would work too, but only on a runtime whose `ManagerOrigin` accepts Root.
+			<pallet_preimage::Pallet<T> as StorePreimage>::unnote(&hash);
+		}
+		if count > 0 {
+			log::info!(target: LOG_TARGET, "Released {count} preimage deposit(s)");
+		}
+	}
+
+	/// A delegator that never signed and grants a portable `Any` proxy: a pure proxy in all but
+	/// name, since a pure is always created with `Any` and one that never signed cannot have been
+	/// anything else.
+	///
+	/// Such an account's funds are reachable *only* through its delegate, so they follow the
+	/// delegate to the Coretime chain whole — see the split in [`Self::withdraw`], and the
+	/// exemption in [`Self::can_migrate`].
+	pub fn is_pure_like(who: &T::AccountId, info: &AccountInfoFor<T>) -> bool {
+		info.nonce.is_zero() &&
+			pallet_proxy::Proxies::<T>::get(who).0.iter().any(|def| {
+				matches!(def.proxy_type.clone().try_into(), Ok(PortableProxyType::Any))
+			})
+	}
+
 	/// Whether the account migrates at all. The rejections here are deliberate policy, not
 	/// failures.
 	pub fn can_migrate(who: &T::AccountId, info: &AccountInfoFor<T>) -> bool {
@@ -386,8 +435,14 @@ impl<T: Config> AccountsMigrator<T> {
 		let data = &info.data;
 		let total = data.free.saturating_add(data.reserved);
 		if total < <T as Config>::Currency::minimum_balance() {
-			// Below-ED accounts only exist via external provider references (e.g. system
-			// accounts); what happens to them is undecided.
+			// Below-ED accounts are left here and reaped: the balance is by definition less than
+			// the chain considers worth keeping an account for.
+			//
+			// This includes pure-like delegators, and that is a deliberate exception to
+			// funds-follow-control rather than an oversight. Their definitions still reach the
+			// Coretime chain, so the delegate keeps the *para*, but a sub-ED remainder is not
+			// worth a migration path of its own — there is nothing usable to lose. Above the ED
+			// the rule applies in full: see the `pure_like` split in `withdraw`.
 			log::info!(target: LOG_TARGET, "Keeping below-ED account {who:?} on the RC");
 			return false;
 		}

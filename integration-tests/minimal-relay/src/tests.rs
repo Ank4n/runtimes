@@ -49,8 +49,8 @@ fn unpaid_transact<Call: Encode>(call: Call) -> Xcm<()> {
 /// keyed (`nonce > 0`) accounts whose reserve is fully CT-bound (which is what
 /// [`find_clean_manager`] selects); never-signed `Any`-delegators route everything to CT instead.
 fn expected_split(free: u128, reserved: u128) -> (u128, u128) {
-	let buffer: u128 = polkadot_runtime::CtFreeBuffer::get();
-	let ah_ed: u128 = polkadot_runtime::AhExistentialDeposit::get();
+	let buffer: u128 = crate::mock::network::relay::CtFreeBuffer::get();
+	let ah_ed: u128 = crate::mock::network::relay::AhExistentialDeposit::get();
 	let mut ct_free = if reserved == 0 { 0 } else { free.min(buffer) };
 	let mut ah_free = free - ct_free;
 	if ah_free > 0 && ah_free < ah_ed && reserved > 0 {
@@ -61,12 +61,34 @@ fn expected_split(free: u128, reserved: u128) -> (u128, u128) {
 }
 
 /// Polkadot-format SS58 of an account, for census output.
+/// SS58 prefix of the network under test, so printed addresses match what a block explorer shows.
+const SS58_PREFIX: u16 = if cfg!(feature = "kusama") { 2 } else { 0 };
+
+/// Token symbol and decimals differ between the networks (DOT 10, KSM 12); printing the wrong one
+/// silently misreports every figure by a factor of 100.
+const TOKEN: &str = if cfg!(feature = "kusama") { "KSM" } else { "DOT" };
+const TOKEN_UNIT: f64 = if cfg!(feature = "kusama") { 1e12 } else { 1e10 };
+
 fn ss58(a: &AccountId32) -> String {
-	a.to_ss58check_with_version(Ss58AddressFormat::custom(0))
+	a.to_ss58check_with_version(Ss58AddressFormat::custom(SS58_PREFIX))
+}
+
+/// Where an account's balance, deposits and records continue on the destination chains.
+///
+/// Mirrors `rc2-migrator`'s rule rather than calling it: a child sovereign (`para…`) is the same
+/// parachain seen from a sibling (`sibl…`), and everyone else keeps their address. Stated here so
+/// the test asserts the intended behaviour instead of whatever the migrator happens to do.
+fn translate_destination(who: &AccountId32) -> AccountId32 {
+	let bytes: &[u8] = who.as_ref();
+	if let Some(rest) = bytes.strip_prefix(b"para") {
+		let para_id = u32::from(rest[0]) | (u32::from(rest[1]) << 8);
+		return migrator_types::sibling_account(para_id);
+	}
+	who.clone()
 }
 
 fn dot(v: u128) -> f64 {
-	v as f64 / 1e10
+	v as f64 / TOKEN_UNIT
 }
 
 /// Decompose every account on the RC by why the migration leaves it behind, with per-account
@@ -77,7 +99,7 @@ fn dot(v: u128) -> f64 {
 /// migratable accounts would be noise. Without it, every remaining account is printed: the
 /// post-migration measurement of the "RC → 0" gap.
 fn print_remaining_on_rc(only_referenced: bool) {
-	type Rc = polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
 	let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
 
 	let (mut dust_n, mut dust_amt) = (0u32, 0u128);
@@ -147,11 +169,11 @@ fn print_remaining_on_rc(only_referenced: bool) {
 			}
 		}
 	}
-	println!("below-ED dust: {dust_n} accounts, {:.4} DOT", dot(dust_amt));
+	println!("below-ED dust: {dust_n} accounts, {:.4} {TOKEN}", dot(dust_amt));
 	for (blocker, (n, amt)) in &dust_blockers {
-		println!("  dust blocked by {blocker}: {n} accounts, {:.4} DOT", dot(*amt));
+		println!("  dust blocked by {blocker}: {n} accounts, {:.4} {TOKEN}", dot(*amt));
 	}
-	println!("all accounts on the RC: {accounts}, {:.4} DOT", dot(total_sum));
+	println!("all accounts on the RC: {accounts}, {:.4} {TOKEN}", dot(total_sum));
 }
 
 /// Find a parachain manager that migrates cleanly: a live registrar deposit that fully accounts
@@ -159,7 +181,7 @@ fn print_remaining_on_rc(only_referenced: bool) {
 /// routing), and nothing else attached. Returns `(manager, free, reserved)`.
 /// Must run inside the RC externalities.
 fn find_clean_manager() -> (AccountId32, u128, u128) {
-	type Rc = polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
 	let mut recorded = BTreeMap::<AccountId32, u128>::new();
 	for (_, info) in paras_registrar::Paras::<Rc>::iter() {
 		*recorded.entry(info.manager).or_default() += info.deposit;
@@ -193,24 +215,24 @@ async fn three_chains_produce_blocks() {
 	});
 	ah.execute_with(|| {
 		for _ in 0..10 {
-			next_block_para::<AssetHubPolkadot>();
+			next_block_para::<AssetHubPara>();
 		}
 	});
 	ct.execute_with(|| {
 		for _ in 0..10 {
-			next_block_para::<CoretimePolkadot>();
+			next_block_para::<CoretimePara>();
 		}
 	});
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rc_and_asset_hub_exchange_messages() {
-	message_round_trip::<AssetHubPolkadot>().await;
+	message_round_trip::<AssetHubPara>().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rc_and_coretime_exchange_messages() {
-	message_round_trip::<CoretimePolkadot>().await;
+	message_round_trip::<CoretimePara>().await;
 }
 
 /// Assert that a `System::Remarked` event was emitted on runtime `T`.
@@ -259,7 +281,7 @@ where
 
 	// para -> RC.
 	let ump = para.execute_with(|| {
-		let call: polkadot_runtime::RuntimeCall =
+		let call: crate::mock::network::relay::RuntimeCall =
 			frame_system::Call::remark_with_event { remark: b"minimal-relay ump".to_vec() }.into();
 		send_ump::<P>(unpaid_transact(call));
 		take_ump::<P>()
@@ -270,7 +292,7 @@ where
 	rc.execute_with(|| {
 		enqueue_ump(P::PARA_ID.into(), ump);
 		next_block_rc();
-		assert_remarked::<polkadot_runtime::Runtime>("the RC");
+		assert_remarked::<crate::mock::network::relay::Runtime>("the RC");
 	});
 }
 
@@ -357,12 +379,12 @@ where
 	println!("### Balance census: {name}");
 	println!();
 	println!(
-		"{accounts} accounts, total issuance {:.4} DOT (inactive: {:.4})",
+		"{accounts} accounts, total issuance {:.4} {TOKEN} (inactive: {:.4})",
 		dot(pallet_balances::TotalIssuance::<T>::get()),
 		dot(pallet_balances::InactiveIssuance::<T>::get()),
 	);
 	println!();
-	println!("| Balance kind | Accounts | DOT |");
+	println!("| Balance kind | Accounts | {TOKEN} |");
 	println!("|---|---:|---:|");
 	row("free", &free);
 	row("reserved (holds + named + unnamed)", &reserved);
@@ -389,12 +411,12 @@ where
 async fn balance_census() {
 	let mut rc = remote_ext(Chain::Relay).await;
 	rc.execute_with(|| {
-		print_balance_census::<polkadot_runtime::Runtime>("Polkadot Relay Chain");
+		print_balance_census::<crate::mock::network::relay::Runtime>("Polkadot Relay Chain");
 
 		// Decompose which accounts the accounts stage keeps on the RC, with amounts — the
 		// direct answer to "where does the kept balance sit".
 		{
-			type Rc = polkadot_runtime::Runtime;
+			type Rc = crate::mock::network::relay::Runtime;
 			let ed = pallet_balances::Pallet::<Rc>::minimum_balance();
 			let mut cats: BTreeMap<&str, (u32, u128)> = BTreeMap::new();
 			for (who, info) in frame_system::Account::<Rc>::iter() {
@@ -425,10 +447,10 @@ async fn balance_census() {
 			println!("\n### kept-account decomposition (accounts the migrator skips)");
 			let mut sum = 0u128;
 			for (cat, (n, amt)) in &cats {
-				println!("{cat}: {n} accounts, {:.4} DOT", *amt as f64 / 1e10);
+				println!("{cat}: {n} accounts, {:.4} {TOKEN}", dot(*amt));
 				sum += amt;
 			}
-			println!("skipped-account total: {:.4} DOT", sum as f64 / 1e10);
+			println!("skipped-account total: {:.4} {TOKEN}", dot(sum));
 		}
 
 		// Registrar reconciliation census: for every manager, compare the recorded deposits
@@ -437,7 +459,7 @@ async fn balance_census() {
 		// `over` are accounts with additional unattributable reserves (proxy deposits) that the
 		// migration holds back whole.
 		{
-			type Rc = polkadot_runtime::Runtime;
+			type Rc = crate::mock::network::relay::Runtime;
 			let mut recorded = BTreeMap::<AccountId32, u128>::new();
 			let mut paras_of = BTreeMap::<AccountId32, Vec<(u32, u128, Option<bool>)>>::new();
 			for (id, info) in paras_registrar::Paras::<Rc>::iter() {
@@ -463,7 +485,7 @@ async fn balance_census() {
 				};
 				if cat != "exact" {
 					println!(
-						"{cat}: {} | paras {:?} | recorded {:.4} DOT, live reserve {:.4} DOT, gap {:.4} DOT",
+						"{cat}: {} | paras {:?} | recorded {:.4} {TOKEN}, live reserve {:.4} {TOKEN}, gap {:.4} {TOKEN}",
 						ss58(manager),
 						paras_of[manager],
 						dot(*expected),
@@ -479,7 +501,7 @@ async fn balance_census() {
 			println!("\n### registrar reconciliation summary");
 			for (cat, (managers, paras, dep)) in &cls {
 				println!(
-					"{cat}: {managers} managers / {paras} paras, recorded {:.4} DOT",
+					"{cat}: {managers} managers / {paras} paras, recorded {:.4} {TOKEN}",
 					dot(*dep)
 				);
 			}
@@ -515,13 +537,13 @@ async fn balance_census() {
 				} else if reserved < full {
 					short += 1;
 					println!(
-						"short: para {:?} | channels {:.4} + requests {:.4} DOT recorded, live reserve {:.4} DOT",
+						"short: para {:?} | channels {:.4} + requests {:.4} {TOKEN} recorded, live reserve {:.4} {TOKEN}",
 						paras, dot(*chan), dot(requests), dot(reserved),
 					);
 				} else {
 					over += 1;
 					println!(
-						"over: para {:?} | channels {:.4} + requests {:.4} DOT recorded, live reserve {:.4} DOT",
+						"over: para {:?} | channels {:.4} + requests {:.4} {TOKEN} recorded, live reserve {:.4} {TOKEN}",
 						paras, dot(*chan), dot(requests), dot(reserved),
 					);
 				}
@@ -540,7 +562,7 @@ async fn balance_census() {
 		// The Balances pallet's own storage keys: how many are empty leftovers, and how many
 		// belong to accounts that no longer exist (v1 reaped the account, the key survived).
 		{
-			type Rc = polkadot_runtime::Runtime;
+			type Rc = crate::mock::network::relay::Runtime;
 			let report = |name: &str, entries: Vec<(AccountId32, bool)>| {
 				let n = entries.len();
 				let empty = entries.iter().filter(|(_, e)| *e).count();
@@ -574,10 +596,10 @@ async fn balance_census() {
 
 		// Unclaimed pre-genesis claims are part of total issuance but sit in no account — the
 		// prime suspect for the "not held by any account" row above.
-		let unclaimed = polkadot_runtime_common::claims::Total::<polkadot_runtime::Runtime>::get();
+		let unclaimed = polkadot_runtime_common::claims::Total::<crate::mock::network::relay::Runtime>::get();
 		println!();
 		println!(
-			"claims::Total (unclaimed pre-genesis claims): {:.4} DOT",
+			"claims::Total (unclaimed pre-genesis claims): {:.4} {TOKEN}",
 			unclaimed as f64 / 1e10
 		);
 
@@ -591,7 +613,7 @@ async fn balance_census() {
 		if let Some(raw) = frame_support::storage::unhashed::get_raw(&key) {
 			if let Ok((kept, migrated)) = <(u128, u128)>::decode(&mut &raw[..]) {
 				println!(
-					"v1 RcMigratedBalanceArchive: kept {:.4} DOT, migrated {:.4} DOT",
+					"v1 RcMigratedBalanceArchive: kept {:.4} {TOKEN}, migrated {:.4} {TOKEN}",
 					kept as f64 / 1e10,
 					migrated as f64 / 1e10,
 				);
@@ -602,10 +624,10 @@ async fn balance_census() {
 
 		// The XCM teleport checking account (tracked teleported-out DOT before v1 moved that
 		// role to Asset Hub).
-		let check = pallet_xcm::Pallet::<polkadot_runtime::Runtime>::check_account();
-		let check_data = frame_system::Account::<polkadot_runtime::Runtime>::get(&check).data;
+		let check = pallet_xcm::Pallet::<crate::mock::network::relay::Runtime>::check_account();
+		let check_data = frame_system::Account::<crate::mock::network::relay::Runtime>::get(&check).data;
 		println!(
-			"XCM checking account {check:?}: free {:.4} DOT, reserved {:.4} DOT",
+			"XCM checking account {check:?}: free {:.4} {TOKEN}, reserved {:.4} {TOKEN}",
 			check_data.free as f64 / 1e10,
 			check_data.reserved as f64 / 1e10,
 		);
@@ -619,7 +641,7 @@ async fn balance_census() {
 /// Writes to the file named by `AHM_PROXY_DUMP`; without it, prints only aggregates.
 #[tokio::test(flavor = "multi_thread")]
 async fn proxy_census() {
-	type Rc = polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
 
 	let mut rc = remote_ext(Chain::Relay).await;
 	rc.execute_with(|| {
@@ -669,7 +691,7 @@ async fn proxy_census() {
 				delegates.join(","),
 			));
 		}
-		println!("proxy census: {entries} delegators, {:.2} DOT deposits", deposit_total as f64 / 1e10);
+		println!("proxy census: {entries} delegators, {:.2} {TOKEN} deposits", deposit_total as f64 / 1e10);
 		if let Ok(path) = std::env::var("AHM_PROXY_DUMP") {
 			std::fs::write(&path, out.join("\n")).expect("can write proxy dump");
 			println!("wrote {path}");
@@ -691,8 +713,8 @@ async fn proxy_census() {
 /// pin down.
 #[tokio::test(flavor = "multi_thread")]
 async fn accounts_migrate_rc_to_ct() {
-	type Rc = polkadot_runtime::Runtime;
-	type Ct = coretime_polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
+	type Ct = crate::mock::network::ct::Runtime;
 	type RcStage = pallet_rc2_migrator::MigrationStageOf<Rc>;
 
 	let (mut rc, mut ct) = tokio::join!(load(Chain::Relay), load(Chain::Coretime));
@@ -708,7 +730,7 @@ async fn accounts_migrate_rc_to_ct() {
 	// WHEN the accounts stage runs to completion.
 	let (dmp, migrated) = rc.execute_with(|| {
 		pallet_rc2_migrator::Pallet::<Rc>::force_set_stage(
-			polkadot_runtime::RuntimeOrigin::root(),
+			crate::mock::network::relay::RuntimeOrigin::root(),
 			RcStage::AccountsInit,
 		)
 		.expect("root may set the stage");
@@ -725,7 +747,7 @@ async fn accounts_migrate_rc_to_ct() {
 			"accounts stage must finish within 20 blocks"
 		);
 
-		(take_dmp(CoretimePolkadot::PARA_ID.into()), RcMigratedBalance::<Rc>::get())
+		(take_dmp(CoretimePara::PARA_ID.into()), RcMigratedBalance::<Rc>::get())
 	});
 	rc.commit_all().unwrap();
 	assert!(!dmp.is_empty(), "the accounts stage queued no DMP messages for Coretime");
@@ -753,10 +775,10 @@ async fn accounts_migrate_rc_to_ct() {
 			"manager unexpectedly already has holds on Coretime"
 		);
 
-		enqueue_dmp::<CoretimePolkadot>(dmp);
+		enqueue_dmp::<CoretimePara>(dmp);
 		// Generous bound; the batches drain in a few blocks.
 		for _ in 0..30 {
-			next_block_para::<CoretimePolkadot>();
+			next_block_para::<CoretimePara>();
 		}
 
 		assert_eq!(
@@ -776,7 +798,7 @@ async fn accounts_migrate_rc_to_ct() {
 		assert_eq!(holds.len(), 1, "the registrar deposit must arrive as exactly one hold");
 		assert_eq!(
 			holds[0].id,
-			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(
+			crate::mock::network::ct::RuntimeHoldReason::CtMigrator(
 				pallet_ct_migrator::HoldReason::RcMigratedReserve
 			)
 		);
@@ -802,10 +824,10 @@ async fn accounts_migrate_rc_to_ct() {
 /// monitor frontend replays.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_migration_rc_to_ct() {
-	type Rc = polkadot_runtime::Runtime;
-	type Ct = coretime_polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
+	type Ct = crate::mock::network::ct::Runtime;
 	type RcStage = pallet_rc2_migrator::MigrationStageOf<Rc>;
-	type Ah = asset_hub_polkadot_runtime::Runtime;
+	type Ah = crate::mock::network::ah::Runtime;
 
 	let (mut rc, mut ct, mut ah) =
 		tokio::join!(load(Chain::Relay), load(Chain::Coretime), load(Chain::AssetHub));
@@ -878,8 +900,8 @@ async fn full_migration_rc_to_ct() {
 	// untranslated to the same bytes on AH.
 	let (treasury, sweep_pots, sweep_dust, sibl_before) = rc.execute_with(|| {
 		let treasury: AccountId32 =
-			polkadot_runtime::TreasuryPalletId::get().into_account_truncating();
-		let pots: Vec<(AccountId32, u128)> = polkadot_runtime::SweepAccounts::get()
+			crate::mock::network::relay::TreasuryPalletId::get().into_account_truncating();
+		let pots: Vec<(AccountId32, u128)> = crate::mock::network::relay::SweepAccounts::get()
 			.into_iter()
 			.map(|who| {
 				let amount = frame_system::Account::<Rc>::get(&who).data.free;
@@ -960,8 +982,21 @@ async fn full_migration_rc_to_ct() {
 				dispatch = Some((who.clone(), any.delegate.clone(), reg.delegate.clone()));
 			}
 		}
-		let dispatch =
-			dispatch.expect("snapshot has a delegator with Any + ParaRegistration proxies");
+		// Not every network has one: `ParaRegistration` proxies exist on Polkadot but nobody has
+		// created one on Kusama. Absence is allowed, but it has to be *because* the chain has
+		// none — not because the lookup above is broken — so prove that before letting the
+		// dispatch checks be skipped.
+		if dispatch.is_none() {
+			let para_reg = pallet_proxy::Proxies::<Rc>::iter()
+				.flat_map(|(_, (defs, _))| defs.into_inner())
+				.filter(|d| portable(&d.proxy_type) == Some(PortableProxyType::ParaRegistration))
+				.count();
+			assert_eq!(
+				para_reg, 0,
+				"the chain has {para_reg} ParaRegistration proxies but none paired with an Any \
+				 delegate — the dispatch fixture is broken, not absent"
+			);
+		}
 		(ct_bound, nonce0, dispatch)
 	});
 	assert!(!ct_bound_proxies.is_empty(), "live snapshot has portable proxies");
@@ -973,7 +1008,10 @@ async fn full_migration_rc_to_ct() {
 			.iter()
 			.filter(|(_, had_any, existed, _)| *had_any && *existed)
 			.map(|(who, ..)| {
-				let d = frame_system::Account::<Ct>::get(who).data;
+				// Keyed by the relay-chain account, but read at the address it continues under
+				// here — a para sovereign already has a Coretime balance under its `sibl…` name,
+				// and missing it would look like the migration invented money.
+				let d = frame_system::Account::<Ct>::get(translate_destination(who)).data;
 				(who.clone(), d.free + d.reserved)
 			})
 			.collect();
@@ -1001,11 +1039,21 @@ async fn full_migration_rc_to_ct() {
 			.collect()
 	});
 
+	// The relay chain's existential deposit: below it, accounts are reaped rather than migrated.
+	let rc_existential_deposit: u128 =
+		<crate::mock::network::relay::Runtime as pallet_balances::Config>::ExistentialDeposit::get();
+
+	// The preimages that must not survive: `can_migrate` refuses any account holding a named
+	// hold, so one preimage deposit strands that account's whole balance. The migration releases
+	// them itself in `AccountsInit`; this only records what was there so the post-check can prove
+	// it happened.
+	let preimages_before = rc.execute_with(|| pallet_preimage::RequestStatusFor::<Rc>::iter().count());
+
 	// WHEN the whole migration runs, DMP shuttled after every burst of RC blocks.
 	rc.execute_with(|| {
 		let start = frame_system::Pallet::<Rc>::block_number() + 1;
 		pallet_rc2_migrator::Pallet::<Rc>::force_set_stage(
-			polkadot_runtime::RuntimeOrigin::root(),
+			crate::mock::network::relay::RuntimeOrigin::root(),
 			RcStage::Scheduled { start },
 		)
 		.expect("root may set the stage");
@@ -1022,30 +1070,30 @@ async fn full_migration_rc_to_ct() {
 				next_block_rc();
 			}
 			(
-				take_dmp(CoretimePolkadot::PARA_ID.into()),
-				take_dmp(AssetHubPolkadot::PARA_ID.into()),
+				take_dmp(CoretimePara::PARA_ID.into()),
+				take_dmp(AssetHubPara::PARA_ID.into()),
 				RcMigrationStage::<Rc>::get(),
 			)
 		});
 		rc.commit_all().unwrap();
 
 		ct.execute_with(|| {
-			enqueue_dmp::<CoretimePolkadot>(ct_dmp);
+			enqueue_dmp::<CoretimePara>(ct_dmp);
 			for _ in 0..3 {
-				next_block_para::<CoretimePolkadot>();
+				next_block_para::<CoretimePara>();
 			}
 		});
 		ct.commit_all().unwrap();
 
 		ah.execute_with(|| {
-			enqueue_dmp::<AssetHubPolkadot>(ah_dmp);
+			enqueue_dmp::<AssetHubPara>(ah_dmp);
 			for _ in 0..3 {
-				next_block_para::<AssetHubPolkadot>();
+				next_block_para::<AssetHubPara>();
 				// A trapped asset means a teleport failed half-way; that must never pass.
 				assert!(
 					!frame_system::Pallet::<Ah>::events().into_iter().any(|r| matches!(
 						r.event,
-						asset_hub_polkadot_runtime::RuntimeEvent::PolkadotXcm(
+						crate::mock::network::ah::RuntimeEvent::PolkadotXcm(
 							pallet_xcm::Event::AssetsTrapped { .. }
 						)
 					)),
@@ -1139,13 +1187,15 @@ async fn full_migration_rc_to_ct() {
 				"fund-less proxy entries (v1 husks) must be deleted, found {who:?}"
 			);
 		}
-		let residual = pallet_proxy::Proxies::<Rc>::get(&proxy_dispatch.0).0;
-		assert!(
-			residual
-				.iter()
-				.all(|d| PortableProxyType::try_from(d.proxy_type.clone()).is_err()),
-			"the manager's translatable defs must have left the RC"
-		);
+		if let Some((manager, ..)) = &proxy_dispatch {
+			let residual = pallet_proxy::Proxies::<Rc>::get(manager).0;
+			assert!(
+				residual
+					.iter()
+					.all(|d| PortableProxyType::try_from(d.proxy_type.clone()).is_err()),
+				"the manager's translatable defs must have left the RC"
+			);
+		}
 
 		// Every funded pot is gone; its balance teleported to the same address on AH.
 		for (who, amount) in &sweep_pots {
@@ -1156,6 +1206,24 @@ async fn full_migration_rc_to_ct() {
 				);
 			}
 		}
+
+		// No preimage deposit survived. The migration releases them in `AccountsInit`, because
+		// `can_migrate` refuses any account holding a named hold — on Kusama one preimage was
+		// holding back a para manager with 539 KSM of registrar deposits.
+		//
+		// A *requested* preimage keeps its blob and loses only its ticket, so this asserts on the
+		// deposits, not on the preimages themselves.
+		let deposits_left = pallet_preimage::RequestStatusFor::<Rc>::iter()
+			.filter(|(_, status)| match status {
+				pallet_preimage::RequestStatus::Unrequested { .. } => true,
+				pallet_preimage::RequestStatus::Requested { maybe_ticket, .. } =>
+					maybe_ticket.is_some(),
+			})
+			.count();
+		assert_eq!(
+			deposits_left, 0,
+			"every preimage deposit must be released ({preimages_before} existed before)"
+		);
 
 		// The RC end state: not a single planck remains anywhere, and every surviving record
 		// earns its place — something still references it (session key-holders being the known
@@ -1218,13 +1286,21 @@ async fn full_migration_rc_to_ct() {
 			"balance bookkeeping is exact"
 		);
 		assert_eq!(pallet_balances::TotalIssuance::<Rc>::get(), tracker.kept);
+		// Where the relay chain's issuance went. Printed on every run because it is the headline
+		// number anyone reviewing a migration wants, and it differs per network.
+		println!("\n### the relay chain drained {:.4} {TOKEN}", dot(rc_ti_before));
+		println!("  to Coretime, held:  {:.4}", dot(tracker.ct_reserved));
+		println!("  to Coretime, free:  {:.4}", dot(tracker.ct_free));
+		println!("  to Asset Hub:       {:.4}", dot(tracker.ah_free));
+		println!("  burned (TI corr.):  {:.4}", dot(tracker.ti_corrected));
+		println!("  kept behind:        {:.4}", dot(tracker.kept));
 		// The headline: the relay chain ends the migration with ZERO issuance.
-		assert_eq!(tracker.kept, 0, "the RC must drain to exactly zero DOT");
+		assert_eq!(tracker.kept, 0, "the RC must drain to exactly zero issuance");
 		// The audited phantom issuance was burned in full: the runtime constant equals the
 		// measured unaccounted issuance on this snapshot, so nothing remains and no anomaly.
 		assert_eq!(
 			tracker.ti_corrected,
-			polkadot_runtime::TiCorrection::get(),
+			crate::mock::network::relay::TiCorrection::get(),
 			"TI correction burned exactly the audited amount"
 		);
 		(tracker, migrated_nonce0)
@@ -1382,14 +1458,14 @@ async fn full_migration_rc_to_ct() {
 			// carried across; if it silently failed, the manager would regain control of a live
 			// parachain.
 			let refused = pallet_registrar_para::Pallet::<Ct>::deregister(
-				coretime_polkadot_runtime::RuntimeOrigin::signed(manager.clone()),
+				crate::mock::network::ct::RuntimeOrigin::signed(manager.clone()),
 				*para_id,
 			);
 			assert!(refused.is_err(), "a locked migrated para must refuse its manager");
 
 			// And the manager may still lock further: locking is never blocked by a lock.
 			assert_ok!(pallet_registrar_para::Pallet::<Ct>::add_lock(
-				coretime_polkadot_runtime::RuntimeOrigin::signed(manager),
+				crate::mock::network::ct::RuntimeOrigin::signed(manager),
 				*para_id,
 			));
 		}
@@ -1403,7 +1479,7 @@ async fn full_migration_rc_to_ct() {
 			// A reserved id is dropped locally, deposit returned, without ever touching the
 			// relay chain — so it works even though nothing is listening up there any more.
 			assert_ok!(pallet_registrar_para::Pallet::<Ct>::deregister(
-				coretime_polkadot_runtime::RuntimeOrigin::signed(info.manager.clone()),
+				crate::mock::network::ct::RuntimeOrigin::signed(info.manager.clone()),
 				*para_id,
 			));
 			assert!(pallet_registrar_para::Paras::<Ct>::get(*para_id).is_none());
@@ -1436,16 +1512,17 @@ async fn full_migration_rc_to_ct() {
 		// Re-attribution must not create holds out of thin air: the sum of holds under each
 		// attributed reason equals its re-attributed total.
 		let reg_id =
-			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::RegistrarDeposit);
+			crate::mock::network::ct::RuntimeHoldReason::CtMigrator(HoldReason::RegistrarDeposit);
 		let hrmp_id =
-			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::HrmpDeposit);
+			crate::mock::network::ct::RuntimeHoldReason::CtMigrator(HoldReason::HrmpDeposit);
 		let proxy_id =
-			coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(HoldReason::ProxyDeposit);
-		let unattributed_id = coretime_polkadot_runtime::RuntimeHoldReason::CtMigrator(
+			crate::mock::network::ct::RuntimeHoldReason::CtMigrator(HoldReason::ProxyDeposit);
+		let unattributed_id = crate::mock::network::ct::RuntimeHoldReason::CtMigrator(
 			HoldReason::UnattributedReserve,
 		);
 		let (mut reg_held, mut hrmp_held, mut proxy_held, mut unattributed_held) =
 			(0u128, 0u128, 0u128, 0u128);
+		let mut proxy_stuck: Vec<(AccountId32, u128)> = Vec::new();
 		for who in frame_system::Account::<Ct>::iter_keys() {
 			for hold in pallet_balances::Holds::<Ct>::get(&who) {
 				if hold.id == reg_id {
@@ -1454,6 +1531,7 @@ async fn full_migration_rc_to_ct() {
 					hrmp_held += hold.amount;
 				} else if hold.id == proxy_id {
 					proxy_held += hold.amount;
+					proxy_stuck.push((who.clone(), hold.amount));
 				} else if hold.id == unattributed_id {
 					unattributed_held += hold.amount;
 				}
@@ -1472,8 +1550,8 @@ async fn full_migration_rc_to_ct() {
 			for hold in pallet_balances::Holds::<Ct>::get(&who) {
 				let is_control_plane = matches!(
 					hold.id,
-					coretime_polkadot_runtime::RuntimeHoldReason::RegistrarPara(_) |
-						coretime_polkadot_runtime::RuntimeHoldReason::HrmpPara(_)
+					crate::mock::network::ct::RuntimeHoldReason::RegistrarPara(_) |
+						crate::mock::network::ct::RuntimeHoldReason::HrmpPara(_)
 				);
 				if is_control_plane {
 					pallet_held += hold.amount;
@@ -1481,14 +1559,51 @@ async fn full_migration_rc_to_ct() {
 			}
 		}
 		assert!(pallet_held > 0, "the control-plane pallets must hold their own deposits");
-		println!("control-plane deposits held on CT: {:.4} DOT", dot(pallet_held));
+		println!("control-plane deposits held on CT: {:.4} {TOKEN}", dot(pallet_held));
 		// Every migrated proxy deposit is resized (released and re-reserved at this chain's
 		// rates) when its definitions arrive; a remaining hold would mean defs never followed.
-		assert_eq!(proxy_held, 0, "no unresized proxy deposit may remain");
+		// No para sovereign may still be holding a *migrator* hold on Coretime. This is the
+		// invariant both halves of the sovereign-translation bug violated: the accounts stage
+		// sends a child sovereign's balance to the `sibl…` address, so every stage that names an
+		// account must send the same one. A `para…` key arriving here means some stage did not
+		// translate, and the money lands on an address nothing will ever resize or refund.
+		for (who, holds) in frame_system::Account::<Ct>::iter_keys()
+			.map(|who| (who.clone(), pallet_balances::Holds::<Ct>::get(&who)))
+			.filter(|(_, h)| !h.is_empty())
+		{
+			let bytes: &[u8] = who.as_ref();
+			assert!(
+				!bytes.starts_with(b"para"),
+				"{} is a relay-chain child sovereign holding {:?} on Coretime; some stage sent an \
+				 untranslated account id",
+				ss58(&who),
+				holds.iter().map(|h| format!("{:?}", h.id)).collect::<Vec<_>>(),
+			);
+		}
+
+		if proxy_held != 0 {
+			// Name them: a bare total says nothing about whether this is one odd account or a
+			// systematic gap in which definitions travel.
+			for (who, amount) in &proxy_stuck {
+				let defs = pallet_proxy::Proxies::<Ct>::get(who).0;
+				println!(
+					"stuck proxy deposit: {} {:.4} {TOKEN} | defs on CT {:?}",
+					ss58(who),
+					dot(*amount),
+					defs.iter().map(|d| format!("{:?}", d.proxy_type)).collect::<Vec<_>>(),
+				);
+			}
+		}
+		assert_eq!(
+			proxy_held,
+			0,
+			"no unresized proxy deposit may remain ({} account(s), see the list above)",
+			proxy_stuck.len(),
+		);
 		// The RC's anomalous reserves (backed by no deposit record) must arrive parked rather
 		// than stay behind; the snapshot is known to carry some.
 		assert!(unattributed_held > 0, "unattributed reserves must arrive parked on CT");
-		println!("unattributed reserves parked on CT: {:.4} DOT", dot(unattributed_held));
+		println!("unattributed reserves parked on CT: {:.4} {TOKEN}", dot(unattributed_held));
 
 		assert_eq!(CtMintedTotal::<Ct>::get(), migrated_ct, "CT minted exactly the CT-bound burn");
 		assert_eq!(pallet_balances::TotalIssuance::<Ct>::get(), ct_ti_before + migrated_ct);
@@ -1496,78 +1611,121 @@ async fn full_migration_rc_to_ct() {
 		// AND every portable definition was recreated in the REAL proxy pallet, so keyless
 		// (pure) delegators can dispatch here from day one.
 		assert!(FailedProxies::<Ct>::iter().next().is_none(), "no proxy set may fail");
+		let failed_accounts: Vec<_> = FailedAccounts::<Ct>::iter_keys().map(|w| ss58(&w)).collect();
+		assert!(
+			failed_accounts.is_empty(),
+			"{} account(s) failed to integrate: {failed_accounts:?}",
+			failed_accounts.len(),
+		);
 		for who in &ct_bound_proxies {
+			// Under the address the account continues at here: a child sovereign's balance, its
+			// deposit and its definitions all arrive at the `sibl…` address, so the delegator is
+			// looked up there and not under its relay-chain key.
+			let here = translate_destination(who);
 			assert!(
-				!pallet_proxy::Proxies::<Ct>::get(who).0.is_empty(),
-				"delegator {who:?} must have proxies on CT"
+				!pallet_proxy::Proxies::<Ct>::get(&here).0.is_empty(),
+				"delegator {} must have proxies on CT (looked up as {})",
+				ss58(who),
+				ss58(&here),
 			);
 		}
 
 		// Funds-follow-control invariant: every never-signed delegator with an `Any` definition
-		// that migrated moved WHOLE to this chain — its balance and an `Any` def — so the
-		// delegate keeps full control. A violation would strand money nobody can use.
+		// moved WHOLE to this chain — its balance and an `Any` def — so the delegate keeps full
+		// control. A violation strands money nobody can use.
+		//
+		// No size exemption. A pure proxy's funds are reachable only through its delegate, so a
+		// below-ED one left behind is not "dust that does not matter" — it is money separated
+		// from its only key, and the amount has nothing to do with it. `can_migrate` exempts
+		// these from its below-ED rule for exactly this reason.
 		for (who, had_any, _, rc_total) in &migrated_nonce0 {
 			if !*had_any {
 				continue;
 			}
-			let d = frame_system::Account::<Ct>::get(who).data;
+			// Below-ED delegators are reaped rather than migrated — a deliberate exception, not a
+			// gap: their definitions still reach this chain so the delegate keeps the para, and a
+			// sub-ED remainder is not worth a migration path of its own. Printed, so the exception
+			// is visible in every run rather than implied by the assertion's absence.
+			if *rc_total < rc_existential_deposit {
+				println!(
+					"below-ED delegator {} reaped, {:.6} {TOKEN} not carried",
+					ss58(who),
+					dot(*rc_total),
+				);
+				continue;
+			}
+			// A para sovereign also reads as never-signed with an `Any` definition, and it is the
+			// one kind of delegator that does not keep its address: look it up where it lands.
+			let here = translate_destination(who);
+			let d = frame_system::Account::<Ct>::get(&here).data;
 			let before = ct_pures_before.get(who).copied().unwrap_or_default();
 			assert_eq!(
 				d.free + d.reserved,
 				before + rc_total,
-				"possible pure {who:?}'s whole RC balance must arrive on CT"
+				"possible pure {}'s whole RC balance must arrive on CT (as {})",
+				ss58(who),
+				ss58(&here),
 			);
 			assert!(
-				pallet_proxy::Proxies::<Ct>::get(who)
+				pallet_proxy::Proxies::<Ct>::get(&here)
 					.0
 					.iter()
-					.any(|def| def.proxy_type == coretime_polkadot_runtime::ProxyType::Any),
-				"possible pure {who:?} must have an Any definition on CT"
+					.any(|def| def.proxy_type == crate::mock::network::ct::ProxyType::Any),
+				"possible pure {} must have an Any definition on CT (as {})",
+				ss58(who),
+				ss58(&here),
 			);
 		}
 
 		// Dispatch checks through the recreated definitions: the Any delegate acts for the
-		// manager; the ParaRegistration delegate is accepted but its filter allows nothing yet.
-		let (manager, any_delegate, reg_delegate) = proxy_dispatch.clone();
-		let remark = || {
-			Box::new(coretime_polkadot_runtime::RuntimeCall::System(
-				frame_system::Call::remark_with_event { remark: b"via proxy".to_vec() },
-			))
-		};
-		let proxy_call = |force, delegate: &AccountId32| {
-			coretime_polkadot_runtime::RuntimeCall::Proxy(pallet_proxy::Call::proxy {
-				real: sp_runtime::MultiAddress::Id(manager.clone()),
-				force_proxy_type: force,
-				call: remark(),
-			})
-			.dispatch(coretime_polkadot_runtime::RuntimeOrigin::signed(delegate.clone()))
-		};
-		let executed = |records: &[frame_system::EventRecord<_, _>]| {
-			records.iter().rev().find_map(|r| match &r.event {
-				coretime_polkadot_runtime::RuntimeEvent::Proxy(
-					pallet_proxy::Event::ProxyExecuted { result },
-				) => Some(result.clone()),
-				_ => None,
-			})
-		};
+		// manager, and the ParaRegistration delegate is recognised but confined to its scope.
+		//
+		// Skipped where the snapshot has no such delegator — Kusama has no `ParaRegistration`
+		// proxies at all. The fixture asserts *why* it is absent, so this cannot quietly stop
+		// testing anything on a chain that does have them.
+		if let Some((manager, any_delegate, reg_delegate)) = proxy_dispatch.clone() {
+			let remark = || {
+				Box::new(crate::mock::network::ct::RuntimeCall::System(
+					frame_system::Call::remark_with_event { remark: b"via proxy".to_vec() },
+				))
+			};
+			let proxy_call = |force, delegate: &AccountId32| {
+				crate::mock::network::ct::RuntimeCall::Proxy(pallet_proxy::Call::proxy {
+					real: sp_runtime::MultiAddress::Id(manager.clone()),
+					force_proxy_type: force,
+					call: remark(),
+				})
+				.dispatch(crate::mock::network::ct::RuntimeOrigin::signed(delegate.clone()))
+			};
+			let executed = |records: &[frame_system::EventRecord<_, _>]| {
+				records.iter().rev().find_map(|r| match &r.event {
+					crate::mock::network::ct::RuntimeEvent::Proxy(
+						pallet_proxy::Event::ProxyExecuted { result },
+					) => Some(result.clone()),
+					_ => None,
+				})
+			};
 
-		proxy_call(Some(coretime_polkadot_runtime::ProxyType::Any), &any_delegate)
-			.expect("Any delegate may dispatch for the pure manager");
-		assert_eq!(
-			executed(&frame_system::Pallet::<Ct>::events()),
-			Some(Ok(())),
-			"the Any-proxied call must execute"
-		);
+			proxy_call(Some(crate::mock::network::ct::ProxyType::Any), &any_delegate)
+				.expect("Any delegate may dispatch for the pure manager");
+			assert_eq!(
+				executed(&frame_system::Pallet::<Ct>::events()),
+				Some(Ok(())),
+				"the Any-proxied call must execute"
+			);
 
-		proxy_call(Some(coretime_polkadot_runtime::ProxyType::ParaRegistration), &reg_delegate)
-			.expect("ParaRegistration delegate is recognised");
-		assert!(
-			matches!(executed(&frame_system::Pallet::<Ct>::events()), Some(Err(_))),
-			"the ParaRegistration filter must allow nothing until the registrar lands"
-		);
+			proxy_call(Some(crate::mock::network::ct::ProxyType::ParaRegistration), &reg_delegate)
+				.expect("ParaRegistration delegate is recognised");
+			assert!(
+				matches!(executed(&frame_system::Pallet::<Ct>::events()), Some(Err(_))),
+				"a ParaRegistration proxy must not be able to dispatch an arbitrary call"
+			);
+		} else {
+			println!("no Any+ParaRegistration delegator in this snapshot; dispatch checks skipped");
+		}
 	});
 
-	// AND Asset Hub received the teleports: issuance unchanged, the checking account (the "DOT
+	// AND Asset Hub received the teleports: issuance unchanged, the checking account (the "{TOKEN}
 	// out on the RC" ledger) drained by exactly the teleported total, the sample manager's free
 	// balance arrived, and nothing was trapped (asserted per block in the loop above).
 	let (_, ah_free_exp) = expected_split(sample.1, sample.2);
@@ -1627,18 +1785,18 @@ async fn full_migration_rc_to_ct() {
 /// receives it. These are pure encoding tests and need no snapshot.
 mod call_encoding {
 	use codec::{Decode, Encode};
-	use coretime_polkadot_runtime::para_control::{
+	use crate::mock::network::ct::para_control::{
 		HrmpRelayCalls, RegistrarRelayCalls, RelayRuntimePallets,
 	};
 	use hrmp_primitives::{ChannelId, MessageToRelayV1 as HrmpToRelay};
-	use polkadot_runtime::para_control::{
+	use crate::mock::network::relay::para_control::{
 		CoretimeRuntimePallets, HrmpParaCalls, RegistrarParaCalls,
 	};
 	use registrar_primitives::MessageToRelayV1 as RegistrarToRelay;
 	use sp_core::H256;
 
-	type RelayCall = polkadot_runtime::RuntimeCall;
-	type CoretimeCall = coretime_polkadot_runtime::RuntimeCall;
+	type RelayCall = crate::mock::network::relay::RuntimeCall;
+	type CoretimeCall = crate::mock::network::ct::RuntimeCall;
 	type AccountId = sp_runtime::AccountId32;
 
 	const PARA: u32 = 2000;
@@ -1865,12 +2023,12 @@ mod call_encoding {
 #[tokio::test]
 async fn only_a_system_para_can_drive_the_relay_control_plane() {
 	let mut rc = load(Chain::Relay).await;
-	type Rc = polkadot_runtime::Runtime;
-	let coretime: polkadot_primitives::Id = CoretimePolkadot::PARA_ID.into();
+	type Rc = crate::mock::network::relay::Runtime;
+	let coretime: polkadot_primitives::Id = CoretimePara::PARA_ID.into();
 
 	// A deregistration request for a para that does not exist. The verdict does not matter —
 	// what matters is that a verdict is produced at all, which only happens if the call ran.
-	let call = polkadot_runtime::RuntimeCall::RegistrarRelay(
+	let call = crate::mock::network::relay::RuntimeCall::RegistrarRelay(
 		pallet_registrar_relay::Call::deregister {
 			message: registrar_primitives::MessageToRelay::V1(
 				registrar_primitives::MessageToRelayV1::Deregister {
@@ -1912,12 +2070,12 @@ async fn only_a_system_para_can_drive_the_relay_control_plane() {
 		let now = frame_system::Pallet::<Rc>::block_number() + 1;
 		frame_system::Pallet::<Rc>::set_block_number(now);
 		frame_system::Pallet::<Rc>::reset_events();
-		<polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		<crate::mock::network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
 
 		let refused = frame_system::Pallet::<Rc>::events().into_iter().any(|record| {
 			matches!(
 				record.event,
-				polkadot_runtime::RuntimeEvent::MessageQueue(
+				crate::mock::network::relay::RuntimeEvent::MessageQueue(
 					pallet_message_queue::Event::Processed { success: false, .. }
 				)
 			)

@@ -16,6 +16,13 @@ ct coretime-polkadot wss://polkadot-coretime-rpc.polkadot.io:443
 
 default: test
 
+# Run the suite against Kusama. Same tests, `--features kusama` swaps which runtimes they bind to.
+test-kusama *args:
+	SNAP_RC="{{ snap_dir }}/snap_rc_ksm.snap" \
+	SNAP_AH="{{ snap_dir }}/snap_ah_ksm.snap" \
+	SNAP_CT="{{ snap_dir }}/snap_ct_ksm.snap" \
+		cargo test -p polkadot-integration-tests-minimal-relay --features kusama {{ args }}
+
 # Run the integration tests, fetching missing snapshots first. Extra args go to `cargo test`.
 test *args: _ensure-snapshots
 	SNAP_RC="{{ snap_dir }}/snap_rc.snap" \

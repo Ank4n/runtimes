@@ -51,6 +51,7 @@ frame_support::construct_runtime!(
 		Registrar: paras_registrar,
 		Multisig: pallet_multisig,
 		Proxy: pallet_proxy,
+		Preimage: pallet_preimage,
 		Rc2Migrator: pallet_rc2_migrator,
 	}
 );
@@ -221,6 +222,32 @@ parameter_types! {
 	pub const AnnouncementDepositFactor: u128 = 6;
 	pub const MaxProxies: u16 = 4;
 	pub const MaxPending: u16 = 4;
+}
+
+parameter_types! {
+	pub const PreimageBaseDeposit: u128 = 1;
+	pub const PreimageByteDeposit: u128 = 1;
+	pub const PreimageHoldReason: RuntimeHoldReason =
+		RuntimeHoldReason::Preimage(pallet_preimage::HoldReason::Preimage);
+}
+
+impl pallet_preimage::Config for Test {
+	type RuntimeEvent = RuntimeEvent;
+	type WeightInfo = ();
+	type Currency = Balances;
+	// Root, matching both live relay runtimes: the migration unnotes every preimage as Root
+	// during `AccountsInit`.
+	type ManagerOrigin = EnsureRoot<AccountId32>;
+	type Consideration = frame_support::traits::fungible::HoldConsideration<
+		AccountId32,
+		Balances,
+		PreimageHoldReason,
+		frame_support::traits::LinearStoragePrice<
+			PreimageBaseDeposit,
+			PreimageByteDeposit,
+			u128,
+		>,
+	>;
 }
 
 impl pallet_proxy::Config for Test {

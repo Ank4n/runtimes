@@ -107,13 +107,23 @@ impl<T: Config> ProxyMigrator<T> {
 				let delegates: Vec<_> = travel
 					.into_iter()
 					.map(|(def, portable)| migrator_types::PortableProxyDelegate {
-						delegate: def.delegate,
+						// Translated for the same reason as the delegator below: a parachain that
+						// is somebody's delegate is a different address on the destination.
+						delegate: super::accounts::AccountsMigrator::<T>::translate_destination(
+							&def.delegate,
+						),
 						proxy_type: portable.expect("partition kept only Ok conversions; qed"),
 						delay: def.delay.unique_saturated_into(),
 					})
 					.collect();
 				batch.push(PortableProxy {
-					delegator: who.clone(),
+					// The address this account continues under on the destination. The accounts
+					// stage sends a child sovereign's balance — and its `ProxyDeposit` hold — to
+					// the *sibling* address, so sending the delegations under the raw relay-chain
+					// key would put the hold on one account and the definitions on another: the
+					// hold is never resized, and the parachain's proxy is recreated under an
+					// address that is not that parachain.
+					delegator: super::accounts::AccountsMigrator::<T>::translate_destination(&who),
 					delegates: delegates
 						.try_into()
 						.map_err(|_| Error::<T>::FailedToWithdrawAccount)?,

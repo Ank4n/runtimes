@@ -1677,10 +1677,10 @@ parameter_types! {
 	/// Audited issuance held by no account ("phantom issuance"), burned at the end of the
 	/// migration.
 	///
-	/// TODO: **must be measured on Kusama before any real run.** The `balance_census` test prints
-	/// the exact value at a given block; the number below is a placeholder of zero, which burns
-	/// nothing and is the only safe default — over-burning is unrecoverable.
-	pub const TiCorrection: u128 = 0;
+	/// Measured by the `balance_census` test against the 28 Aug 2026 snapshot, which prints the
+	/// exact planck value. Re-measure and update ahead of the real run: this is a one-shot burn,
+	/// and burning more than the chain actually carries is unrecoverable.
+	pub const TiCorrection: u128 = 2_052_086_889_496;
 	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
 	/// One KSM, mirroring Polkadot's one DOT — the two are different amounts of money, and the
 	/// point is a usable buffer on each chain rather than a matching number.

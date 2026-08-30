@@ -30,8 +30,38 @@ use frame_support::{
 };
 use frame_system::pallet_prelude::BlockNumberFor;
 use polkadot_primitives::UpwardMessage;
-use polkadot_runtime::{Block as PolkadotBlock, Runtime as Polkadot};
-use polkadot_runtime_constants::system_parachain;
+/// The three runtimes under test, chosen by the `kusama` feature.
+///
+/// Everything else in this crate goes through these aliases, so the suite is written once and runs
+/// against either network. Nothing here may name a network directly.
+#[cfg(not(feature = "kusama"))]
+pub mod network {
+	pub use asset_hub_polkadot_runtime as ah;
+	pub use coretime_polkadot_runtime as ct;
+	pub use polkadot_runtime as relay;
+	pub use polkadot_runtime_constants as constants;
+
+	pub const NAME: &str = "Polkadot";
+	pub const RELAY_RPC: &str = "wss://try-runtime.polkadot.io:443";
+	pub const AH_RPC: &str = "wss://polkadot-asset-hub-rpc.polkadot.io:443";
+	pub const CT_RPC: &str = "wss://polkadot-coretime-rpc.polkadot.io:443";
+}
+
+#[cfg(feature = "kusama")]
+pub mod network {
+	pub use asset_hub_kusama_runtime as ah;
+	pub use coretime_kusama_runtime as ct;
+	pub use kusama_runtime as relay;
+	pub use kusama_runtime_constants as constants;
+
+	pub const NAME: &str = "Kusama";
+	pub const RELAY_RPC: &str = "wss://kusama-try-runtime-node.parity-chains.parity.io:443";
+	pub const AH_RPC: &str = "wss://kusama-asset-hub-rpc.polkadot.io:443";
+	pub const CT_RPC: &str = "wss://kusama-coretime-rpc.polkadot.io:443";
+}
+
+use network::relay::{Block as RelayBlock, Runtime as Polkadot};
+use network::constants::system_parachain;
 use remote_externalities::{Builder, Mode, OfflineConfig};
 use runtime_parachains::{
 	configuration::ActiveConfig,
@@ -73,17 +103,17 @@ pub trait Para {
 	const CHAIN: Chain;
 }
 
-pub struct AssetHubPolkadot;
-impl Para for AssetHubPolkadot {
-	type Runtime = asset_hub_polkadot_runtime::Runtime;
+pub struct AssetHubPara;
+impl Para for AssetHubPara {
+	type Runtime = network::ah::Runtime;
 	const PARA_ID: u32 = system_parachain::ASSET_HUB_ID;
 	const NAME: &'static str = "runtime::asset-hub";
 	const CHAIN: Chain = Chain::AssetHub;
 }
 
-pub struct CoretimePolkadot;
-impl Para for CoretimePolkadot {
-	type Runtime = coretime_polkadot_runtime::Runtime;
+pub struct CoretimePara;
+impl Para for CoretimePara {
+	type Runtime = network::ct::Runtime;
 	const PARA_ID: u32 = system_parachain::BROKER_ID;
 	const NAME: &'static str = "runtime::coretime";
 	const CHAIN: Chain = Chain::Coretime;
@@ -113,7 +143,7 @@ pub enum Chain {
 impl Chain {
 	pub const fn name(self) -> &'static str {
 		match self {
-			Chain::Relay => "Polkadot",
+			Chain::Relay => network::NAME,
 			Chain::AssetHub => "Asset Hub",
 			Chain::Coretime => "Coretime",
 		}
@@ -131,9 +161,9 @@ impl Chain {
 	/// snapshot. Must stay in sync with the `chains` table in the justfile.
 	pub const fn rpc(self) -> &'static str {
 		match self {
-			Chain::Relay => "wss://try-runtime.polkadot.io:443",
-			Chain::AssetHub => "wss://polkadot-asset-hub-rpc.polkadot.io:443",
-			Chain::Coretime => "wss://polkadot-coretime-rpc.polkadot.io:443",
+			Chain::Relay => network::RELAY_RPC,
+			Chain::AssetHub => network::AH_RPC,
+			Chain::Coretime => network::CT_RPC,
 		}
 	}
 
@@ -184,9 +214,9 @@ async fn load_snapshot_uncached(chain: Chain) -> RawSnapshot {
 	assert!(abs.exists(), "No file at {}.{}", abs.display(), chain.missing_snapshot_help());
 
 	log::info!("Loading {} snapshot from {}", chain.name(), abs.display());
-	// The `Block` type is only used for header decoding in online mode; `PolkadotBlock` works for
+	// The `Block` type is only used for header decoding in online mode; `RelayBlock` works for
 	// all three chains when loading offline snapshots.
-	let ext = Builder::<PolkadotBlock>::default()
+	let ext = Builder::<RelayBlock>::default()
 		.mode(Mode::Offline(OfflineConfig { state_snapshot: abs.display().to_string().into() }))
 		.build()
 		.await
@@ -220,10 +250,10 @@ pub async fn load_externalities() -> (TestExternalities, TestExternalities, Test
 /// runtime, so inbound messages are processed before the migrator acts) and then `Rc2Migrator`.
 pub fn next_block_rc() {
 	next_block::<Polkadot>(LOG_RC, |now| {
-		let mut weight = <polkadot_runtime::MessageQueue as OnInitialize<_>>::on_initialize(now);
-		weight += <polkadot_runtime::Rc2Migrator as OnInitialize<_>>::on_initialize(now);
-		<polkadot_runtime::MessageQueue as OnFinalize<_>>::on_finalize(now);
-		<polkadot_runtime::Rc2Migrator as OnFinalize<_>>::on_finalize(now);
+		let mut weight = <network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		weight += <network::relay::Rc2Migrator as OnInitialize<_>>::on_initialize(now);
+		<network::relay::MessageQueue as OnFinalize<_>>::on_finalize(now);
+		<network::relay::Rc2Migrator as OnFinalize<_>>::on_finalize(now);
 		weight
 	});
 	crate::events::emit_rc_block();
@@ -330,10 +360,10 @@ pub fn enqueue_dmp<P: Para>(msgs: Vec<InboundDownwardMessage>) {
 pub fn enqueue_ump(para: ParaId, msgs: Vec<UpwardMessage>) {
 	log::info!(target: LOG_RC, "Received {} UMP messages from para {}", msgs.len(), u32::from(para));
 	for msg in msgs {
-		sanity_check_xcm::<polkadot_runtime::RuntimeCall>(&msg);
+		sanity_check_xcm::<network::relay::RuntimeCall>(&msg);
 
 		let bounded: BoundedVec<u8, _> = msg.try_into().expect("UMP message too big");
-		polkadot_runtime::MessageQueue::enqueue_message(
+		network::relay::MessageQueue::enqueue_message(
 			bounded.as_bounded_slice(),
 			RcMessageOrigin::Ump(UmpQueueId::Para(para)),
 		);

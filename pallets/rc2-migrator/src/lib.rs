@@ -234,6 +234,11 @@ pub mod pallet {
 			Currency = pallet_balances::Pallet<Self>,
 			ProxyType: TryInto<PortableProxyType>,
 		>
+		// Preimage deposits are released before the accounts stage runs: they are named holds,
+		// and `can_migrate` refuses any account that has one. The bound is on the pallet rather
+		// than a `StorePreimage` seam because the deposits have to be *enumerated*, which only
+		// the pallet's storage can do. See `release_preimage_deposits`.
+		+ pallet_preimage::Config
 	{
 		/// The overarching event type.
 		#[allow(deprecated)]
@@ -438,6 +443,9 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::AccountsInit => {
+					// Before anything is measured: drop every preimage deposit, so accounts that
+					// hold one are not skipped by `can_migrate`.
+					accounts::AccountsMigrator::<T>::release_preimage_deposits();
 					let total_issuance = <T as Config>::Currency::total_issuance();
 					RcMigratedBalance::<T>::put(MigratedBalances {
 						kept: total_issuance,

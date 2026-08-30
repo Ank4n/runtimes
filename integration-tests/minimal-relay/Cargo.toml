@@ -46,4 +46,18 @@ coretime-polkadot-runtime = { workspace = true, default-features = true }
 polkadot-runtime = { workspace = true, default-features = true }
 kusama-runtime = { workspace = true, default-features = true }
 pallet-society = { workspace = true, default-features = true }
+pallet-preimage = { workspace = true, default-features = true }
+pallet-multisig = { workspace = true, default-features = true }
+pallet-delegated-staking = { workspace = true, default-features = true }
+pallet-referenda = { workspace = true, default-features = true }
+pallet-scheduler = { workspace = true, default-features = true }
+asset-hub-kusama-runtime = { workspace = true, default-features = true }
+coretime-kusama-runtime = { workspace = true, default-features = true }
+kusama-runtime-constants = { workspace = true, default-features = true }
 polkadot-runtime-constants = { workspace = true, default-features = true }
+
+[features]
+default = []
+# Run the whole suite against Kusama instead of Polkadot. The tests are network-agnostic; this
+# only swaps which runtimes `mock::network` resolves to, and which snapshots the justfile passes.
+kusama = []

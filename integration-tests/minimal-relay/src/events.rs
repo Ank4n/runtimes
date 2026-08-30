@@ -84,8 +84,8 @@ pub fn emit_rc_census(phase: &str) {
 	if sink().is_none() {
 		return;
 	}
-	let block = frame_system::Pallet::<polkadot_runtime::Runtime>::block_number();
-	census("rc", phase, block, polkadot_runtime::AllPalletsWithSystem::infos());
+	let block = frame_system::Pallet::<crate::mock::network::relay::Runtime>::block_number();
+	census("rc", phase, block, crate::mock::network::relay::AllPalletsWithSystem::infos());
 }
 
 /// Like [`emit_rc_census`] for the Coretime chain.
@@ -93,8 +93,8 @@ pub fn emit_ct_census(phase: &str) {
 	if sink().is_none() {
 		return;
 	}
-	let block = frame_system::Pallet::<coretime_polkadot_runtime::Runtime>::block_number();
-	census("ct", phase, block, coretime_polkadot_runtime::AllPalletsWithSystem::infos());
+	let block = frame_system::Pallet::<crate::mock::network::ct::Runtime>::block_number();
+	census("ct", phase, block, crate::mock::network::ct::AllPalletsWithSystem::infos());
 }
 
 /// One pass over the whole top-level trie, bucketed by the 16-byte `twox128(pallet_name)`
@@ -158,7 +158,7 @@ pub fn emit_pre_facts() {
 	if sink().is_none() {
 		return;
 	}
-	type Rc = polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
 	let block = frame_system::Pallet::<Rc>::block_number();
 	let fact = |pallet: &str, key: &str, value: Value| {
 		emit("rc", block, "fact", json!({ "pallet": pallet, "key": key, "value": value }))
@@ -254,14 +254,14 @@ pub fn emit_rc_block() {
 	if sink().is_none() {
 		return;
 	}
-	type Rc = polkadot_runtime::Runtime;
+	type Rc = crate::mock::network::relay::Runtime;
 	use pallet_rc2_migrator::Event as MigEvent;
 
 	let block = frame_system::Pallet::<Rc>::block_number();
 	let e = |kind: &str, payload: Value| emit("rc", block, kind, payload);
 	for record in frame_system::Pallet::<Rc>::events() {
 		match record.event {
-			polkadot_runtime::RuntimeEvent::Rc2Migrator(ev) => match ev {
+			crate::mock::network::relay::RuntimeEvent::Rc2Migrator(ev) => match ev {
 				MigEvent::StageTransition { old, new } =>
 					e("stage", json!({ "old": stage_str(&old), "new": stage_str(&new) })),
 				MigEvent::AccountsBatchSent { count } =>
@@ -309,7 +309,7 @@ pub fn emit_rc_block() {
 					e("hrmp_batch_sent", json!({ "count": count })),
 				_ => (),
 			},
-			polkadot_runtime::RuntimeEvent::MessageQueue(
+			crate::mock::network::relay::RuntimeEvent::MessageQueue(
 				pallet_message_queue::Event::Processed { success, .. },
 			) if !success => e("mq_failed", json!({})),
 			_ => (),
@@ -344,7 +344,7 @@ pub fn emit_para_block(chain: Chain) {
 		Chain::Coretime => emit_ct_block(),
 		// Only a light state probe for AH; it is not a destination of this migration's data.
 		Chain::AssetHub => {
-			type Ah = asset_hub_polkadot_runtime::Runtime;
+			type Ah = crate::mock::network::ah::Runtime;
 			let block = frame_system::Pallet::<Ah>::block_number();
 			// The checking account is AH's ledger of "DOT out on the relay chain"; teleports
 			// from the RC drain it, so its delta is the AH-side receipt confirmation.
@@ -365,14 +365,14 @@ pub fn emit_para_block(chain: Chain) {
 }
 
 fn emit_ct_block() {
-	type Ct = coretime_polkadot_runtime::Runtime;
+	type Ct = crate::mock::network::ct::Runtime;
 	use pallet_ct_migrator::Event as MigEvent;
 
 	let block = frame_system::Pallet::<Ct>::block_number();
 	let e = |kind: &str, payload: Value| emit("ct", block, kind, payload);
 	for record in frame_system::Pallet::<Ct>::events() {
 		match record.event {
-			coretime_polkadot_runtime::RuntimeEvent::CtMigrator(ev) => match ev {
+			crate::mock::network::ct::RuntimeEvent::CtMigrator(ev) => match ev {
 				MigEvent::StageTransition { old, new } =>
 					e("stage", json!({ "old": stage_str(&old), "new": stage_str(&new) })),
 				MigEvent::AccountsReceived { count_good, count_bad } =>
@@ -406,7 +406,7 @@ fn emit_ct_block() {
 					}),
 				),
 			},
-			coretime_polkadot_runtime::RuntimeEvent::MessageQueue(
+			crate::mock::network::ct::RuntimeEvent::MessageQueue(
 				pallet_message_queue::Event::Processed { success, .. },
 			) if !success => e("mq_failed", json!({})),
 			_ => (),
