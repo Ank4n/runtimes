@@ -24,7 +24,7 @@ use polkadot_runtime_common::paras_registrar;
 use runtime_parachains::hrmp::HrmpChannels;
 use sp_core::crypto::{Ss58AddressFormat, Ss58Codec};
 use sp_runtime::{
-	traits::{AccountIdConversion, Dispatchable},
+	traits::{AccountIdConversion, Convert, Dispatchable},
 	AccountId32,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,6 +42,20 @@ fn unpaid_transact<Call: Encode>(call: Call) -> Xcm<()> {
 			call: call.encode().into(),
 		},
 	])
+}
+
+/// An XCM program that executes `call` on the destination **as the sender itself** — the shape a
+/// parachain uses to dispatch a call with its own origin, as opposed to as its sovereign account.
+fn unpaid_transact_native<Call: Encode>(call: Call) -> Vec<u8> {
+	xcm::VersionedXcm::<()>::from(Xcm(vec![
+		UnpaidExecution { weight_limit: Unlimited, check_origin: None },
+		Transact {
+			origin_kind: OriginKind::Native,
+			fallback_max_weight: None,
+			call: call.encode().into(),
+		},
+	]))
+	.encode()
 }
 
 /// Mirror of the accounts-stage split rule, for assertions: how much of an account's free
@@ -1141,6 +1155,37 @@ async fn full_migration_rc_to_ct() {
 		});
 		ct.commit_all().unwrap();
 
+		// Cores keep getting assigned, from the PRD's during-migration list. The claim queue is
+		// the collator-facing answer to "which para may build on which core", and it is refilled by
+		// the scheduler at session boundaries — so this is only a real check because the harness can
+		// now cross one mid-migration. If the migration ever disturbed the assigner or the
+		// scheduler, this is where it would show, while the machine is still running rather than
+		// after it has stopped.
+		rc.execute_with(|| {
+			let before = runtime_parachains::runtime_api_impl::v13::claim_queue::<Rc>();
+			assert!(
+				!before.is_empty(),
+				"cores must be assigned mid-migration, at stage {rc_stage:?}"
+			);
+
+			rotate_session_rc();
+
+			let after = runtime_parachains::runtime_api_impl::v13::claim_queue::<Rc>();
+			assert!(
+				!after.is_empty(),
+				"cores must still be assigned after a session boundary mid-migration, at stage \
+				 {rc_stage:?}"
+			);
+			// Not merely non-empty — the same cores, still carrying work. A queue that emptied and
+			// refilled with nothing would satisfy a bare "is_empty" check.
+			assert_eq!(
+				before.keys().collect::<BTreeSet<_>>(),
+				after.keys().collect::<BTreeSet<_>>(),
+				"the set of scheduled cores changed across a session boundary mid-migration"
+			);
+		});
+		rc.commit_all().unwrap();
+
 		// A record that reaches CT must have left the relay chain: the two sides must never
 		// both claim the same para, or there are two control planes for it at once.
 		rc.execute_with(|| {
@@ -1918,6 +1963,161 @@ async fn full_migration_rc_to_ct() {
 		// without are multisigs, controllable on every chain by their members, so their teleport
 		// here needs no per-account control check.
 	});
+
+	// --- post-migration: normal operations resume -------------------------------------------
+	//
+	// The PRD's post-migration verification list, for the parts that are this stream's: HRMP
+	// messages keep flowing, and a parachain can still manage its own channels. Both are checked
+	// against the state the migration actually produced rather than a reconstruction of it, which
+	// is the whole reason they live at the end of this test.
+
+	// The relay chain still tells every para which channels it may send on. `HrmpChannels` holding
+	// rows is necessary; this is the property that matters, because it is what a collator reads.
+	rc.execute_with(|| {
+		let mut usable = 0usize;
+		for id in HrmpChannels::<Rc>::iter_keys() {
+			let Some(constraints) = runtime_parachains::runtime_api_impl::v13::backing_constraints::<
+				Rc,
+			>(id.sender) else {
+				continue;
+			};
+			let Some((_, limits)) = constraints
+				.hrmp_channels_out
+				.iter()
+				.find(|(para, _)| *para == id.recipient)
+			else {
+				panic!("{id:?} is in HrmpChannels but not reported to its sender");
+			};
+			// Not merely present — reported with room. A channel whose capacity read as zero would
+			// be a channel a para is told it cannot send on, which is the same outage by a
+			// different route.
+			assert!(
+				limits.messages_remaining > 0 && limits.bytes_remaining > 0,
+				"{id:?} is reported with no room: {limits:?}"
+			);
+			usable += 1;
+		}
+		assert!(usable > 20, "only {usable} channels are usable; HRMP has not survived");
+	});
+	rc.commit_all().unwrap();
+
+	// And a parachain can still open a channel *by dispatching exactly the call it dispatches
+	// today*. This is the whole forwarding design end to end: the para's `Transact` lands on the
+	// relay chain, whose body forwards it to Coretime, which takes the deposit and drives the relay
+	// chain back — and the channel materialises at the session boundary like any other.
+	let (opener, target) = rc.execute_with(|| {
+        // Two live paras that have no channel between them yet, so the request is a real one.
+		let existing: BTreeSet<(u32, u32)> = HrmpChannels::<Rc>::iter_keys()
+			.map(|id| (id.sender.into(), id.recipient.into()))
+			.collect();
+		let live: Vec<u32> = paras_before_detail
+			.iter()
+			.map(|(id, _, _)| *id)
+			.filter(|id| {
+				runtime_parachains::paras::Pallet::<Rc>::is_valid_para(
+					polkadot_primitives::Id::from(*id),
+				)
+			})
+			.collect();
+		live.iter()
+			.flat_map(|a| live.iter().map(move |b| (*a, *b)))
+			.find(|(a, b)| a != b && !existing.contains(&(*a, *b)))
+			.expect("the snapshot must have two live paras without a channel between them")
+	});
+	rc.commit_all().unwrap();
+
+	// Coretime takes the channel deposit from the opener's sovereign account there, so it has to be
+	// able to pay. Funding it is legitimate setup: what is under test is the control plane, not
+	// whether this particular para happens to be solvent.
+	ct.execute_with(|| {
+		let sovereign = <<Ct as pallet_hrmp_para::Config>::SovereignAccountOf as Convert<
+			u32,
+			AccountId32,
+		>>::convert(opener);
+		let _ = <pallet_balances::Pallet<Ct> as frame_support::traits::fungible::Mutate<_>>::mint_into(
+			&sovereign,
+			10_000_000_000_000,
+		);
+	});
+	ct.commit_all().unwrap();
+
+	let request = crate::mock::network::relay::RuntimeCall::Hrmp(
+		runtime_parachains::hrmp::Call::<Rc>::hrmp_init_open_channel {
+			recipient: target.into(),
+			proposed_max_capacity: 8,
+			proposed_max_message_size: 1024,
+		},
+	);
+
+	// The para asks the relay chain — dispatched with the origin the XCM converter would hand it,
+	// rather than delivered as an XCM. The two are separable and only one of them is settled: the
+	// forwarding *logic* is what this checks, while whether a non-system para can get an XCM
+	// executed here at all after the migration is B26, which is open and needs a decision. Driving
+	// the origin directly keeps this test honest about which half it proves.
+	let to_ct = rc.execute_with(|| {
+		let _ = take_dmp(CoretimePara::PARA_ID.into());
+		frame_system::Pallet::<Rc>::reset_events();
+		assert_ok!(request.dispatch(
+			pallet_registrar_relay::Origin::Para(opener).into()
+		));
+		next_block_rc();
+		let forwarded = take_dmp(CoretimePara::PARA_ID.into());
+		assert!(
+			!forwarded.is_empty(),
+			"the relay chain must forward para {opener}'s request to Coretime, not act on it"
+		);
+		// And it must NOT have acted locally: the request belongs to Coretime now.
+		assert!(
+			runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::get(
+				&polkadot_primitives::HrmpChannelId {
+					sender: opener.into(),
+					recipient: target.into()
+				}
+			)
+			.is_none(),
+			"the relay chain must not have recorded the request itself"
+		);
+		forwarded
+	});
+	rc.commit_all().unwrap();
+
+	// Coretime records it, takes the deposit, and asks the relay chain.
+	let to_rc = ct.execute_with(|| {
+		enqueue_dmp::<CoretimePara>(to_ct);
+		next_block_para::<CoretimePara>();
+		let channel = hrmp_primitives::ChannelId { sender: opener, recipient: target };
+		let info = pallet_hrmp_para::Channels::<Ct>::get(channel)
+			.expect("Coretime must hold the channel the para asked for");
+		assert!(
+			matches!(info.state, pallet_hrmp_para::ChannelState::Opening { .. }),
+			"expected Opening, got {:?}",
+			info.state
+		);
+		assert!(info.sender_ticket.is_some(), "Coretime must hold the sender's deposit");
+		take_ump::<CoretimePara>()
+	});
+	ct.commit_all().unwrap();
+
+	// The relay chain records the request, and the session boundary is what turns it into a
+	// channel — as it is for any HRMP channel, migrated or not.
+	rc.execute_with(|| {
+		assert!(!to_rc.is_empty(), "Coretime must ask the relay chain to record the request");
+		enqueue_ump(CoretimePara::PARA_ID.into(), to_rc);
+		next_block_rc();
+
+		let id = polkadot_primitives::HrmpChannelId {
+			sender: opener.into(),
+			recipient: target.into(),
+		};
+		let request = runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::get(&id)
+			.expect("the relay chain must now hold the request");
+		assert!(!request.confirmed, "the recipient has not accepted yet");
+		assert_eq!(
+			request.sender_deposit, 0,
+			"the relay chain takes no deposit: Coretime holds the money"
+		);
+	});
+	rc.commit_all().unwrap();
 }
 
 /// The hand-written cross-chain call encodings must match the runtimes that receive them.
@@ -2465,5 +2665,184 @@ async fn channel_caps_and_who_is_near_them() {
             "Kusama now fits ({registered_paras} paras, cap {cap}) — B25 has been addressed, so \
              update the expectations in `full_migration_rc_to_ct` too"
         );
+	});
+}
+
+/// Which XCM doors are open to a **non-system** parachain on the relay chain.
+///
+/// The forwarding design rests on one: a para dispatches its own call here and this chain passes it
+/// on to the control plane. For that `Transact` to run at all it must first get past the XCM
+/// barrier, and the barrier has exactly two doors:
+///
+/// - `AllowExplicitUnpaidExecutionFrom<(IsChildSystemParachain, Fellows, ..)>` — a non-system para
+///   is none of those, so this one is shut for it.
+/// - `AllowTopLevelPaidExecutionFrom<Everything>` — open to anyone who pays, and paying means
+///   holding DOT in its sovereign account **on this chain**.
+///
+/// Which is the problem, and why this test exists: emptying those accounts is what the migration is
+/// *for*. "Zero DOT on RC" is a PRD goal and an asserted invariant of `full_migration_rc_to_ct`. So
+/// after the migration a non-system para can pay for nothing here, and the door it could otherwise
+/// use is the one closed to it. See `open.md` B26.
+///
+/// Measured on a pre-migration snapshot, where the sovereign accounts are still funded — so the
+/// paid door genuinely works today and the finding is about what the migration removes, not about
+/// something being broken now.
+#[tokio::test]
+async fn a_non_system_para_can_only_reach_the_relay_chain_by_paying() {
+	type Rc = crate::mock::network::relay::Runtime;
+	let mut rc = load(Chain::Relay).await;
+
+	let para: u32 = 2000;
+	let call = crate::mock::network::relay::RuntimeCall::Hrmp(
+		runtime_parachains::hrmp::Call::<Rc>::hrmp_init_open_channel {
+			recipient: 2001.into(),
+			proposed_max_capacity: 8,
+			proposed_max_message_size: 1024,
+		},
+	);
+
+	/// Service one UMP message and say whether the XCM executed at all.
+	fn deliver(para: u32, msg: Vec<u8>) -> bool {
+		enqueue_ump(para.into(), vec![msg]);
+		let now = frame_system::Pallet::<Rc>::block_number() + 1;
+		frame_system::Pallet::<Rc>::set_block_number(now);
+		frame_system::Pallet::<Rc>::reset_events();
+		<crate::mock::network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		frame_system::Pallet::<Rc>::events().into_iter().any(|record| {
+			matches!(
+				record.event,
+				crate::mock::network::relay::RuntimeEvent::MessageQueue(
+					pallet_message_queue::Event::Processed { success: true, .. }
+				)
+			)
+		})
+	}
+
+	rc.execute_with(|| {
+		let sovereign: AccountId32 =
+			polkadot_primitives::Id::from(para).into_account_truncating();
+		let funds = frame_system::Account::<Rc>::get(&sovereign).data.free;
+		assert!(funds > 0, "this snapshot must predate the migration for the paid door to mean anything");
+
+		// The unpaid door is shut. Not "the call is refused" — the program never runs.
+		assert!(
+			!deliver(para, unpaid_transact_native(call.clone())),
+			"a non-system para must not get unpaid execution here"
+		);
+
+		// The paid door is open, out of the para's own sovereign account on this chain — which is
+		// exactly the balance the migration takes away.
+		let fee: u128 = 1_000_000_000;
+		let paid = xcm::VersionedXcm::<()>::from(Xcm(vec![
+			WithdrawAsset((Location::here(), fee).into()),
+			BuyExecution { fees: (Location::here(), fee).into(), weight_limit: Unlimited },
+			Transact {
+				origin_kind: OriginKind::Native,
+				fallback_max_weight: None,
+				call: call.encode().into(),
+			},
+		]))
+		.encode();
+		assert!(deliver(para, paid), "a non-system para must be able to pay its way in");
+		// And it really was its own money.
+		assert!(
+			frame_system::Account::<Rc>::get(&sovereign).data.free < funds,
+			"the fee must come out of the para's sovereign account here"
+		);
+	});
+}
+
+/// Before the migration, the relay chain serves HRMP itself — the forwarding seam is inert.
+///
+/// The PRD's Phase 1 rule for this chain is *"before-migrate-v2 — same as existing"*, and this is
+/// what makes that concrete: the seam we added to `pallet_hrmp` reads the migration stage, so at
+/// `Pending` it must take the local path and write local state, exactly as it always has. Nothing
+/// should reach Coretime, whose pallets hold no state yet and would record a channel for a para it
+/// has never heard of.
+///
+/// The complementary half — that the same call *forwards* once the migration is done — is asserted
+/// at the end of `full_migration_rc_to_ct`, against the state the migration really produced.
+#[tokio::test]
+async fn before_the_migration_the_relay_chain_still_serves_hrmp_itself() {
+	type Rc = crate::mock::network::relay::Runtime;
+	let mut rc = load(Chain::Relay).await;
+
+	rc.execute_with(|| {
+		assert_eq!(
+			RcMigrationStage::<Rc>::get(),
+			pallet_rc2_migrator::MigrationStage::Pending,
+			"the snapshot must predate the migration"
+		);
+
+		// Two live paras with no channel *and no pending request* between them, so the request is
+		// a real one and not refused as a duplicate.
+		let existing: BTreeSet<(u32, u32)> = HrmpChannels::<Rc>::iter_keys()
+			.map(|id| (u32::from(id.sender), u32::from(id.recipient)))
+			.chain(
+				runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter_keys()
+					.map(|id| (u32::from(id.sender), u32::from(id.recipient))),
+			)
+			.collect();
+		// Non-system paras on both ends, so the deposit path is actually exercised: HRMP waives the
+		// deposit whenever either end is a system chain.
+		let live: Vec<u32> = HrmpChannels::<Rc>::iter_keys()
+			.map(|id| u32::from(id.sender))
+			.collect::<BTreeSet<_>>()
+			.into_iter()
+			.filter(|id| {
+				*id >= 2000 &&
+					runtime_parachains::paras::Pallet::<Rc>::is_valid_para(
+						polkadot_primitives::Id::from(*id),
+					)
+			})
+			.collect();
+		let (sender, recipient) = live
+			.iter()
+			.flat_map(|a| live.iter().map(move |b| (*a, *b)))
+			.find(|(a, b)| a != b && !existing.contains(&(*a, *b)))
+			.expect("two live paras without a channel between them");
+
+		// The sender pays the relay chain's own deposit on this path, so it has to be able to.
+		// Funding it is setup: what is under test is which code path runs, not solvency.
+		let sovereign: AccountId32 =
+			polkadot_primitives::Id::from(sender).into_account_truncating();
+		let _ = <pallet_balances::Pallet<Rc> as frame_support::traits::fungible::Mutate<_>>::mint_into(
+			&sovereign,
+			1_000_000_000_000_000,
+		);
+		let before = frame_system::Account::<Rc>::get(&sovereign).data.reserved;
+		let _ = take_dmp(CoretimePara::PARA_ID.into());
+
+		// The para asks, with the origin the XCM converter hands it.
+		assert_ok!(crate::mock::network::relay::RuntimeCall::Hrmp(
+			runtime_parachains::hrmp::Call::<Rc>::hrmp_init_open_channel {
+				recipient: recipient.into(),
+				proposed_max_capacity: 8,
+				proposed_max_message_size: 1024,
+			}
+		)
+		.dispatch(pallet_registrar_relay::Origin::Para(sender).into()));
+
+		// THEN this chain recorded it, took the deposit, and told Coretime nothing.
+		let id = polkadot_primitives::HrmpChannelId {
+			sender: sender.into(),
+			recipient: recipient.into(),
+		};
+		let request = runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::get(&id)
+			.expect("the relay chain must record the request itself before the migration");
+		// The relay chain's own configured deposit, taken on the relay chain — which is exactly
+		// what stops being true once the control plane moves.
+		let expected = runtime_parachains::configuration::ActiveConfig::<Rc>::get()
+			.hrmp_sender_deposit;
+		assert_eq!(request.sender_deposit, expected);
+		assert_eq!(
+			frame_system::Account::<Rc>::get(&sovereign).data.reserved,
+			before + expected,
+			"the deposit must be reserved on the sender's sovereign account here"
+		);
+		assert!(
+			take_dmp(CoretimePara::PARA_ID.into()).is_empty(),
+			"nothing may be forwarded to Coretime before the migration"
+		);
 	});
 }

@@ -235,6 +235,37 @@ impl Contains<RuntimeCall> for ParaControlBeforeMigration {
 	}
 }
 
+/// Proxy *mutations*, blocked while the migration is running.
+///
+/// The proxy stage rewrites this chain's `Proxies` map from the relay chain's, resizing each
+/// deposit to local rates as it goes. A user adding or removing a delegation while that is in
+/// flight either loses it — the migrated record overwrites theirs — or leaves the deposit
+/// accounting disagreeing with the map, and neither is recoverable by anything short of
+/// governance.
+///
+/// Only the calls that *mutate* the map are closed, which is the distinction the PRD draws: an
+/// existing proxy keeps working throughout, because `proxy` and `proxy_announced` read the map
+/// rather than writing it. Somebody mid-migration who relies on a proxy to reach their funds is
+/// not locked out; they simply cannot change the arrangement until it is over.
+///
+/// Opens again at `MigrationDone`, unlike the para-control gate, which opens then for the opposite
+/// reason.
+pub struct ProxyMutationsDuringMigration;
+impl Contains<RuntimeCall> for ProxyMutationsDuringMigration {
+	fn contains(c: &RuntimeCall) -> bool {
+		matches!(
+			c,
+			RuntimeCall::Proxy(
+				pallet_proxy::Call::add_proxy { .. } |
+					pallet_proxy::Call::remove_proxy { .. } |
+					pallet_proxy::Call::remove_proxies { .. } |
+					pallet_proxy::Call::create_pure { .. } |
+					pallet_proxy::Call::kill_pure { .. },
+			)
+		) && pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_ongoing()
+	}
+}
+
 /// Implements [`pallet_broker::BlockToRelayHeightConversion`] for the migration to relay chain
 /// block numbers for the broker pallet.
 pub struct BrokerMigrationV4BlockConversion;
@@ -259,7 +290,11 @@ impl pallet_broker::migration::v4::BlockToRelayHeightConversion<Runtime>
 // Configure FRAME pallets to include in runtime.
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig as frame_system::DefaultConfig)]
 impl frame_system::Config for Runtime {
-	type BaseCallFilter = EverythingBut<(IsFilteredBrokerCall, ParaControlBeforeMigration)>;
+	type BaseCallFilter = EverythingBut<(
+		IsFilteredBrokerCall,
+		ParaControlBeforeMigration,
+		ProxyMutationsDuringMigration,
+	)>;
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;
 	/// The nonce type for storing how many extrinsics an account has signed.

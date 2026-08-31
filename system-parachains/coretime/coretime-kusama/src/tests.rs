@@ -381,3 +381,58 @@ fn the_control_plane_pallets_sit_where_the_relay_chain_expects() {
 	assert_eq!(Info::index::<crate::RegistrarPara>(), Some(60));
 	assert_eq!(Info::index::<crate::HrmpPara>(), Some(61));
 }
+
+/// The PRD's during-migration rule for proxies, in its own words: *"Pallet proxy needs to be
+/// blocked, but we can only block the mutation of Proxies map. So add, remove, create, kill. This
+/// allows existing proxies to continue working."*
+///
+/// Both halves matter. Blocking the mutations stops a user's edit racing the proxy stage, which
+/// rewrites this chain's `Proxies` map from the relay chain's — an edit mid-flight is either
+/// overwritten or leaves the deposit accounting disagreeing with the map. Leaving `proxy` itself
+/// open is what stops somebody who reaches their funds *through* a proxy being locked out for the
+/// duration.
+#[test]
+fn proxy_mutations_are_blocked_only_while_the_migration_runs() {
+	use frame_support::traits::Contains;
+	use pallet_ct_migrator::{CtMigrationStage, MigrationStage};
+
+	let mutations: Vec<RuntimeCall> = vec![
+		RuntimeCall::Proxy(pallet_proxy::Call::remove_proxies {}),
+		RuntimeCall::Proxy(pallet_proxy::Call::kill_pure {
+			spawner: AccountId::from([1u8; 32]).into(),
+			proxy_type: ProxyType::Any,
+			index: 0,
+			height: 0,
+			ext_index: 0,
+		}),
+	];
+
+	// Using an existing proxy is not a mutation and must never be blocked.
+	let use_it = RuntimeCall::Proxy(pallet_proxy::Call::proxy {
+		real: AccountId::from([1u8; 32]).into(),
+		force_proxy_type: None,
+		call: Box::new(RuntimeCall::System(frame_system::Call::remark { remark: vec![] })),
+	});
+
+	ExtBuilder::<Runtime>::default().build().execute_with(|| {
+		for (stage, blocked) in [
+			(MigrationStage::Pending, false),
+			(MigrationStage::DataMigrationOngoing, true),
+			(MigrationStage::MigrationDone, false),
+		] {
+			CtMigrationStage::<Runtime>::put(stage.clone());
+
+			for call in &mutations {
+				assert_eq!(
+					!<Runtime as frame_system::Config>::BaseCallFilter::contains(call),
+					blocked,
+					"{call:?} at {stage:?}"
+				);
+			}
+			assert!(
+				<Runtime as frame_system::Config>::BaseCallFilter::contains(&use_it),
+				"an existing proxy must keep working at {stage:?}"
+			);
+		}
+	});
+}

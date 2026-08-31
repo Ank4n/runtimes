@@ -133,12 +133,24 @@ impl xcm_executor::traits::ConvertOrigin<RuntimeOrigin> for SystemChildParachain
 		kind: OriginKind,
 	) -> Result<RuntimeOrigin, Location> {
 		let origin: Location = origin.into();
-		if !SystemParachains::contains(&origin) {
-			return Err(origin);
+		if SystemParachains::contains(&origin) {
+			return ChildParachainAsNative::<parachains_origin::Origin, RuntimeOrigin>::convert_origin(
+				origin, kind,
+			);
 		}
-		ChildParachainAsNative::<parachains_origin::Origin, RuntimeOrigin>::convert_origin(
-			origin, kind,
-		)
+
+		// A non-system child parachain gets the control plane's own narrow origin instead of
+		// `parachains_origin::Origin::Parachain`. Eleven relay-chain calls accept the latter, and
+		// this converter cannot see which call is being dispatched — only the location and the
+		// origin kind — so handing a para that origin would reopen all eleven at once. This one is
+		// accepted by the nine calls a parachain dispatches for itself and by nothing else, and
+		// because no other pallet has an `EnsureOrigin` for the type, "a pallet nobody remembered
+		// to filter" is a compile-time impossibility rather than something an audit has to catch.
+		match (kind, origin.unpack()) {
+			(OriginKind::Native, (0, [Parachain(id)])) =>
+				Ok(pallet_registrar_relay::Origin::Para(*id).into()),
+			_ => Err(origin),
+		}
 	}
 }
 

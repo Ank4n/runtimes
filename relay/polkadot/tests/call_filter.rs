@@ -146,7 +146,11 @@ fn calls_that_cannot_be_forwarded_stay_closed() {
 /// `Contains<RuntimeCall>` cannot see who is calling, so without this a non-system parachain could
 /// still reach any relay-chain pallet nobody thought to filter.
 mod origins {
-	use polkadot_runtime::{xcm_config::SystemChildParachainAsNative, RuntimeOrigin};
+	use frame_support::traits::EnsureOrigin;
+	use runtime_parachains::origin as parachains_origin;
+	use polkadot_runtime::{
+		para_control::EnsureAnyParaSelf, xcm_config::SystemChildParachainAsNative, RuntimeOrigin,
+	};
 	use polkadot_runtime_constants::system_parachain::{ASSET_HUB_ID, BROKER_ID};
 	use xcm::latest::prelude::*;
 	use xcm_executor::traits::ConvertOrigin;
@@ -168,11 +172,32 @@ mod origins {
 	}
 
 	#[test]
-	fn ordinary_parachains_get_no_origin_at_all() {
-		// Not "gets an origin that every pallet then refuses" — gets none, so the `Transact`
-		// fails to convert before any call is even looked at.
-		for para in [2000, 2004, 3367] {
-			assert!(native_origin(para).is_err(), "para {para} must not dispatch here as itself");
+	fn ordinary_parachains_get_the_narrow_control_plane_origin() {
+		// Not `parachains_origin::Origin::Parachain`, which eleven calls accept — the control
+		// plane's own origin, which is accepted by the nine calls a para dispatches for itself and
+		// by nothing else. Two properties, and the second is the one that matters:
+		for para in [2000u32, 2004, 3367] {
+			let origin = native_origin(para).unwrap_or_else(|_| {
+				panic!("para {para} must dispatch here as itself, or it cannot reach the forwarders")
+			});
+
+			// It resolves to the para, for the calls that accept it.
+			assert_eq!(
+				<EnsureAnyParaSelf as EnsureOrigin<RuntimeOrigin>>::try_origin(origin.clone())
+					.ok(),
+				Some(para.into()),
+				"para {para} must resolve through the control-plane origin"
+			);
+
+			// And it is *not* the system-chain origin, so nothing that accepts only that can be
+			// reached with it — including a pallet nobody remembered to filter.
+			assert!(
+				<RuntimeOrigin as Into<Result<parachains_origin::Origin, RuntimeOrigin>>>::into(
+					origin
+				)
+				.is_err(),
+				"para {para} must not obtain the system-chain parachain origin"
+			);
 		}
 	}
 }

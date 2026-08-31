@@ -1669,6 +1669,7 @@ parameter_types! {
 
 impl parachains_hrmp::Config for Runtime {
 	type ParaRequests = crate::para_control::ForwardToCoretime;
+	type ParaSelfOrigin = crate::para_control::EnsureAnyParaSelf;
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type ChannelManager = EitherOfDiverse<
@@ -1807,6 +1808,7 @@ parameter_types! {
 
 impl paras_registrar::Config for Runtime {
 	type ParaRequests = crate::para_control::ForwardToCoretime;
+	type ParaSelfOrigin = crate::para_control::EnsureAnyParaSelf;
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;

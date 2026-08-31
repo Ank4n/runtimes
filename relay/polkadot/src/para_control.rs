@@ -129,6 +129,40 @@ pub enum HrmpParaCalls {
 	EstablishSystemChannel(u32, u32),
 }
 
+/// A parachain acting for itself, whether or not it is a system chain.
+///
+/// The calls a parachain dispatches for itself accept this; every other call that accepts a
+/// parachain keeps `EnsureParachain` and so stays system-chains-only. Two shapes arrive here:
+///
+/// - a **system** chain, as `parachains_origin::Origin::Parachain` — unchanged from today;
+/// - any **other** parachain, as `pallet_registrar_relay::Origin::Para`, which the XCM origin
+///   converter hands it precisely so that it reaches these calls and nothing else.
+pub struct EnsureAnyParaSelf;
+
+impl EnsureOrigin<RuntimeOrigin> for EnsureAnyParaSelf {
+	type Success = polkadot_primitives::Id;
+
+	fn try_origin(o: RuntimeOrigin) -> Result<Self::Success, RuntimeOrigin> {
+		// A non-system parachain, through the narrow origin the XCM converter hands it.
+		let o =
+			match <RuntimeOrigin as Into<Result<pallet_registrar_relay::Origin, RuntimeOrigin>>>::into(o) {
+				Ok(pallet_registrar_relay::Origin::Para(id)) => return Ok(id.into()),
+				Err(o) => o,
+			};
+
+		// A system chain, exactly as before.
+		match <RuntimeOrigin as Into<Result<parachains_origin::Origin, RuntimeOrigin>>>::into(o) {
+			Ok(parachains_origin::Origin::Parachain(id)) => Ok(id),
+			Err(o) => Err(o),
+		}
+	}
+
+	#[cfg(feature = "runtime-benchmarks")]
+	fn try_successful_origin() -> Result<RuntimeOrigin, ()> {
+		Err(())
+	}
+}
+
 /// Forwards a parachain's own registrar and HRMP requests to the Coretime chain.
 ///
 /// This is what keeps a parachain's encoded call unchanged after the control plane moves: the relay
