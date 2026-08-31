@@ -12434,6 +12434,7 @@ dependencies = [
  "kusama-runtime-constants",
  "log",
  "migrator-types",
+ "pallet-babe",
  "pallet-balances",
  "pallet-ct-migrator",
  "pallet-delegated-staking",

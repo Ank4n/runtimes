@@ -259,6 +259,39 @@ pub fn next_block_rc() {
 	crate::events::emit_rc_block();
 }
 
+/// Rotate the Relay Chain into its next session, running the full parachains initializer.
+///
+/// [`next_block_rc`] deliberately runs only the hooks the *migration* needs, so on its own it never
+/// crosses a session boundary. But most of the parachain machinery moves only at one: `paras`
+/// promotes a registration (and takes `SESSION_DELAY` = 2 boundaries to do it), and `hrmp` turns an
+/// accepted open request into an actual channel. A suite that never rotates cannot tell a working
+/// registration from one that silently went nowhere.
+///
+/// Drives `pallet_session::rotate_session`, which is what the real chain calls, so `Initializer`
+/// and every pallet hanging off it see exactly what they would in production.
+pub fn rotate_session_rc() {
+	// `rotate_session` notifies every session handler, Babe among them, and Babe's
+	// `enact_epoch_change` asserts that per-block initialization has run — normally
+	// `Babe::on_initialize` sets this from the block author's pre-digest, which a snapshot test has
+	// no way to produce. Marking the block initialized with no pre-digest is enough: the epoch
+	// change reads the slot from storage, not from the digest.
+	pallet_babe::Initialized::<Polkadot>::mutate(|initialized| *initialized = Some(None));
+	pallet_session::Pallet::<Polkadot>::rotate_session();
+
+	// The parachains `Initializer` only *buffers* the session notification; it applies it at block
+	// finalization, so that the runtime APIs and the next block observe the new session. Without
+	// this the session index never actually advances and nothing downstream of it moves.
+	let now = frame_system::Pallet::<Polkadot>::block_number();
+	<runtime_parachains::initializer::Pallet<Polkadot> as OnFinalize<_>>::on_finalize(now);
+
+	log::info!(target: LOG_RC, "Rotated into session {}", session_index_rc());
+}
+
+/// The Relay Chain's current parachains session index.
+pub fn session_index_rc() -> u32 {
+	runtime_parachains::shared::CurrentSessionIndex::<Polkadot>::get()
+}
+
 /// Execute the next block on parachain `P`. Same hooks and assertions as [`next_block_rc`].
 pub fn next_block_para<P: Para>() {
 	next_block::<P::Runtime>(P::NAME, |now| {

@@ -610,19 +610,20 @@ fn registrar_stage_moves_next_free_id_and_drains_records() {
 // HRMP stage
 // ---------------------------------------------------------------------------
 
+/// The HRMP stage copies records to Coretime and keeps the relay chain's own, because the relay
+/// chain still routes every message through `HrmpChannels` and still completes handshakes from
+/// `HrmpOpenChannelRequests` at a session boundary. Only the deposits move.
 #[test]
-fn hrmp_stage_drains_requests_and_channels() {
+fn hrmp_stage_copies_requests_and_channels_and_keeps_them_deposit_free() {
 	new_test_ext().execute_with(|| {
+		// GIVEN one open channel with deposits at both ends, and one unconfirmed request.
 		open_channel(2000, 2001, 70, 30);
 		open_request(2000, 2002, 25);
 
-		hrmp::HrmpMigrator::<Test>::drain_open_requests().unwrap();
-		assert!(parachains_hrmp::HrmpOpenChannelRequests::<Test>::iter().next().is_none());
-		assert!(parachains_hrmp::HrmpOpenChannelRequestsList::<Test>::get().is_empty());
-		assert_eq!(
-			parachains_hrmp::HrmpOpenChannelRequestCount::<Test>::get(ParaId::from(2000)),
-			0
-		);
+		// WHEN the requests are copied.
+		hrmp::HrmpMigrator::<Test>::copy_open_requests().unwrap();
+
+		// THEN Coretime is told the deposit that was taken...
 		assert_eq!(
 			decode_ct_calls(&take_sent_xcm()),
 			vec![CtMigratorCall::ReceiveHrmpRequests {
@@ -639,9 +640,27 @@ fn hrmp_stage_drains_requests_and_channels() {
 		);
 		assert!(migrator_events().contains(&Event::HrmpRequestsSent { count: 1 }));
 
+		// ...and the request stays here so the session boundary can still promote it, with the
+		// deposit zeroed so a cancellation does not refund money that has left the chain. The
+		// counts stay too: the relay chain still bounds requests per para.
+		let request_id = HrmpChannelId { sender: ParaId::from(2000), recipient: ParaId::from(2002) };
+		let request = parachains_hrmp::HrmpOpenChannelRequests::<Test>::get(&request_id)
+			.expect("the open request must stay on the relay chain");
+		assert_eq!(request.sender_deposit, 0);
+		assert_eq!(
+			parachains_hrmp::HrmpOpenChannelRequestsList::<Test>::get(),
+			vec![request_id]
+		);
+		assert_eq!(
+			parachains_hrmp::HrmpOpenChannelRequestCount::<Test>::get(ParaId::from(2000)),
+			1
+		);
+
+		// WHEN the channels are copied.
 		let done = hrmp::HrmpMigrator::<Test>::migrate_many(None).unwrap();
 		assert_eq!(done, None);
-		assert!(parachains_hrmp::HrmpChannels::<Test>::iter().next().is_none());
+
+		// THEN Coretime is told both deposits...
 		assert_eq!(
 			decode_ct_calls(&take_sent_xcm()),
 			vec![CtMigratorCall::ReceiveHrmp {
@@ -656,6 +675,15 @@ fn hrmp_stage_drains_requests_and_channels() {
 				}],
 			}]
 		);
+
+		// ...and the channel stays here, deposit-free, so messages still route.
+		let channel_id = HrmpChannelId { sender: ParaId::from(2000), recipient: ParaId::from(2001) };
+		let channel = parachains_hrmp::HrmpChannels::<Test>::get(&channel_id)
+			.expect("the channel must stay on the relay chain: it is what routes messages");
+		assert_eq!(channel.sender_deposit, 0);
+		assert_eq!(channel.recipient_deposit, 0);
+		assert_eq!(channel.max_capacity, 8);
+		assert_eq!(channel.max_message_size, 1024);
 	});
 }
 
@@ -815,11 +843,20 @@ fn full_stage_machine_drains_the_chain_to_zero() {
 		assert_eq!(RcMigrationStage::<Test>::get(), Stage::MigrationDone);
 		assert_eq!(System::block_number(), 17 + COOL_OFF_BLOCKS);
 
-		// Every record is drained...
+		// The records Coretime now owns outright are drained...
 		assert!(paras_registrar::Paras::<Test>::iter().next().is_none());
-		assert!(parachains_hrmp::HrmpChannels::<Test>::iter().next().is_none());
-		assert!(parachains_hrmp::HrmpOpenChannelRequests::<Test>::iter().next().is_none());
 		assert!(pallet_proxy::Proxies::<Test>::iter().next().is_none());
+		// ...while the HRMP records the relay chain still reads stay, deposit-free. It routes
+		// every message through `HrmpChannels` and promotes handshakes from
+		// `HrmpOpenChannelRequests` at a session boundary; draining either would stop parachains
+		// talking to each other.
+		for (_, channel) in parachains_hrmp::HrmpChannels::<Test>::iter() {
+			assert_eq!(channel.sender_deposit, 0);
+			assert_eq!(channel.recipient_deposit, 0);
+		}
+		for (_, request) in parachains_hrmp::HrmpOpenChannelRequests::<Test>::iter() {
+			assert_eq!(request.sender_deposit, 0);
+		}
 		// ...every account is gone...
 		assert_eq!(frame_system::Account::<Test>::iter().count(), 0);
 		// ...and the ledger balances to zero, exactly.

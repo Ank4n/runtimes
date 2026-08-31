@@ -534,7 +534,7 @@ pub mod pallet {
 				},
 				MigrationStage::HrmpInit => {
 					Self::migrate_stage_once(
-						hrmp::HrmpMigrator::<T>::drain_open_requests,
+						hrmp::HrmpMigrator::<T>::copy_open_requests,
 						MigrationStage::HrmpOngoing { last_key: None },
 					);
 					T::DbWeight::get().reads_writes(200, 200)

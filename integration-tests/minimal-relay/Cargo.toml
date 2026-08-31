@@ -15,6 +15,7 @@ cumulus-primitives-core = { workspace = true, default-features = true }
 frame-support = { workspace = true, default-features = true }
 frame-system = { workspace = true, default-features = true }
 log = { workspace = true, default-features = true }
+pallet-babe = { workspace = true, default-features = true }
 pallet-balances = { workspace = true, default-features = true }
 pallet-ct-migrator = { workspace = true, default-features = true }
 pallet-registrar-para = { workspace = true, default-features = true }

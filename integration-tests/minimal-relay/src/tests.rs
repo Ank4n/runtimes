@@ -27,7 +27,7 @@ use sp_runtime::{
 	traits::{AccountIdConversion, Dispatchable},
 	AccountId32,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use xcm::latest::prelude::*;
 
 /// An XCM program that executes `call` on the destination with the sender's sovereign-account
@@ -1159,21 +1159,67 @@ async fn full_migration_rc_to_ct() {
 		}
 	}
 
-	// THEN the RC is drained: registrar and HRMP gone, issuance reduced by exactly the burn.
+	// THEN the RC has given up the registry, kept what it still routes on, and reduced issuance by
+	// exactly the burn.
 	let (tracker, migrated_nonce0) = rc.execute_with(|| {
 		crate::events::emit_rc_census("after");
 		assert!(
 			paras_registrar::Paras::<Rc>::iter().next().is_none(),
 			"all registrar records must be drained from the RC"
 		);
+
+		// The HRMP records stay. The relay chain refuses any candidate whose outbound channel it
+		// cannot find (`check_outbound_hrmp`), and it is the only thing that promotes an open
+		// request to a channel, at a session boundary. What leaves is the money: Coretime holds
+		// every deposit now, so a figure left behind here would be a refund against an account the
+		// accounts stage has emptied.
 		assert!(
-			HrmpChannels::<Rc>::iter().next().is_none(),
-			"all HRMP channel records must be drained from the RC"
+			HrmpChannels::<Rc>::iter().next().is_some(),
+			"the RC must keep its HRMP channels: it routes every message through them"
 		);
-		assert!(
-			runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter().next().is_none(),
-			"all pending HRMP requests must be dropped"
-		);
+		for (id, channel) in HrmpChannels::<Rc>::iter() {
+			assert_eq!(
+				(channel.sender_deposit, channel.recipient_deposit),
+				(0, 0),
+				"channel {id:?} kept a deposit the RC can no longer refund"
+			);
+		}
+		for (id, request) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<Rc>::iter() {
+			assert_eq!(
+				request.sender_deposit, 0,
+				"open request {id:?} kept a deposit the RC can no longer refund"
+			);
+		}
+
+		// The relay chain's own HRMP invariant, which nothing here used to check. The
+		// ingress/egress indexes must describe exactly the set of channels in `HrmpChannels`;
+		// upstream asserts this in `assert_storage_consistency_exhaustive`, which is private and
+		// `test`-gated so it cannot be called from here. The indexes are maintained incrementally
+		// and never rebuilt, so any stage that removes a channel without touching them leaves the
+		// relay chain permanently inconsistent — this is what makes that self-catching.
+		let from_ingress: BTreeSet<(u32, u32)> =
+			runtime_parachains::hrmp::HrmpIngressChannelsIndex::<Rc>::iter()
+				.flat_map(|(recipient, senders)| {
+					senders
+						.into_iter()
+						.map(move |sender| (sender.into(), recipient.into()))
+						.collect::<Vec<_>>()
+				})
+				.collect();
+		let from_egress: BTreeSet<(u32, u32)> =
+			runtime_parachains::hrmp::HrmpEgressChannelsIndex::<Rc>::iter()
+				.flat_map(|(sender, recipients)| {
+					recipients
+						.into_iter()
+						.map(move |recipient| (sender.into(), recipient.into()))
+						.collect::<Vec<_>>()
+				})
+				.collect();
+		let ground_truth: BTreeSet<(u32, u32)> = HrmpChannels::<Rc>::iter_keys()
+			.map(|id| (id.sender.into(), id.recipient.into()))
+			.collect();
+		assert_eq!(from_ingress, ground_truth, "HRMP ingress index diverged from HrmpChannels");
+		assert_eq!(from_egress, ground_truth, "HRMP egress index diverged from HrmpChannels");
 
 		// No ghost proxy records: every remaining entry's recorded deposit is backed by an
 		// actual reserve, and the dispatch-check manager's translatable defs left for CT.
@@ -2000,6 +2046,204 @@ async fn only_a_system_para_can_drive_the_relay_control_plane() {
 		assert!(
 			take_dmp(coretime).is_empty(),
 			"and it must not produce a verdict, which would mean the call had run"
+		);
+	});
+}
+
+/// Probe: can the harness cross a Relay Chain session boundary at all against a real snapshot?
+///
+/// Everything the parachain machinery does lazily happens at a session boundary, and until this
+/// existed the suite could not produce one. Kept as a test rather than folded into the helper so a
+/// snapshot or runtime change that breaks rotation is reported here, not as a confusing failure in
+/// whichever test happens to rotate first.
+#[tokio::test]
+async fn rc_can_cross_a_session_boundary() {
+	let mut rc = load(Chain::Relay).await;
+
+	rc.execute_with(|| {
+		let before = session_index_rc();
+		rotate_session_rc();
+		assert_eq!(session_index_rc(), before + 1, "the parachains session index must advance");
+
+		rotate_session_rc();
+		assert_eq!(session_index_rc(), before + 2);
+	});
+}
+
+/// A freshly registered parachain, driven the way Coretime really drives it, across the session
+/// boundaries that registration actually takes.
+///
+/// This is the gap between the suite's two halves: the SDK's cross-chain tests use mocks, so they
+/// have no `paras` lifecycle and no sessions, and `full_migration_rc_to_ct` exercises *migrated*
+/// paras, which are already live. Nothing covered a *new* registration against the real lifecycle —
+/// and `paras` takes `SESSION_DELAY` (2) boundaries to onboard one, so any test that does not rotate
+/// cannot tell a working registration from one that silently went nowhere.
+///
+/// **This test currently documents a bug.** Coretime opens the control channel as soon as the
+/// registration is confirmed, which is while the para is still `Onboarding`, and
+/// `do_init_open_channel` refuses an onboarding recipient. `EstablishSystemChannel` is unanswered,
+/// so the refusal is a relay-chain event and nothing else: Coretime records both directions as
+/// `Open` against a chain that has neither a channel nor a request. Every new parachain comes up
+/// with no control plane and nothing says so.
+///
+/// The assertions below state what *is* true today. When the fix lands, the two marked `BUG`
+/// assertions invert.
+#[tokio::test]
+async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
+	use runtime_parachains::hrmp::{HrmpChannels, HrmpOpenChannelRequests};
+	use sp_runtime::traits::{BlakeTwo256, Hash};
+
+	type Rc = crate::mock::network::relay::Runtime;
+	let mut rc = load(Chain::Relay).await;
+
+	let coretime: polkadot_primitives::Id = CoretimePara::PARA_ID.into();
+	// An id the live snapshot does not know, so the registration is a genuinely new one.
+	let fresh_id: u32 = 4_999;
+	let fresh: polkadot_primitives::Id = fresh_id.into();
+	let manager = AccountId32::new([7u8; 32]);
+	// Above `MIN_CODE_SIZE`; the relay chain takes no deposit on this path, so the manager needs
+	// no balance here — Coretime holds the money.
+	let code = vec![1u8; 32];
+	let code_hash = BlakeTwo256::hash(&code);
+	let genesis_head = vec![2u8; 16];
+
+	// Coretime asks the relay chain to accept the registration, exactly as `register` does.
+	let register = crate::mock::network::relay::RuntimeCall::RegistrarRelay(
+		pallet_registrar_relay::Call::receive {
+			message: registrar_primitives::MessageToRelay::V1(
+				registrar_primitives::MessageToRelayV1::Register {
+					para_id: fresh_id,
+					message_id: 1,
+					manager: manager.clone(),
+					genesis_head: genesis_head.clone(),
+					code_hash,
+					code_len: code.len() as u32,
+				},
+			),
+		},
+	);
+
+	// And, once the registration is confirmed, asks for its control channel — what
+	// `OnParaRegistered::on_registered` does on the Coretime side.
+	let establish = crate::mock::network::relay::RuntimeCall::HrmpRelay(
+		pallet_hrmp_relay::Call::receive {
+			message: hrmp_primitives::MessageToRelay::V1(
+				hrmp_primitives::MessageToRelayV1::EstablishSystemChannel {
+					channel: hrmp_primitives::ChannelId {
+						sender: CoretimePara::PARA_ID,
+						recipient: fresh_id,
+					},
+					message_id: 2,
+				},
+			),
+		},
+	);
+
+	let as_coretime = |call: crate::mock::network::relay::RuntimeCall| {
+		xcm::VersionedXcm::<()>::from(Xcm(vec![
+			UnpaidExecution { weight_limit: Unlimited, check_origin: None },
+			Transact {
+				origin_kind: OriginKind::Native,
+				fallback_max_weight: None,
+				call: call.encode().into(),
+			},
+		]))
+		.encode()
+	};
+
+	rc.execute_with(|| {
+		// GIVEN nothing on the relay chain knows this para id.
+		assert!(runtime_parachains::paras::Pallet::<Rc>::lifecycle(fresh).is_none());
+		let _ = take_dmp(coretime);
+
+		// WHEN Coretime requests the registration.
+		enqueue_ump(coretime, vec![as_coretime(register)]);
+		next_block_rc();
+		assert!(
+			pallet_registrar_relay::PendingRegistrations::<Rc>::contains_key(fresh_id),
+			"the relay chain must be holding the authorization"
+		);
+
+		// Mark the code trusted first, which is what skips PVF pre-checking. Without this the
+		// code needs a validator vote that no test can produce, and the *para* pays for it: at the
+		// next session `groom_ongoing_pvf_votes` rejects the unconcluded vote and offboards it, so
+		// the lifecycle goes to `None` rather than `Parathread`. Worth knowing beyond this test —
+		// on the real chain pre-checking adds its own sessions before a para onboards, so the
+		// control-channel window below is *longer* in production than the two boundaries here.
+		assert_ok!(crate::mock::network::relay::RuntimeCall::Paras(
+			runtime_parachains::paras::Call::add_trusted_validation_code {
+				validation_code: polkadot_primitives::ValidationCode(code.clone()),
+			}
+		)
+		.dispatch(frame_system::RawOrigin::Root.into()));
+
+		// WHEN the validation code is uploaded. Unsigned and feeless: the pending entry already
+		// pins the exact bytes.
+		assert_ok!(crate::mock::network::relay::RuntimeCall::RegistrarRelay(
+			pallet_registrar_relay::Call::apply_authorized_code {
+				para_id: fresh_id,
+				validation_code: code.clone(),
+			}
+		)
+		.dispatch(frame_system::RawOrigin::Authorized.into()));
+
+		// THEN the para is registered, and `Onboarding` — not yet live. This is the window the
+		// whole test is about.
+		assert_eq!(
+			runtime_parachains::paras::Pallet::<Rc>::lifecycle(fresh),
+			Some(runtime_parachains::paras::ParaLifecycle::Onboarding),
+		);
+		assert!(!runtime_parachains::paras::Pallet::<Rc>::is_valid_para(fresh));
+		assert!(
+			!take_dmp(coretime).is_empty(),
+			"the relay chain must report the registration back to Coretime"
+		);
+
+        // WHEN Coretime, having had that report, asks for the control channel.
+		enqueue_ump(coretime, vec![as_coretime(establish)]);
+		next_block_rc();
+
+		let channel =
+			polkadot_primitives::HrmpChannelId { sender: coretime, recipient: fresh };
+		let back = polkadot_primitives::HrmpChannelId { sender: fresh, recipient: coretime };
+
+		// BUG: the request is refused because the recipient is still onboarding, and the refusal
+		// goes nowhere Coretime can see it. When fixed, these become `is_some`.
+		assert!(
+			HrmpOpenChannelRequests::<Rc>::get(&channel).is_none(),
+			"BUG: no request is recorded for the control channel"
+		);
+		assert!(
+			frame_system::Pallet::<Rc>::events().into_iter().any(|record| matches!(
+				record.event,
+				crate::mock::network::relay::RuntimeEvent::HrmpRelay(
+					pallet_hrmp_relay::Event::SystemChannelRejected { .. }
+				)
+			)),
+			"BUG: the refusal is only a relay-chain event; Coretime is never told"
+		);
+
+		// WHEN the two session boundaries registration actually takes go by.
+		let before = session_index_rc();
+		rotate_session_rc();
+		rotate_session_rc();
+		assert_eq!(session_index_rc(), before + 2);
+
+		// THEN the para is live...
+		assert!(
+			runtime_parachains::paras::Pallet::<Rc>::is_valid_para(fresh),
+			"the para must be live after SESSION_DELAY boundaries"
+		);
+
+		// ...and BUG: its control channel never appeared, because the refusal was terminal and
+		// nothing retries. When fixed, both become `is_some`/`true`.
+		assert!(
+			HrmpChannels::<Rc>::get(&channel).is_none(),
+			"BUG: the live para has no inbound control channel from Coretime"
+		);
+		assert!(
+			HrmpChannels::<Rc>::get(&back).is_none(),
+			"BUG: and no outbound channel back to Coretime"
 		);
 	});
 }
