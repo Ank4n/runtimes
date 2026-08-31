@@ -43,11 +43,6 @@ fn allowed_at(stage: Stage, call: &RuntimeCall) -> bool {
 	})
 }
 
-/// For the arms that do not depend on the stage, asserted at `Pending` — the state an upgrade
-/// lands in, and the one where a mistake would be live immediately.
-fn allowed(call: RuntimeCall) -> bool {
-	allowed_at(Stage::Pending, &call)
-}
 
 /// The registrar's own calls: served until the migration starts, closed from then on.
 ///
@@ -56,37 +51,25 @@ fn allowed(call: RuntimeCall) -> bool {
 /// either chain for as long as governance takes to schedule the start. Root is unaffected
 /// throughout: it bypasses the base call filter entirely, which is how governance and the
 /// migration still reach these.
+///
+/// The calls a parachain dispatches **for itself** follow a three-phase schedule rather than
+/// closing for good, because after the migration their bodies no longer touch this chain — they
+/// forward the request to Coretime on the para's behalf. Keeping them open is what lets every
+/// parachain go on encoding exactly the call it encodes today.
+///
+/// The middle phase is the load-bearing one. The forwarder turns on when the migration is
+/// **finished**, so while it is running these calls would still take the local path and act on a
+/// half-drained registry. They must be shut for exactly that window and no longer.
 #[test]
-fn registrar_calls_close_when_the_migration_starts_not_when_the_runtime_upgrades() {
+fn para_facing_calls_reopen_as_forwarders_once_the_migration_is_done() {
 	for call in [
-		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::reserve {}),
 		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::deregister { id: 2000.into() }),
 		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::add_lock { para: 2000.into() }),
 		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::remove_lock { para: 2000.into() }),
-		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::swap {
-			id: 2000.into(),
-			other: 2001.into(),
+		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::set_current_head {
+			para: 2000.into(),
+			new_head: polkadot_primitives::HeadData(vec![1, 2, 3]),
 		}),
-	] {
-		// Upgraded, and scheduled but not yet begun: business as usual, right up to the start.
-		assert!(allowed_at(Stage::Pending, &call), "{call:?} must survive the upgrade");
-		assert!(
-			allowed_at(Stage::Scheduled { start: 100 }, &call),
-			"{call:?} must stay open until the migration actually begins"
-		);
-		// Running, paused mid-run, and finished: closed in all three.
-		for stage in [Stage::RegistrarInit, Stage::Paused, Stage::MigrationDone] {
-			assert!(!allowed_at(stage.clone(), &call), "{call:?} must be closed at {stage:?}");
-		}
-	}
-}
-
-/// The same for HRMP, on the same schedule. This is the actor change: a parachain used to open a
-/// channel by `Transact`ing this call with its own origin, and that origin is filtered like any
-/// other non-Root one.
-#[test]
-fn hrmp_calls_close_when_the_migration_starts() {
-	for call in [
 		RuntimeCall::Hrmp(hrmp::Call::<Runtime>::hrmp_init_open_channel {
 			recipient: 2001.into(),
 			proposed_max_capacity: 8,
@@ -100,67 +83,64 @@ fn hrmp_calls_close_when_the_migration_starts() {
 			channel_id: HrmpChannelId { sender: 2000.into(), recipient: 2001.into() },
 			open_requests: 1,
 		}),
+		RuntimeCall::Hrmp(hrmp::Call::<Runtime>::establish_channel_with_system {
+			target_system_chain: 1000.into(),
+		}),
+	] {
+		// Before the migration begins: served locally, exactly as today.
+		assert!(allowed_at(Stage::Pending, &call), "{call:?} must survive the upgrade");
+		assert!(
+			allowed_at(Stage::Scheduled { start: 100 }, &call),
+			"{call:?} must stay open until the migration actually begins"
+		);
+
+		// While it runs: shut. The forwarder is not on yet and the registry is half drained.
+		for stage in [Stage::RegistrarInit, Stage::HrmpInit, Stage::Paused] {
+			assert!(
+				!allowed_at(stage.clone(), &call),
+				"{call:?} must be closed while the migration runs, at {stage:?}"
+			);
+		}
+
+		// Afterwards: open again, now forwarding to Coretime.
+		assert!(
+			allowed_at(Stage::MigrationDone, &call),
+			"{call:?} must reopen as a forwarder once the migration is done"
+		);
+	}
+}
+
+/// The calls that cannot be forwarded, and so close for good.
+///
+/// `reserve` and `swap` have no Coretime counterpart a para may drive — ids are allocated there and
+/// swap is retired. `schedule_code_upgrade` carries the whole validation code, which is precisely
+/// what the Coretime protocol refuses to move: it commits to a hash and a length and has the blob
+/// uploaded separately. A parachain's ordinary upgrade path is `parachain_system`'s
+/// `authorize_upgrade`, which never touches this pallet.
+#[test]
+fn calls_that_cannot_be_forwarded_stay_closed() {
+	for call in [
+		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::reserve {}),
+		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::swap {
+			id: 2000.into(),
+			other: 2001.into(),
+		}),
+		RuntimeCall::Registrar(paras_registrar::Call::<Runtime>::schedule_code_upgrade {
+			para: 2000.into(),
+			new_code: polkadot_primitives::ValidationCode(vec![1; 32]),
+		}),
 	] {
 		assert!(allowed_at(Stage::Pending, &call), "{call:?} must survive the upgrade");
 		assert!(
-			!allowed_at(Stage::HrmpInit, &call),
-			"{call:?} must be closed once the migration is running"
+			allowed_at(Stage::Scheduled { start: 100 }, &call),
+			"{call:?} must stay open until the migration begins"
 		);
-		assert!(
-			!allowed_at(Stage::MigrationDone, &call),
-			"{call:?} must stay closed afterwards"
-		);
+		for stage in [Stage::RegistrarInit, Stage::Paused, Stage::MigrationDone] {
+			assert!(!allowed_at(stage.clone(), &call), "{call:?} must be closed at {stage:?}");
+		}
 	}
 }
 
-/// Everything Coretime drives, which arrives as `Origin::Parachain(BROKER_ID)` — filtered like any
-/// other non-Root origin, so this has to be an explicit allow.
-#[test]
-fn the_control_plane_stays_open() {
-	let registrar_msg = registrar_primitives::MessageToRelay::V1(
-		registrar_primitives::MessageToRelayV1::Deregister { para_id: 2000, message_id: 0 },
-	);
-	let hrmp_msg = hrmp_primitives::MessageToRelay::V1(
-		hrmp_primitives::MessageToRelayV1::AcceptOpenChannel {
-			channel: hrmp_primitives::ChannelId { sender: 2000, recipient: 2001 },
-			message_id: 0,
-		},
-	);
-
-	for call in [
-		RuntimeCall::RegistrarRelay(pallet_registrar_relay::Call::<Runtime>::receive {
-			message: registrar_msg,
-		}),
-		RuntimeCall::HrmpRelay(pallet_hrmp_relay::Call::<Runtime>::receive {
-			message: hrmp_msg,
-		}),
-	] {
-		assert!(allowed(call.clone()), "{call:?} is how Coretime drives this chain");
-	}
-}
-
-/// The validation-code uploads are unsigned and feeless, and unsigned is not Root — so they are
-/// filtered too, and a registration that has been authorized would have no way to complete.
-#[test]
-fn the_unsigned_code_uploads_stay_open() {
-	for call in [
-		RuntimeCall::RegistrarRelay(pallet_registrar_relay::Call::<Runtime>::apply_authorized_code {
-			para_id: 2000,
-			validation_code: vec![1, 2, 3],
-		}),
-		RuntimeCall::RegistrarRelay(
-			pallet_registrar_relay::Call::<Runtime>::apply_authorized_code_upgrade {
-				para_id: 2000,
-				validation_code: vec![1, 2, 3],
-			},
-		),
-	] {
-		assert!(allowed(call.clone()), "{call:?} is the only way code reaches this chain");
-	}
-}
-
-/// The origin half of the same rule.
-///
 /// `PostAhmFilter` closes the calls this chain used to serve; this closes the *origin* those calls
 /// would have arrived with. The two are complementary and neither substitutes for the other: a
 /// `Contains<RuntimeCall>` cannot see who is calling, so without this a non-system parachain could

@@ -256,16 +256,50 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 			// `Transact` that did nothing.
 			RegistrarRelay(..) | HrmpRelay(..) => true,
 
-			// Registrar and HRMP move to the Coretime chain; see `para_control`. Gated on the
-			// migration rather than on the upgrade: the Coretime pallets hold no state until the
-			// migration hands it over, so closing these at the upgrade would leave nobody able to
-			// register a para or open a channel on *either* chain for however long governance
-			// takes to schedule the start. A scheduled migration has not started.
+			// The para-facing registrar and HRMP calls a parachain dispatches for *itself*. These
+			// stay reachable for good, because after the migration their bodies no longer touch
+			// this chain — they forward the request to Coretime on the para's behalf (see
+			// `para_control::ForwardToCoretime`). Keeping them is what lets every parachain go on
+			// encoding exactly the call it encodes today: same pallet index, same call index, same
+			// arguments, no coordination with fifty teams.
+			//
+			// Blocked only *while the migration runs*, and that window is load-bearing: the
+			// forwarder turns on when the migration is **finished**, so mid-migration these would
+			// still take the local path and act on a half-drained registry. `is_ongoing` is
+			// therefore the right predicate here where `has_started` is right below.
+			//
+			// `schedule_code_upgrade` is deliberately **not** in this list: it carries the whole
+			// validation code, which cannot be forwarded — see `registrar_primitives`. It falls
+			// through to the blanket arm below.
+			Registrar(
+				paras_registrar::Call::<Runtime>::deregister { .. } |
+				paras_registrar::Call::<Runtime>::add_lock { .. } |
+				paras_registrar::Call::<Runtime>::remove_lock { .. } |
+				paras_registrar::Call::<Runtime>::set_current_head { .. },
+			) |
+			Hrmp(
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_init_open_channel { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_accept_open_channel { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_close_channel { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_cancel_open_request { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::establish_channel_with_system { .. },
+			) => !pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_ongoing(),
+
+			// Everything else on those two pallets moves to the Coretime chain; see
+			// `para_control`. Closing them here is what stops there being two live control planes,
+			// which would diverge the moment either side acted. Root still reaches both — Root
+			// bypasses this filter — which is what governance and the migration need, and the
+			// relay-side pallets above drive them by direct call rather than by dispatch, so they
+			// are unaffected.
+			//
+			// Gated on the migration rather than on the upgrade, and the distinction matters: the
+			// Coretime pallets hold no state until the migration hands it over, so closing these
+			// at the upgrade would leave nobody able to register a para or open a channel on
+			// *either* chain for however long governance takes to schedule the start. A scheduled
+			// migration has not started, so the relay chain serves its users right up to the
+			// start block, and never again after it.
 			Registrar(..) | Hrmp(..) =>
 				!pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started(),
-
-			// Fellowship and its preimages explicitly allowed.
-			FellowshipCollective(..) | FellowshipReferenda(..) | Preimage(..) => true,
 
 			// Everything else is allowed.
 			_ => true,
@@ -1634,7 +1668,7 @@ parameter_types! {
 }
 
 impl parachains_hrmp::Config for Runtime {
-	type ParaRequests = ();
+	type ParaRequests = crate::para_control::ForwardToCoretime;
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type ChannelManager = EitherOfDiverse<
@@ -1772,7 +1806,7 @@ parameter_types! {
 }
 
 impl paras_registrar::Config for Runtime {
-	type ParaRequests = ();
+	type ParaRequests = crate::para_control::ForwardToCoretime;
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;

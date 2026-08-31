@@ -92,14 +92,134 @@ pub enum CoretimeRuntimePallets {
 
 #[derive(Encode)]
 pub enum RegistrarParaCalls {
+	/// A para asked this chain to deregister it; forwarded on its behalf.
+	#[codec(index = 4)]
+	Deregister(u32),
 	#[codec(index = 3)]
 	Receive(registrar_primitives::MessageToPara),
+	/// A para asked this chain to lock it against its manager.
+	#[codec(index = 6)]
+	AddLock(u32),
+	/// A para asked this chain to unlock it.
+	#[codec(index = 7)]
+	RemoveLock(u32),
+	/// A para asked this chain to set its head data.
+	#[codec(index = 9)]
+	SetCurrentHead(u32, Vec<u8>),
 }
 
 #[derive(Encode)]
 pub enum HrmpParaCalls {
+	/// `(sender, recipient, max_capacity, max_message_size)`.
+	#[codec(index = 0)]
+	OpenChannel(u32, u32, u32, u32),
+	/// `(sender, recipient)`.
+	#[codec(index = 1)]
+	AcceptOpenChannel(u32, u32),
+	/// `(sender, recipient)`.
+	#[codec(index = 2)]
+	CloseChannel(u32, u32),
+	/// `(sender, recipient)`.
+	#[codec(index = 3)]
+	CancelOpenRequest(u32, u32),
 	#[codec(index = 4)]
 	Receive(hrmp_primitives::MessageToPara),
+	/// `(sender, recipient)`.
+	#[codec(index = 5)]
+	EstablishSystemChannel(u32, u32),
+}
+
+/// Forwards a parachain's own registrar and HRMP requests to the Coretime chain.
+///
+/// This is what keeps a parachain's encoded call unchanged after the control plane moves: the relay
+/// chain keeps its para-facing calls, and in remote mode their bodies land here instead of touching
+/// relay-chain state. The request goes on as `OriginKind::Superuser`, so it arrives on Coretime as
+/// Root naming the para — which is exactly what its calls already accept, since each takes the para
+/// id as a parameter. Nothing new is needed on the Coretime side.
+///
+/// Root is sound here precisely because of the origin discipline on *this* chain: only a parachain
+/// can reach the calls that end up here (this chain accepts no signed origins after the migration),
+/// so "Root, acting for para X" can only ever mean "para X asked". The relay chain and the system
+/// chains trust each other absolutely, so Coretime acts on that assertion without re-deriving it.
+pub struct ForwardToCoretime;
+
+impl ForwardToCoretime {
+	/// Whether the control plane has taken over. Requests are applied locally until it has.
+	///
+	/// Keyed on the migration being *finished*, not merely started: Coretime's registry is empty
+	/// until the migration hands it over, so forwarding earlier would record state there for paras
+	/// it does not yet know about. The window in between is covered by the call filter, which blocks
+	/// these calls outright while the migration runs — see `PostAhmFilter`.
+	fn remote() -> bool {
+		pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_finished()
+	}
+
+	fn registrar(call: RegistrarParaCalls) -> Result<(), ()> {
+		send_to_coretime(CoretimeRuntimePallets::RegistrarPara(call).encode())
+	}
+
+	fn hrmp(call: HrmpParaCalls) -> Result<(), ()> {
+		send_to_coretime(CoretimeRuntimePallets::HrmpPara(call).encode())
+	}
+}
+
+impl registrar_primitives::ParaRequestRouter for ForwardToCoretime {
+	fn is_remote() -> bool {
+		Self::remote()
+	}
+
+	fn deregister(para_id: u32) -> Result<(), ()> {
+		Self::registrar(RegistrarParaCalls::Deregister(para_id))
+	}
+
+	fn add_lock(para_id: u32) -> Result<(), ()> {
+		Self::registrar(RegistrarParaCalls::AddLock(para_id))
+	}
+
+	fn remove_lock(para_id: u32) -> Result<(), ()> {
+		Self::registrar(RegistrarParaCalls::RemoveLock(para_id))
+	}
+
+	fn set_current_head(para_id: u32, head: Vec<u8>) -> Result<(), ()> {
+		Self::registrar(RegistrarParaCalls::SetCurrentHead(para_id, head))
+	}
+}
+
+impl hrmp_primitives::ParaRequestRouter for ForwardToCoretime {
+	fn is_remote() -> bool {
+		Self::remote()
+	}
+
+	fn open_channel(
+		sender: u32,
+		recipient: u32,
+		max_capacity: u32,
+		max_message_size: u32,
+	) -> Result<(), ()> {
+		Self::hrmp(HrmpParaCalls::OpenChannel(sender, recipient, max_capacity, max_message_size))
+	}
+
+	fn accept_open_channel(sender: u32, recipient: u32) -> Result<(), ()> {
+		Self::hrmp(HrmpParaCalls::AcceptOpenChannel(sender, recipient))
+	}
+
+	// Known fidelity gap, harmless today: Coretime derives which end asked from the origin, and for
+	// Root that is the sender. So a close initiated by the *recipient* is attributed to the sender
+	// in both chains' events. Nothing depends on it — the relay chain accepts a close from either
+	// participant (`close_channel` checks `is_participant` alone) and the deposits are symmetric —
+	// but the record is wrong, and closing it properly means giving Coretime's `close_channel` an
+	// explicit initiator.
+	fn close_channel(_initiator: u32, channel: hrmp_primitives::ChannelId) -> Result<(), ()> {
+		Self::hrmp(HrmpParaCalls::CloseChannel(channel.sender, channel.recipient))
+	}
+
+	fn cancel_open_request(_sender: u32, channel: hrmp_primitives::ChannelId) -> Result<(), ()> {
+		Self::hrmp(HrmpParaCalls::CancelOpenRequest(channel.sender, channel.recipient))
+	}
+
+	fn establish_channel_with_system(sender: u32, target: u32) -> Result<(), ()> {
+		Self::hrmp(HrmpParaCalls::EstablishSystemChannel(sender, target))
+	}
 }
 
 /// Hand a `Transact` to the Coretime chain.
