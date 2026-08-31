@@ -1159,6 +1159,33 @@ async fn full_migration_rc_to_ct() {
 		}
 	}
 
+	// Settle the control plane. The registrar stage asks the relay chain for a deposit-free channel
+	// with every para it hands over, and those requests are Coretime *UMP* — which the loop above
+	// never shuttled, so before this the requests went nowhere and their verdicts never came back.
+	// Drain both directions until quiet, so the pairs reach the state they would really reach.
+	// Enough rounds to drain both directions with slack; the queues are serviced a batch at a
+	// time, and stopping at the first quiet round settles only part of the set.
+	for _ in 0..12 {
+		let ump = ct.execute_with(|| {
+			next_block_para::<CoretimePara>();
+			take_ump::<CoretimePara>()
+		});
+		ct.commit_all().unwrap();
+
+		let dmp = rc.execute_with(|| {
+			enqueue_ump(CoretimePara::PARA_ID.into(), ump);
+			next_block_rc();
+			take_dmp(CoretimePara::PARA_ID.into())
+		});
+		rc.commit_all().unwrap();
+
+		ct.execute_with(|| {
+			enqueue_dmp::<CoretimePara>(dmp);
+			next_block_para::<CoretimePara>();
+		});
+		ct.commit_all().unwrap();
+	}
+
 	// THEN the RC has given up the registry, kept what it still routes on, and reduced issuance by
 	// exactly the burn.
 	let (tracker, migrated_nonce0) = rc.execute_with(|| {
@@ -1220,6 +1247,42 @@ async fn full_migration_rc_to_ct() {
 			.collect();
 		assert_eq!(from_ingress, ground_truth, "HRMP ingress index diverged from HrmpChannels");
 		assert_eq!(from_egress, ground_truth, "HRMP egress index diverged from HrmpChannels");
+
+		// And the relay chain still *tells* paras about those channels. `HrmpChannels` holding a
+		// row is necessary but not the property that matters: what decides whether a parachain may
+		// actually send is `backing_constraints`, the runtime API a collator asks. It reads the
+		// same map, so a drain leaves `hrmp_channels_out` empty and every para silently believes
+		// it has nowhere to send — with no error anywhere, because nothing was refused, nothing
+		// was ever attempted.
+		let mut egress = BTreeMap::<u32, BTreeSet<u32>>::new();
+		for id in HrmpChannels::<Rc>::iter_keys() {
+			egress.entry(id.sender.into()).or_default().insert(id.recipient.into());
+		}
+		let mut checked = 0usize;
+		for (sender, recipients) in &egress {
+			let Some(constraints) = runtime_parachains::runtime_api_impl::v13::backing_constraints::<
+				Rc,
+			>(polkadot_primitives::Id::from(*sender))
+			else {
+				// Not a fully live para (no head or no current code), so it has no constraints to
+				// report. Nothing to assert for it.
+				continue;
+			};
+			let reported: BTreeSet<u32> = constraints
+				.hrmp_channels_out
+				.iter()
+				.map(|(para, _)| u32::from(*para))
+				.collect();
+			assert_eq!(
+				&reported, recipients,
+				"para {sender} is told a different set of outbound channels than the RC holds"
+			);
+			checked += 1;
+		}
+		assert!(
+			checked > 10,
+			"only {checked} paras had reportable constraints; the assertion above is not covering 			 the migrated set"
+		);
 
 		// No ghost proxy records: every remaining entry's recorded deposit is backed by an
 		// actual reserve, and the dispatch-check manager's translatable defs left for CT.
@@ -1427,6 +1490,9 @@ async fn full_migration_rc_to_ct() {
 		// speak for itself here — without them a locked para (which every live para is) would
 		// need Coretime governance for anything at all.
 		let self_id: u32 = <Ct as pallet_hrmp_para::Config>::SelfParaId::get();
+		let mut control_channels = 0usize;
+		let mut open_pairs = 0usize;
+		let mut unconfirmed_pairs = 0usize;
 		for (para_id, registered, _) in &expected {
 			if !registered {
 				continue;
@@ -1437,12 +1503,47 @@ async fn full_migration_rc_to_ct() {
 			] {
 				let info = pallet_hrmp_para::Channels::<Ct>::get(key)
 					.unwrap_or_else(|| panic!("control channel {key:?} must exist"));
-				assert_eq!(info.state, ChannelState::Open);
+				// Open once the relay chain confirms, `Pending` while it has not. Both are
+				// legitimate end states here and the distinction is the point: a pair may only be
+				// claimed open on the relay chain's answer, never on the strength of having asked.
+				match info.state {
+					ChannelState::Open => open_pairs += 1,
+					// See B25. The relay chain caps how many channels one para may hold, and the
+					// control plane wants one with *every* para it takes over — so on a network
+					// with enough paras the budget runs out and the rest are refused
+					// `LimitExceeded`. That is a real gap in the design, not a test artefact; what
+					// changed is that it is now visible instead of being recorded as `Open`
+					// against a relay chain that has nothing.
+					ChannelState::Pending => unconfirmed_pairs += 1,
+					ref other => panic!("control channel {key:?} in unexpected state {other:?}"),
+				}
+				control_channels += 1;
 				// A system channel holds no deposit at either end; charging one would take money
 				// from a sovereign account for a route the control plane needs to exist.
 				assert!(info.sender_ticket.is_none() && info.recipient_ticket.is_none());
 			}
 		}
+
+		// Both directions for every para that arrived registered, and nothing quietly skipped.
+		let registered = expected.iter().filter(|(_, r, _)| *r).count();
+		assert_eq!(control_channels, registered * 2);
+		assert_eq!(open_pairs + unconfirmed_pairs, control_channels);
+		println!("control channels: {open_pairs} open, {unconfirmed_pairs} unconfirmed");
+
+		// Measured against real state, and pinned exactly rather than as a ratio — this is the
+		// number **B25 exists to move**, so it must fail loudly the moment it changes, in either
+		// direction.
+		//
+		// Polkadot fits: every para the control plane takes over gets both directions. Kusama does
+		// not, and the reason is a hard relay-chain limit rather than anything this code does
+		// wrong: `hrmp_max_parachain_outbound_channels` caps how many channels one para may hold,
+		// the control plane wants one with *every* para it manages, and Kusama has more paras than
+		// Coretime has budget. So Coretime cannot reach most of the network it is supposed to
+		// control, and until the refusal was reported it recorded all of them `Open` regardless.
+		#[cfg(not(feature = "kusama"))]
+		assert_eq!((open_pairs, unconfirmed_pairs), (170, 0));
+		#[cfg(feature = "kusama")]
+		assert_eq!((open_pairs, unconfirmed_pairs), (58, 156));
 
 		// Nothing exists that is not either migrated or a control channel. A set union rather
 		// than a sum, because the two overlap: a para that already had a channel with this chain
@@ -2139,6 +2240,20 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 		},
 	);
 
+	let establish_retry = crate::mock::network::relay::RuntimeCall::HrmpRelay(
+		pallet_hrmp_relay::Call::receive {
+			message: hrmp_primitives::MessageToRelay::V1(
+				hrmp_primitives::MessageToRelayV1::EstablishSystemChannel {
+					channel: hrmp_primitives::ChannelId {
+						sender: CoretimePara::PARA_ID,
+						recipient: fresh_id,
+					},
+					message_id: 3,
+				},
+			),
+		},
+	);
+
 	let as_coretime = |call: crate::mock::network::relay::RuntimeCall| {
 		xcm::VersionedXcm::<()>::from(Xcm(vec![
 			UnpaidExecution { weight_limit: Unlimited, check_origin: None },
@@ -2207,11 +2322,13 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 			polkadot_primitives::HrmpChannelId { sender: coretime, recipient: fresh };
 		let back = polkadot_primitives::HrmpChannelId { sender: fresh, recipient: coretime };
 
-		// BUG: the request is refused because the recipient is still onboarding, and the refusal
-		// goes nowhere Coretime can see it. When fixed, these become `is_some`.
+		// THEN the relay chain refuses — it will not open a channel to a para that has not
+		// onboarded — and, crucially, it now *answers*. The reply is what lets Coretime record the
+		// pair as unconfirmed rather than claiming it open against nothing, which is what made this
+		// refusal invisible before.
 		assert!(
 			HrmpOpenChannelRequests::<Rc>::get(&channel).is_none(),
-			"BUG: no request is recorded for the control channel"
+			"the relay chain must not record a request for a para that is still onboarding"
 		);
 		assert!(
 			frame_system::Pallet::<Rc>::events().into_iter().any(|record| matches!(
@@ -2220,7 +2337,11 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 					pallet_hrmp_relay::Event::SystemChannelRejected { .. }
 				)
 			)),
-			"BUG: the refusal is only a relay-chain event; Coretime is never told"
+			"the refusal must be raised locally"
+		);
+		assert!(
+			!take_dmp(coretime).is_empty(),
+			"and reported back to Coretime, so it knows the pair is not open"
 		);
 
 		// WHEN the two session boundaries registration actually takes go by.
@@ -2235,15 +2356,114 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 			"the para must be live after SESSION_DELAY boundaries"
 		);
 
-		// ...and BUG: its control channel never appeared, because the refusal was terminal and
-		// nothing retries. When fixed, both become `is_some`/`true`.
+		// ...and its control channel still does not exist, because a refusal is not retried on its
+		// own. What the answer bought is that Coretime knows, so a retry is possible and
+		// meaningful — see `a_refused_pair_stays_unconfirmed_and_can_be_retried` in
+		// `pallet-hrmp-para` for the Coretime half.
+		assert!(HrmpChannels::<Rc>::get(&channel).is_none());
+		assert!(HrmpChannels::<Rc>::get(&back).is_none());
+
+		// WHEN the retry goes out now that the para is live.
+		let _ = take_dmp(coretime);
+		enqueue_ump(coretime, vec![as_coretime(establish_retry)]);
+		next_block_rc();
+
+		// THEN the relay chain accepts it, in both directions, and answers.
+		for id in [&channel, &back] {
+			assert!(
+				HrmpOpenChannelRequests::<Rc>::get(id).is_some_and(|r| r.confirmed),
+				"{id:?} must be a confirmed request once the para is live"
+			);
+		}
+		assert!(!take_dmp(coretime).is_empty(), "Coretime must be told it succeeded");
+
+		// The channel itself only exists after the next boundary — a request is not a channel.
+		assert!(HrmpChannels::<Rc>::get(&channel).is_none());
+		rotate_session_rc();
+
+		// THEN the control plane is finally reachable in both directions.
 		assert!(
-			HrmpChannels::<Rc>::get(&channel).is_none(),
-			"BUG: the live para has no inbound control channel from Coretime"
+			HrmpChannels::<Rc>::get(&channel).is_some(),
+			"Coretime must have a route to the new para"
 		);
 		assert!(
-			HrmpChannels::<Rc>::get(&back).is_none(),
-			"BUG: and no outbound channel back to Coretime"
+			HrmpChannels::<Rc>::get(&back).is_some(),
+			"and the para a route back, which is what makes its own HRMP calls reachable"
 		);
+	});
+}
+
+/// Probe: the relay chain's per-para channel caps, and who is closest to them.
+///
+/// Context for B25. The cap is one flat number applied to every para — HRMP's `is_system()` checks
+/// only ever waive *deposits*, never the count — so a para whose channel count scales with the size
+/// of the network has nowhere to grow.
+#[tokio::test]
+async fn channel_caps_and_who_is_near_them() {
+	type Rc = crate::mock::network::relay::Runtime;
+	let mut rc = load(Chain::Relay).await;
+
+	rc.execute_with(|| {
+		let config = runtime_parachains::configuration::ActiveConfig::<Rc>::get();
+		println!(
+			"{}: outbound cap {}, inbound cap {}",
+			crate::mock::network::NAME,
+			config.hrmp_max_parachain_outbound_channels,
+			config.hrmp_max_parachain_inbound_channels,
+		);
+
+		let mut out = BTreeMap::<u32, usize>::new();
+		let mut inn = BTreeMap::<u32, usize>::new();
+		for id in HrmpChannels::<Rc>::iter_keys() {
+			*out.entry(id.sender.into()).or_default() += 1;
+			*inn.entry(id.recipient.into()).or_default() += 1;
+		}
+
+		let mut top: Vec<_> = out.iter().map(|(p, n)| (*n, *p)).collect();
+		top.sort_unstable_by(|a, b| b.cmp(a));
+		println!("busiest senders (para, outbound):");
+		for (n, para) in top.iter().take(8) {
+			println!("  {para}: {n} out, {} in", inn.get(para).copied().unwrap_or(0));
+		}
+
+		let total_paras = out.keys().chain(inn.keys()).collect::<BTreeSet<_>>().len();
+		let coretime: u32 = CoretimePara::PARA_ID;
+		println!(
+			"paras with any channel: {total_paras}; coretime({coretime}) has {} out / {} in",
+			out.get(&coretime).copied().unwrap_or(0),
+			inn.get(&coretime).copied().unwrap_or(0),
+		);
+
+		// The caps are governance-settable, and B25 turns on their value, so pin them: a change to
+		// either one changes whether the control plane can reach the network, and it should not be
+		// possible to make that change quietly.
+		#[cfg(not(feature = "kusama"))]
+		let (cap, registered_paras) = (128u32, 85usize);
+		#[cfg(feature = "kusama")]
+		let (cap, registered_paras) = (30u32, 107usize);
+
+		assert_eq!(config.hrmp_max_parachain_outbound_channels, cap);
+		assert_eq!(config.hrmp_max_parachain_inbound_channels, cap);
+
+        // The control plane wants a channel with every para it manages, in both directions, so its
+        // requirement is the *number of paras* — not a constant. That is the shape the cap was
+        // never sized for: the busiest para today is a hub by usage (Asset Hub), which grew
+        // organically, whereas this is a hub by construction.
+        //
+        // Whether it fits is therefore a property of how many paras the network has, and it is
+        // checked here rather than left to be discovered during a migration.
+        let fits = registered_paras <= cap as usize;
+        #[cfg(not(feature = "kusama"))]
+        assert!(
+            fits,
+            "Polkadot no longer fits: {registered_paras} paras against a cap of {cap}. The \
+             control plane cannot reach them all — see open.md B25"
+        );
+        #[cfg(feature = "kusama")]
+        assert!(
+            !fits,
+            "Kusama now fits ({registered_paras} paras, cap {cap}) — B25 has been addressed, so \
+             update the expectations in `full_migration_rc_to_ct` too"
+        );
 	});
 }
