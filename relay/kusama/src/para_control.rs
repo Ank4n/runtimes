@@ -116,9 +116,9 @@ pub enum HrmpParaCalls {
 	/// `(sender, recipient)`.
 	#[codec(index = 1)]
 	AcceptOpenChannel(u32, u32),
-	/// `(sender, recipient)`.
+	/// `(sender, recipient, initiator)`.
 	#[codec(index = 2)]
-	CloseChannel(u32, u32),
+	CloseChannel(u32, u32, u32),
 	/// `(sender, recipient)`.
 	#[codec(index = 3)]
 	CancelOpenRequest(u32, u32),
@@ -203,14 +203,11 @@ impl hrmp_primitives::ParaRequestRouter for ForwardToCoretime {
 		Self::hrmp(HrmpParaCalls::AcceptOpenChannel(sender, recipient))
 	}
 
-	// Known fidelity gap, harmless today: Coretime derives which end asked from the origin, and for
-	// Root that is the sender. So a close initiated by the *recipient* is attributed to the sender
-	// in both chains' events. Nothing depends on it — the relay chain accepts a close from either
-	// participant (`close_channel` checks `is_participant` alone) and the deposits are symmetric —
-	// but the record is wrong, and closing it properly means giving Coretime's `close_channel` an
-	// explicit initiator.
-	fn close_channel(_initiator: u32, channel: hrmp_primitives::ChannelId) -> Result<(), ()> {
-		Self::hrmp(HrmpParaCalls::CloseChannel(channel.sender, channel.recipient))
+	// The initiator travels explicitly. Either end may close, so this is not about authority — it
+	// is about Coretime and then the relay chain recording *which* para asked, which only this
+	// chain knows: it is the para origin the call arrived with.
+	fn close_channel(initiator: u32, channel: hrmp_primitives::ChannelId) -> Result<(), ()> {
+		Self::hrmp(HrmpParaCalls::CloseChannel(channel.sender, channel.recipient, initiator))
 	}
 
 	fn cancel_open_request(_sender: u32, channel: hrmp_primitives::ChannelId) -> Result<(), ()> {
