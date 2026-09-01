@@ -107,7 +107,7 @@ pub enum RegistrarParaCalls {
 	/// A para asked this chain to deregister it; forwarded on its behalf.
 	#[codec(index = 4)]
 	Deregister(u32),
-	#[codec(index = 3)]
+	#[codec(index = 0)]
 	Receive(registrar_primitives::MessageToPara),
 	/// A para asked this chain to lock it against its manager.
 	#[codec(index = 6)]
