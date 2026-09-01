@@ -229,6 +229,10 @@ pub type Barrier = TrailingSetTopicAsId<(
 			AllowTopLevelPaidExecutionFrom<Everything>,
 			// Messages coming from system parachains need not pay for execution.
 			AllowExplicitUnpaidExecutionFrom<(IsChildSystemParachain<ParaId>, AssetHubPlurality)>,
+			// A parachain's own control-plane request executes unpaid: post-migration its
+			// sovereign account here is empty by design, and the work is priced on the Coretime
+			// chain instead. Deliberately shape-checked and rate-limited — see `para_control`.
+			crate::para_control::AllowUnpaidParaControlFrom<OnlyParachains>,
 			// Subscriptions for version tracking are OK.
 			AllowSubscriptionsFrom<OnlyParachains>,
 		),

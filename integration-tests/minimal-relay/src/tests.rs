@@ -1136,13 +1136,7 @@ async fn full_migration_rc_to_ct() {
 				paras <= paras_before.len(),
 				"more paras on CT ({paras}) than the relay chain ever had"
 			);
-			// Only migrated channels are bounded by what the relay chain held. The control
-			// channels this chain opens for each para it takes over are new by construction, and
-			// re-establishing one is a deliberate no-op rather than a double charge.
-			let self_id: u32 = <Ct as pallet_hrmp_para::Config>::SelfParaId::get();
-			let channels = pallet_hrmp_para::Channels::<Ct>::iter_keys()
-				.filter(|c| c.sender != self_id && c.recipient != self_id)
-				.count();
+			let channels = pallet_hrmp_para::Channels::<Ct>::iter_keys().count();
 			assert!(
 				channels <= hrmp_before.len() + requests_before_detail.len(),
 				"more migrated channels on CT ({channels}) than the relay chain ever had"
@@ -1204,12 +1198,9 @@ async fn full_migration_rc_to_ct() {
 		}
 	}
 
-	// Settle the control plane. The registrar stage asks the relay chain for a deposit-free channel
-	// with every para it hands over, and those requests are Coretime *UMP* — which the loop above
-	// never shuttled, so before this the requests went nowhere and their verdicts never came back.
-	// Drain both directions until quiet, so the pairs reach the state they would really reach.
-	// Enough rounds to drain both directions with slack; the queues are serviced a batch at a
-	// time, and stopping at the first quiet round settles only part of the set.
+	// Drain both directions until quiet, so anything either side queued during the migration is
+	// delivered before the after-state is asserted on. The queues are serviced a batch at a time,
+	// so one round is not enough.
 	for _ in 0..12 {
 		let ump = ct.execute_with(|| {
 			next_block_para::<CoretimePara>();
@@ -1530,86 +1521,24 @@ async fn full_migration_rc_to_ct() {
 		}
 
 		// --- and the HRMP pallet owns the channels ----------------------------------------
-		// Migrated channels and requests, plus both directions of a deposit-free control channel
-		// for every para that arrived already registered. Those are what let a migrated para
-		// speak for itself here — without them a locked para (which every live para is) would
-		// need Coretime governance for anything at all.
-		let self_id: u32 = <Ct as pallet_hrmp_para::Config>::SelfParaId::get();
-		let mut control_channels = 0usize;
-		let mut open_pairs = 0usize;
-		let mut unconfirmed_pairs = 0usize;
-		for (para_id, registered, _) in &expected {
-			if !registered {
-				continue;
-			}
-			for key in [
-				hrmp_primitives::ChannelId { sender: self_id, recipient: *para_id },
-				hrmp_primitives::ChannelId { sender: *para_id, recipient: self_id },
-			] {
-				let info = pallet_hrmp_para::Channels::<Ct>::get(key)
-					.unwrap_or_else(|| panic!("control channel {key:?} must exist"));
-				// Open once the relay chain confirms, `Pending` while it has not. Both are
-				// legitimate end states here and the distinction is the point: a pair may only be
-				// claimed open on the relay chain's answer, never on the strength of having asked.
-				match info.state {
-					ChannelState::Open => open_pairs += 1,
-					// See B25. The relay chain caps how many channels one para may hold, and the
-					// control plane wants one with *every* para it takes over — so on a network
-					// with enough paras the budget runs out and the rest are refused
-					// `LimitExceeded`. That is a real gap in the design, not a test artefact; what
-					// changed is that it is now visible instead of being recorded as `Open`
-					// against a relay chain that has nothing.
-					ChannelState::Pending => unconfirmed_pairs += 1,
-					ref other => panic!("control channel {key:?} in unexpected state {other:?}"),
-				}
-				control_channels += 1;
-				// A system channel holds no deposit at either end; charging one would take money
-				// from a sovereign account for a route the control plane needs to exist.
-				assert!(info.sender_ticket.is_none() && info.recipient_ticket.is_none());
-			}
-		}
-
-		// Both directions for every para that arrived registered, and nothing quietly skipped.
-		let registered = expected.iter().filter(|(_, r, _)| *r).count();
-		assert_eq!(control_channels, registered * 2);
-		assert_eq!(open_pairs + unconfirmed_pairs, control_channels);
-		println!("control channels: {open_pairs} open, {unconfirmed_pairs} unconfirmed");
-
-		// Measured against real state, and pinned exactly rather than as a ratio — this is the
-		// number **B25 exists to move**, so it must fail loudly the moment it changes, in either
-		// direction.
-		//
-		// Polkadot fits: every para the control plane takes over gets both directions. Kusama does
-		// not, and the reason is a hard relay-chain limit rather than anything this code does
-		// wrong: `hrmp_max_parachain_outbound_channels` caps how many channels one para may hold,
-		// the control plane wants one with *every* para it manages, and Kusama has more paras than
-		// Coretime has budget. So Coretime cannot reach most of the network it is supposed to
-		// control, and until the refusal was reported it recorded all of them `Open` regardless.
-		#[cfg(not(feature = "kusama"))]
-		assert_eq!((open_pairs, unconfirmed_pairs), (170, 0));
-		#[cfg(feature = "kusama")]
-		assert_eq!((open_pairs, unconfirmed_pairs), (58, 156));
-
-		// Nothing exists that is not either migrated or a control channel. A set union rather
-		// than a sum, because the two overlap: a para that already had a channel with this chain
-		// arrives twice and is deduplicated on the way in.
-		let mut want: std::collections::BTreeSet<_> = hrmp_before
+		// Exactly the migrated channels and requests — nothing more. There is deliberately no
+		// CT↔para control channel per registered para any more: the control link is relayed
+		// through the relay chain, which keeps its para-facing calls and forwards them, so no
+		// per-para channel exists to be capped, refused while onboarding, or collided with.
+		// (Kusama is what forced this: the relay chain caps how many channels one para may hold,
+		// the old design wanted one per para it managed, and 156 of 214 directions were refused
+		// `LimitExceeded` — see B25 and `decisions.md` 2026-08-31.)
+		let want: std::collections::BTreeSet<_> = hrmp_before
 			.iter()
 			.map(|(id, _, _)| (u32::from(id.sender), u32::from(id.recipient)))
 			.chain(requests_before_detail.iter().map(|(s, r, _)| (*s, *r)))
 			.collect();
-		for (para_id, registered, _) in &expected {
-			if *registered {
-				want.insert((self_id, *para_id));
-				want.insert((*para_id, self_id));
-			}
-		}
 		let have: std::collections::BTreeSet<_> = pallet_hrmp_para::Channels::<Ct>::iter_keys()
 			.map(|c| (c.sender, c.recipient))
 			.collect();
 		assert_eq!(
 			have, want,
-			"the HRMP pallet holds exactly the migrated channels plus the control channels"
+			"the HRMP pallet holds exactly the migrated channels and requests"
 		);
 		for (id, _, _) in &hrmp_before {
 			let key = hrmp_primitives::ChannelId {
@@ -2049,18 +1978,28 @@ async fn full_migration_rc_to_ct() {
 		},
 	);
 
-	// The para asks the relay chain — dispatched with the origin the XCM converter would hand it,
-	// rather than delivered as an XCM. The two are separable and only one of them is settled: the
-	// forwarding *logic* is what this checks, while whether a non-system para can get an XCM
-	// executed here at all after the migration is B26, which is open and needs a decision. Driving
-	// the origin directly keeps this test honest about which half it proves.
+	// The para asks the relay chain with **exactly the message it sends today**: an unpaid
+	// `Transact` of its own call, delivered as real UMP. Post-migration the barrier admits this
+	// shape from any child para (closing B26), the origin converter hands it the narrow
+	// control-plane origin, and the call's body forwards — so this drives the whole loop:
+	// barrier, origin, seam, Coretime.
 	let to_ct = rc.execute_with(|| {
 		let _ = take_dmp(CoretimePara::PARA_ID.into());
 		frame_system::Pallet::<Rc>::reset_events();
-		assert_ok!(request.dispatch(
-			pallet_registrar_relay::Origin::Para(opener).into()
-		));
+		enqueue_ump(
+			polkadot_primitives::Id::from(opener),
+			vec![unpaid_transact_native(request)],
+		);
 		next_block_rc();
+		assert!(
+			frame_system::Pallet::<Rc>::events().into_iter().any(|record| matches!(
+				record.event,
+				crate::mock::network::relay::RuntimeEvent::MessageQueue(
+					pallet_message_queue::Event::Processed { success: true, .. }
+				)
+			)),
+			"the para's unpaid control-plane message must be admitted and dispatched"
+		);
 		let forwarded = take_dmp(CoretimePara::PARA_ID.into());
 		assert!(
 			!forwarded.is_empty(),
@@ -2270,6 +2209,89 @@ mod call_encoding {
 			other => panic!("HRMP report decoded as {other:?}"),
 		}
 	}
+
+	/// Every call the relay chain forwards on a para's behalf must decode on Coretime as the
+	/// matching extrinsic with the same arguments. `full_migration_rc_to_ct` drives only
+	/// `OpenChannel` end to end, so the other eight of these hand-written indices are pinned here
+	/// or nowhere.
+	#[test]
+	fn forwarded_para_calls_decode_on_coretime() {
+		let decode = |encoded: Vec<u8>| {
+			CoretimeCall::decode(&mut &encoded[..]).expect("forwarded call does not decode")
+		};
+		let head = vec![9u8; 16];
+
+		use pallet_registrar_para::Call as RegistrarCall;
+		let registrar_cases = vec![
+			(
+				RegistrarParaCalls::Deregister(PARA),
+				CoretimeCall::RegistrarPara(RegistrarCall::deregister { para_id: PARA }),
+			),
+			(
+				RegistrarParaCalls::AddLock(PARA),
+				CoretimeCall::RegistrarPara(RegistrarCall::add_lock { para_id: PARA }),
+			),
+			(
+				RegistrarParaCalls::RemoveLock(PARA),
+				CoretimeCall::RegistrarPara(RegistrarCall::remove_lock { para_id: PARA }),
+			),
+			(
+				RegistrarParaCalls::SetCurrentHead(PARA, head.clone()),
+				CoretimeCall::RegistrarPara(RegistrarCall::set_current_head {
+					para_id: PARA,
+					head,
+				}),
+			),
+		];
+		for (sent, expected) in registrar_cases {
+			assert_eq!(decode(CoretimeRuntimePallets::RegistrarPara(sent).encode()), expected);
+		}
+
+		use pallet_hrmp_para::Call as HrmpCall;
+		let hrmp_cases = vec![
+			(
+				HrmpParaCalls::OpenChannel(PARA, OTHER, 8, 1024),
+				CoretimeCall::HrmpPara(HrmpCall::open_channel {
+					sender: PARA,
+					recipient: OTHER,
+					max_capacity: 8,
+					max_message_size: 1024,
+				}),
+			),
+			(
+				HrmpParaCalls::AcceptOpenChannel(PARA, OTHER),
+				CoretimeCall::HrmpPara(HrmpCall::accept_open_channel {
+					sender: PARA,
+					recipient: OTHER,
+				}),
+			),
+			(
+				HrmpParaCalls::CloseChannel(PARA, OTHER, PARA),
+				CoretimeCall::HrmpPara(HrmpCall::close_channel {
+					sender: PARA,
+					recipient: OTHER,
+					initiator: PARA,
+				}),
+			),
+			(
+				HrmpParaCalls::CancelOpenRequest(PARA, OTHER),
+				CoretimeCall::HrmpPara(HrmpCall::cancel_open_request {
+					sender: PARA,
+					recipient: OTHER,
+				}),
+			),
+			(
+				HrmpParaCalls::EstablishSystemChannel(PARA, OTHER),
+				CoretimeCall::HrmpPara(HrmpCall::establish_system_channel {
+					sender: PARA,
+					recipient: OTHER,
+				}),
+			),
+		];
+		for (sent, expected) in hrmp_cases {
+			assert_eq!(decode(CoretimeRuntimePallets::HrmpPara(sent).encode()), expected);
+		}
+	}
 }
 
 /// The relay chain answers Coretime, and nobody else.
@@ -2372,7 +2394,8 @@ async fn rc_can_cross_a_session_boundary() {
 }
 
 /// A freshly registered parachain, driven the way Coretime really drives it, across the session
-/// boundaries that registration actually takes.
+/// boundaries that registration actually takes — and the relayed control route working for it the
+/// moment it is live.
 ///
 /// This is the gap between the suite's two halves: the SDK's cross-chain tests use mocks, so they
 /// have no `paras` lifecycle and no sessions, and `full_migration_rc_to_ct` exercises *migrated*
@@ -2380,17 +2403,15 @@ async fn rc_can_cross_a_session_boundary() {
 /// and `paras` takes `SESSION_DELAY` (2) boundaries to onboard one, so any test that does not rotate
 /// cannot tell a working registration from one that silently went nowhere.
 ///
-/// **This test currently documents a bug.** Coretime opens the control channel as soon as the
-/// registration is confirmed, which is while the para is still `Onboarding`, and
-/// `do_init_open_channel` refuses an onboarding recipient. `EstablishSystemChannel` is unanswered,
-/// so the refusal is a relay-chain event and nothing else: Coretime records both directions as
-/// `Open` against a chain that has neither a channel nor a request. Every new parachain comes up
-/// with no control plane and nothing says so.
-///
-/// The assertions below state what *is* true today. When the fix lands, the two marked `BUG`
-/// assertions invert.
+/// There is deliberately **no channel to wait for**. The old design opened a CT↔para control
+/// channel at registration, which the relay chain refused while the para was still onboarding —
+/// a whole class of invisible failure (B22), and a per-para channel budget Kusama could not fit
+/// (B25). The control link is relayed through this chain instead: the para keeps sending exactly
+/// the call it sends today, unpaid, and this chain forwards it to the control plane at the para's
+/// expense over there. So what registration must deliver is *nothing but the registration* — and
+/// what must work afterwards, with no further setup, is the forwarded route.
 #[tokio::test]
-async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
+async fn a_fresh_registration_across_sessions_and_the_relayed_control_route() {
 	use runtime_parachains::hrmp::{HrmpChannels, HrmpOpenChannelRequests};
 	use sp_runtime::traits::{BlakeTwo256, Hash};
 
@@ -2424,36 +2445,6 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 		},
 	);
 
-	// And, once the registration is confirmed, asks for its control channel — what
-	// `OnParaRegistered::on_registered` does on the Coretime side.
-	let establish = crate::mock::network::relay::RuntimeCall::HrmpRelay(
-		pallet_hrmp_relay::Call::receive {
-			message: hrmp_primitives::MessageToRelay::V1(
-				hrmp_primitives::MessageToRelayV1::EstablishSystemChannel {
-					channel: hrmp_primitives::ChannelId {
-						sender: CoretimePara::PARA_ID,
-						recipient: fresh_id,
-					},
-					message_id: 2,
-				},
-			),
-		},
-	);
-
-	let establish_retry = crate::mock::network::relay::RuntimeCall::HrmpRelay(
-		pallet_hrmp_relay::Call::receive {
-			message: hrmp_primitives::MessageToRelay::V1(
-				hrmp_primitives::MessageToRelayV1::EstablishSystemChannel {
-					channel: hrmp_primitives::ChannelId {
-						sender: CoretimePara::PARA_ID,
-						recipient: fresh_id,
-					},
-					message_id: 3,
-				},
-			),
-		},
-	);
-
 	let as_coretime = |call: crate::mock::network::relay::RuntimeCall| {
 		xcm::VersionedXcm::<()>::from(Xcm(vec![
 			UnpaidExecution { weight_limit: Unlimited, check_origin: None },
@@ -2467,7 +2458,9 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 	};
 
 	rc.execute_with(|| {
-		// GIVEN nothing on the relay chain knows this para id.
+		// GIVEN a chain whose control plane has moved — a fresh CT-driven registration only
+		// happens in that world — and nothing on it knows this para id.
+		RcMigrationStage::<Rc>::put(pallet_rc2_migrator::MigrationStage::MigrationDone);
 		assert!(runtime_parachains::paras::Pallet::<Rc>::lifecycle(fresh).is_none());
 		let _ = take_dmp(coretime);
 
@@ -2483,8 +2476,7 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 		// code needs a validator vote that no test can produce, and the *para* pays for it: at the
 		// next session `groom_ongoing_pvf_votes` rejects the unconcluded vote and offboards it, so
 		// the lifecycle goes to `None` rather than `Parathread`. Worth knowing beyond this test —
-		// on the real chain pre-checking adds its own sessions before a para onboards, so the
-		// control-channel window below is *longer* in production than the two boundaries here.
+		// on the real chain pre-checking adds its own sessions before a para onboards.
 		assert_ok!(crate::mock::network::relay::RuntimeCall::Paras(
 			runtime_parachains::paras::Call::add_trusted_validation_code {
 				validation_code: polkadot_primitives::ValidationCode(code.clone()),
@@ -2502,8 +2494,8 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 		)
 		.dispatch(frame_system::RawOrigin::Authorized.into()));
 
-		// THEN the para is registered, and `Onboarding` — not yet live. This is the window the
-		// whole test is about.
+		// THEN the para is registered and `Onboarding`, the registration is reported back, and —
+		// the point — nothing has asked for any channel on its behalf.
 		assert_eq!(
 			runtime_parachains::paras::Pallet::<Rc>::lifecycle(fresh),
 			Some(runtime_parachains::paras::ParaLifecycle::Onboarding),
@@ -2513,36 +2505,14 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 			!take_dmp(coretime).is_empty(),
 			"the relay chain must report the registration back to Coretime"
 		);
-
-        // WHEN Coretime, having had that report, asks for the control channel.
-		enqueue_ump(coretime, vec![as_coretime(establish)]);
-		next_block_rc();
-
-		let channel =
-			polkadot_primitives::HrmpChannelId { sender: coretime, recipient: fresh };
+		let out = polkadot_primitives::HrmpChannelId { sender: coretime, recipient: fresh };
 		let back = polkadot_primitives::HrmpChannelId { sender: fresh, recipient: coretime };
-
-		// THEN the relay chain refuses — it will not open a channel to a para that has not
-		// onboarded — and, crucially, it now *answers*. The reply is what lets Coretime record the
-		// pair as unconfirmed rather than claiming it open against nothing, which is what made this
-		// refusal invisible before.
-		assert!(
-			HrmpOpenChannelRequests::<Rc>::get(&channel).is_none(),
-			"the relay chain must not record a request for a para that is still onboarding"
-		);
-		assert!(
-			frame_system::Pallet::<Rc>::events().into_iter().any(|record| matches!(
-				record.event,
-				crate::mock::network::relay::RuntimeEvent::HrmpRelay(
-					pallet_hrmp_relay::Event::SystemChannelRejected { .. }
-				)
-			)),
-			"the refusal must be raised locally"
-		);
-		assert!(
-			!take_dmp(coretime).is_empty(),
-			"and reported back to Coretime, so it knows the pair is not open"
-		);
+		for id in [&out, &back] {
+			assert!(
+				HrmpOpenChannelRequests::<Rc>::get(id).is_none(),
+				"no control channel may be requested for a fresh registration"
+			);
+		}
 
 		// WHEN the two session boundaries registration actually takes go by.
 		let before = session_index_rc();
@@ -2550,45 +2520,39 @@ async fn a_freshly_registered_para_and_its_control_channel_across_sessions() {
 		rotate_session_rc();
 		assert_eq!(session_index_rc(), before + 2);
 
-		// THEN the para is live...
+		// THEN the para is live, still with no channel anywhere — and none needed.
 		assert!(
 			runtime_parachains::paras::Pallet::<Rc>::is_valid_para(fresh),
 			"the para must be live after SESSION_DELAY boundaries"
 		);
+		for id in [&out, &back] {
+			assert!(HrmpChannels::<Rc>::get(id).is_none());
+			assert!(HrmpOpenChannelRequests::<Rc>::get(id).is_none());
+		}
 
-		// ...and its control channel still does not exist, because a refusal is not retried on its
-		// own. What the answer bought is that Coretime knows, so a retry is possible and
-		// meaningful — see `a_refused_pair_stays_unconfirmed_and_can_be_retried` in
-		// `pallet-hrmp-para` for the Coretime half.
-		assert!(HrmpChannels::<Rc>::get(&channel).is_none());
-		assert!(HrmpChannels::<Rc>::get(&back).is_none());
-
-		// WHEN the retry goes out now that the para is live.
+		// WHEN the new para sends the exact message any para sends today — an unpaid `Transact`
+		// of its own call — twice in one block.
+		let ask = crate::mock::network::relay::RuntimeCall::Hrmp(
+			runtime_parachains::hrmp::Call::<Rc>::hrmp_init_open_channel {
+				recipient: 2000.into(),
+				proposed_max_capacity: 8,
+				proposed_max_message_size: 1024,
+			},
+		);
 		let _ = take_dmp(coretime);
-		enqueue_ump(coretime, vec![as_coretime(establish_retry)]);
+		enqueue_ump(fresh, vec![as_coretime(ask.clone()), as_coretime(ask)]);
 		next_block_rc();
 
-		// THEN the relay chain accepts it, in both directions, and answers.
-		for id in [&channel, &back] {
-			assert!(
-				HrmpOpenChannelRequests::<Rc>::get(id).is_some_and(|r| r.confirmed),
-				"{id:?} must be a confirmed request once the para is live"
-			);
-		}
-		assert!(!take_dmp(coretime).is_empty(), "Coretime must be told it succeeded");
-
-		// The channel itself only exists after the next boundary — a request is not a channel.
-		assert!(HrmpChannels::<Rc>::get(&channel).is_none());
-		rotate_session_rc();
-
-		// THEN the control plane is finally reachable in both directions.
-		assert!(
-			HrmpChannels::<Rc>::get(&channel).is_some(),
-			"Coretime must have a route to the new para"
+		// THEN exactly one request is forwarded to the control plane: the route works with no
+		// further setup, and the second ask fell to the per-para per-block forward budget.
+		assert_eq!(
+			take_dmp(coretime).len(),
+			1,
+			"one forward per para per block: the first must go through, the second must not"
 		);
 		assert!(
-			HrmpChannels::<Rc>::get(&back).is_some(),
-			"and the para a route back, which is what makes its own HRMP calls reachable"
+			HrmpOpenChannelRequests::<Rc>::iter_keys().all(|id| id.sender != fresh),
+			"the relay chain must forward the para's request, not act on it"
 		);
 	});
 }
@@ -2634,59 +2598,32 @@ async fn channel_caps_and_who_is_near_them() {
 			inn.get(&coretime).copied().unwrap_or(0),
 		);
 
-		// The caps are governance-settable, and B25 turns on their value, so pin them: a change to
-		// either one changes whether the control plane can reach the network, and it should not be
-		// possible to make that change quietly.
+		// The caps stay a probe, not a constraint. The control plane holds **no** channel per
+		// para — its link to each para is relayed through this chain (see `decisions.md`
+		// 2026-08-31) — so its budget here is zero and no cap can price it out. This is what
+		// closed B25: on this very snapshot Kusama could fit only 30 of the 107 channels the old
+		// per-para design needed. The numbers keep printing so a future design that *does* want
+		// per-para channels knows what it is up against.
 		#[cfg(not(feature = "kusama"))]
-		let (cap, registered_paras) = (128u32, 85usize);
+		let cap = 128u32;
 		#[cfg(feature = "kusama")]
-		let (cap, registered_paras) = (30u32, 107usize);
-
+		let cap = 30u32;
 		assert_eq!(config.hrmp_max_parachain_outbound_channels, cap);
 		assert_eq!(config.hrmp_max_parachain_inbound_channels, cap);
-
-        // The control plane wants a channel with every para it manages, in both directions, so its
-        // requirement is the *number of paras* — not a constant. That is the shape the cap was
-        // never sized for: the busiest para today is a hub by usage (Asset Hub), which grew
-        // organically, whereas this is a hub by construction.
-        //
-        // Whether it fits is therefore a property of how many paras the network has, and it is
-        // checked here rather than left to be discovered during a migration.
-        let fits = registered_paras <= cap as usize;
-        #[cfg(not(feature = "kusama"))]
-        assert!(
-            fits,
-            "Polkadot no longer fits: {registered_paras} paras against a cap of {cap}. The \
-             control plane cannot reach them all — see open.md B25"
-        );
-        #[cfg(feature = "kusama")]
-        assert!(
-            !fits,
-            "Kusama now fits ({registered_paras} paras, cap {cap}) — B25 has been addressed, so \
-             update the expectations in `full_migration_rc_to_ct` too"
-        );
 	});
 }
 
-/// Which XCM doors are open to a **non-system** parachain on the relay chain.
+/// Which XCM doors are open to a **non-system** parachain on the relay chain, before the
+/// migration: unpaid is shut — including the control-plane shape, whose barrier only opens at
+/// `MigrationDone` — and paid works out of the para's own sovereign account here.
 ///
-/// The forwarding design rests on one: a para dispatches its own call here and this chain passes it
-/// on to the control plane. For that `Transact` to run at all it must first get past the XCM
-/// barrier, and the barrier has exactly two doors:
-///
-/// - `AllowExplicitUnpaidExecutionFrom<(IsChildSystemParachain, Fellows, ..)>` — a non-system para
-///   is none of those, so this one is shut for it.
-/// - `AllowTopLevelPaidExecutionFrom<Everything>` — open to anyone who pays, and paying means
-///   holding DOT in its sovereign account **on this chain**.
-///
-/// Which is the problem, and why this test exists: emptying those accounts is what the migration is
-/// *for*. "Zero DOT on RC" is a PRD goal and an asserted invariant of `full_migration_rc_to_ct`. So
-/// after the migration a non-system para can pay for nothing here, and the door it could otherwise
-/// use is the one closed to it. See `open.md` B26.
-///
-/// Measured on a pre-migration snapshot, where the sovereign accounts are still funded — so the
-/// paid door genuinely works today and the finding is about what the migration removes, not about
-/// something being broken now.
+/// This is the pre-migration half of B26. Post-migration the sovereign account is empty by design
+/// ("Zero DOT on RC"), and what opens instead is `AllowUnpaidParaControlFrom`: exactly
+/// `UnpaidExecution` + one `Transact { Native }` from a child para, rate-limited per para per
+/// block, with the forwarded work priced on the Coretime chain. That half is driven end to end in
+/// `full_migration_rc_to_ct` and in the fresh-registration test above. What this test pins is that
+/// **nothing changes early**: on a snapshot that predates the migration, the new barrier arm must
+/// refuse the very shape it will later admit.
 #[tokio::test]
 async fn a_non_system_para_can_only_reach_the_relay_chain_by_paying() {
 	type Rc = crate::mock::network::relay::Runtime;

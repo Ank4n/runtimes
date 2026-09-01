@@ -247,6 +247,10 @@ pub type Barrier = TrailingSetTopicAsId<(
 				Fellows,
 				AssetHubPlurality,
 			)>,
+			// A parachain's own control-plane request executes unpaid: post-migration its
+			// sovereign account here is empty by design, and the work is priced on the Coretime
+			// chain instead. Deliberately shape-checked and rate-limited — see `para_control`.
+			crate::para_control::AllowUnpaidParaControlFrom<OnlyParachains>,
 		),
 		UniversalLocation,
 		ConstU32<8>,

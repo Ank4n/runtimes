@@ -282,9 +282,6 @@ impl pallet_registrar_para::Config for Runtime {
 	type BlockNumberProvider = cumulus_pallet_parachain_system::RelaychainDataProvider<Runtime>;
 	type Fungible = Balances;
 	type UpgradeCooldownCost = UpgradeCooldownCost;
-	// A registration opens a channel with the new para, so this chain always has a route to every
-	// para it is the control plane for — and so the para can `Transact` back.
-	type OnRegistered = crate::HrmpPara;
 	type WeightInfo = ();
 }
 
