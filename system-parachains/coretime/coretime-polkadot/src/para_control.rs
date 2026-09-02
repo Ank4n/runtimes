@@ -53,7 +53,7 @@ parameter_types! {
 	/// The relay chain, where every request goes.
 	pub RelayLocation: Location = Location::parent();
 
-	/// This chain's own para id, for the channel it opens with every para it registers.
+	/// This chain's own para id, naming it as one end of a system channel.
 	pub const SelfParaId: u32 = BROKER_ID;
 
 	/// Mirrors the relay chain's `LOWEST_PUBLIC_ID`: ids below it are system chains, and this
