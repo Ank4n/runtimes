@@ -59,9 +59,10 @@ impl<T: Config> RegistrarMigrator<T> {
 					// see `migrator_types::translate_destination`.
 					manager: migrator_types::translate_destination(&info.manager),
 					deposit: info.deposit,
-					// The registrar leaves the flag unset until a para's first head; the
-					// destination treats unset as unlocked, so collapse it on the way out.
-					locked: info.locked.unwrap_or(false),
+					// Carried whole. The registrar leaves this unset until a para's first head,
+					// and the destination needs to tell "never locked" from "unlocked on
+					// purpose" — only the first is still eligible for its automatic lock.
+					locked: info.locked,
 					// Both read here because only this chain can: the lifecycle map and the head
 					// data stay behind, and the destination prices the arriving registration from
 					// the head length exactly as it would price a fresh one.

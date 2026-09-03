@@ -615,7 +615,8 @@ pub mod pallet {
 				} else {
 					MigratedParaState::Reserved
 				},
-				// Every live para arrives locked; the relay chain set that at its first head.
+				// Passed through unchanged, including the unset case: a para the relay chain
+				// never locked stays eligible for this chain's own automatic lock.
 				locked: para.locked,
 			})
 			.map_err(|e| {

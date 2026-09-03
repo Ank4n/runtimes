@@ -866,12 +866,14 @@ async fn full_migration_rc_to_ct() {
 			let paras: Vec<(u32, u128)> = paras_registrar::Paras::<Rc>::iter()
 				.map(|(id, info)| (id.into(), info.deposit))
 				.collect();
-			let detail: Vec<(u32, bool, bool)> = paras_registrar::Paras::<Rc>::iter()
+			// The lock travels whole, not collapsed: Coretime has to tell "never locked"
+			// (still eligible for its own automatic lock) from "unlocked on purpose".
+			let detail: Vec<(u32, bool, Option<bool>)> = paras_registrar::Paras::<Rc>::iter()
 				.map(|(id, info)| {
 					(
 						id.into(),
 						runtime_parachains::paras::Pallet::<Rc>::lifecycle(id).is_some(),
-						info.locked.unwrap_or(false),
+						info.locked,
 					)
 				})
 				.collect();
@@ -905,8 +907,12 @@ async fn full_migration_rc_to_ct() {
 		"the snapshot must contain at least one onboarded para"
 	);
 	assert!(
-		paras_before_detail.iter().any(|(_, _, locked)| *locked),
+		paras_before_detail.iter().any(|(_, _, locked)| *locked == Some(true)),
 		"the snapshot must contain at least one locked para, or the lock carry is untested"
+	);
+	assert!(
+		paras_before_detail.iter().any(|(_, _, locked)| locked.is_none()),
+		"the snapshot must contain at least one never-locked para, or the None carry is untested"
 	);
 
 	// The sweep stage's inputs — the configured pots plus reapable below-ED dust, all landing
@@ -1572,7 +1578,7 @@ async fn full_migration_rc_to_ct() {
 		// --- migrated state must be usable, not merely present ---------------------------
 		// The strongest thing this test can say: pick real migrated paras out of the snapshot
 		// and drive them through the pallet as their manager would.
-		let locked_para = paras_before_detail.iter().find(|(_, _, locked)| *locked);
+		let locked_para = paras_before_detail.iter().find(|(_, _, locked)| *locked == Some(true));
 		if let Some((para_id, _, _)) = locked_para {
 			let manager = pallet_registrar_para::Paras::<Ct>::get(*para_id).unwrap().manager;
 			// A locked para's manager must be shut out. This is the whole reason the lock is
@@ -1592,7 +1598,7 @@ async fn full_migration_rc_to_ct() {
 		}
 
 		let reserved_para = paras_before_detail.iter().find(|(_, registered, locked)| {
-			!*registered && !*locked
+			!*registered && *locked != Some(true)
 		});
 		if let Some((para_id, _, _)) = reserved_para {
 			let info = pallet_registrar_para::Paras::<Ct>::get(*para_id).unwrap();

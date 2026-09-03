@@ -97,7 +97,7 @@ fn sub_ed_free_survives_hold_placement_and_reattribution() {
 				para_id: 2000,
 				manager: bob.clone(),
 				deposit: 40,
-				locked: false,
+				locked: None,
 				registered: true,
 				head_len: 32,
 			}],
@@ -177,7 +177,7 @@ fn receive_registrar_releases_the_deposit_and_hands_the_para_over() {
 			para_id: 2000,
 			manager: alice.clone(),
 			deposit: 300,
-			locked: false,
+			locked: None,
 			registered: true,
 			head_len: 32,
 		};
@@ -200,7 +200,7 @@ fn receive_registrar_releases_the_deposit_and_hands_the_para_over() {
 		assert_eq!(received.len(), 1);
 		assert_eq!(received[0].para_id, 2000);
 		assert_eq!(received[0].manager, alice);
-		assert!(!received[0].locked);
+		assert_eq!(received[0].locked, None);
 		assert_eq!(
 			received[0].state,
 			registrar_primitives::MigratedParaState::Registered { head_len: 32 }
@@ -223,7 +223,7 @@ fn registrar_shortfall_is_parked_never_minted() {
 			para_id: 2000,
 			manager: alice.clone(),
 			deposit: 250,
-			locked: false,
+			locked: None,
 			registered: false,
 			head_len: 0,
 		};
@@ -254,7 +254,7 @@ fn multi_para_manager_attribution_is_capped_by_what_arrived() {
 			para_id: id,
 			manager: alice.clone(),
 			deposit: 300,
-			locked: false,
+			locked: None,
 			registered: true,
 			head_len: 32,
 		};

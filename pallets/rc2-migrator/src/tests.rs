@@ -594,7 +594,9 @@ fn registrar_stage_moves_next_free_id_and_drains_records() {
 					para_id: 2000,
 					manager: alice,
 					deposit: 300,
-					locked: false,
+					// Never locked, and it travels as such: the relay chain only sets this at a
+					// para's first head, and this one has never produced one.
+					locked: None,
 					// The test para has a registrar record but was never onboarded, so it has no
 					// lifecycle and no head data — it travels as a reserved id.
 					registered: false,

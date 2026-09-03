@@ -148,11 +148,13 @@ pub struct PortableParaInfo<AccountId, Balance> {
 	/// The deposit as recorded by the registrar. Reconciled against the balance that actually
 	/// arrived held during the accounts stage; never trusted on its own.
 	pub deposit: Balance,
-	/// Whether the para is locked from manager control.
+	/// Whether the para is locked from manager control, as the registrar recorded it.
 	///
-	/// The registrar's own field is `Option<bool>` (unset until the first head), but the
-	/// destination treats unset as unlocked, so the wire carries the collapsed value.
-	pub locked: bool,
+	/// Three-valued, and carried whole rather than collapsed. `None` means never locked and still
+	/// eligible for the destination's automatic lock; `Some(false)` means deliberately unlocked
+	/// and must stay that way. Collapsing the two would opt every never-locked para out of ever
+	/// locking again.
+	pub locked: Option<bool>,
 	/// Whether the para is actually onboarded, or merely has its id reserved.
 	///
 	/// The discriminator is `paras::ParaLifecycles`, which stays on the relay chain — so the
