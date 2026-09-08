@@ -25,15 +25,15 @@ sp-tracing = { workspace = true, default-features = true }
 tokio = { features = ["macros", "rt-multi-thread", "sync"], workspace = true }
 xcm = { workspace = true, default-features = true }
 
-asset-hub-polkadot-runtime = { workspace = true, default-features = true }
-coretime-polkadot-runtime = { workspace = true, default-features = true }
-polkadot-runtime = { workspace = true, default-features = true }
+asset-hub-polkadot-runtime = { workspace = true }
+coretime-polkadot-runtime = { workspace = true }
+polkadot-runtime = { workspace = true }
 polkadot-runtime-constants = { workspace = true, default-features = true }
 
 # Only compiled with the `kusama` feature, so the default build pulls in one set of runtimes.
-asset-hub-kusama-runtime = { workspace = true, default-features = true, optional = true }
-coretime-kusama-runtime = { workspace = true, default-features = true, optional = true }
-kusama-runtime = { workspace = true, default-features = true, optional = true }
+asset-hub-kusama-runtime = { workspace = true, optional = true }
+coretime-kusama-runtime = { workspace = true, optional = true }
+kusama-runtime = { workspace = true, optional = true }
 kusama-runtime-constants = { workspace = true, default-features = true, optional = true }
 
 [features]
