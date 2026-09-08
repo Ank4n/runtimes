@@ -1166,6 +1166,26 @@ impl From<TransparentProxyType<ProxyType>> for ProxyType {
 	}
 }
 
+/// Which proxy permissions travel to the Coretime chain in the migration. A permission with no
+/// meaning there (staking, governance, …) returns `Err`, and its definitions stay on this chain.
+impl TryFrom<TransparentProxyType<ProxyType>> for migrator_types::PortableProxyType {
+	type Error = ();
+
+	fn try_from(t: TransparentProxyType<ProxyType>) -> Result<Self, ()> {
+		use migrator_types::PortableProxyType as P;
+		match t.0 {
+			ProxyType::Any => Ok(P::Any),
+			ProxyType::NonTransfer => Ok(P::NonTransfer),
+			ProxyType::CancelProxy => Ok(P::CancelProxy),
+			ProxyType::ParaRegistration => Ok(P::ParaRegistration),
+			ProxyType::Governance |
+			ProxyType::Staking |
+			ProxyType::Auction |
+			ProxyType::NominationPools => Err(()),
+		}
+	}
+}
+
 impl<T: scale_info::TypeInfo> scale_info::TypeInfo for TransparentProxyType<T> {
 	type Identity = T::Identity;
 
@@ -1839,6 +1859,44 @@ impl pallet_rc_migrator::Config for Runtime {
 	type Currency = Balances;
 }
 
+parameter_types! {
+	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
+	/// Leftover pots emptied by the migration's sweep stage. `dap/satl` is the retired
+	/// direct-allocation pot's `PalletId`; the on-demand pot can accrue order revenue right up to
+	/// the migration.
+	pub SweepAccounts: Vec<AccountId> = vec![
+		TreasuryPalletId::get().into_account_truncating(),
+		PalletId(*b"dap/satl").into_account_truncating(),
+		OnDemandPalletId::get().into_account_truncating(),
+	];
+	/// Where swept pots and dust land on Asset Hub: the treasury account, which derives from the
+	/// same `PalletId` there and so has the same address.
+	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
+	/// Audited issuance that no account holds ("phantom issuance"), burned at the end of the
+	/// migration. Measured at RC block #32,378,714; re-measure and update ahead of the real run.
+	pub const TiCorrection: u128 = 216_543_537_220_240;
+	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain, so
+	/// the receiving account can pay for the holds placed on it.
+	pub const CtFreeBuffer: Balance = UNITS;
+	/// Asset Hub's existential deposit; mirrors
+	/// `system_parachains_constants::polkadot::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
+	/// (= relay ED / 10) without pulling that crate into the relay runtime.
+	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
+}
+
+impl pallet_rc2_migrator::Config for Runtime {
+	type RuntimeEvent = RuntimeEvent;
+	type Currency = Balances;
+	type SendXcm = xcm_config::XcmRouter;
+	type CtParaId = BrokerId;
+	type AhParaId = AssetHubId;
+	type CtFreeBuffer = CtFreeBuffer;
+	type AhExistentialDeposit = AhExistentialDeposit;
+	type SweepAccounts = SweepAccounts;
+	type SweepBeneficiary = SweepBeneficiary;
+	type TiCorrection = TiCorrection;
+}
+
 construct_runtime! {
 	pub enum Runtime
 		{
@@ -1948,6 +2006,11 @@ construct_runtime! {
 		// The pallet must be located below `MessageQueue` to get the XCM message acknowledgements
 		// from Asset Hub before we get the `RcMigrator` `on_initialize` executed.
 		RcMigrator: pallet_rc_migrator = 255,
+
+		// Relay-chain side of the registrar and HRMP move to the Coretime chain. Below
+		// `MessageQueue` for the same reason as `RcMigrator`: its `on_initialize` must see the
+		// block's inbound messages. Inert until a root call schedules the migration.
+		Rc2Migrator: pallet_rc2_migrator = 254,
 	}
 }
 

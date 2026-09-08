@@ -156,3 +156,28 @@ fn proxy_type_superset_relation_matches_call_filters() {
 		}
 	}
 }
+
+/// Only permissions that still mean something on the Coretime chain travel in the AHM v2
+/// migration; the rest stay here, so their definitions are dropped rather than silently
+/// widened into something the receiving chain would interpret differently.
+///
+/// Driven off `all_proxy_types()`, so a new variant fails here until it is classified.
+#[test]
+fn portable_proxy_types_are_exactly_the_ones_coretime_can_honour() {
+	use migrator_types::PortableProxyType;
+
+	let travels: Vec<(ProxyType, PortableProxyType)> = all_proxy_types()
+		.into_iter()
+		.filter_map(|p| PortableProxyType::try_from(TransparentProxyType(p)).ok().map(|q| (p, q)))
+		.collect();
+
+	assert_eq!(
+		travels,
+		vec![
+			(ProxyType::Any, PortableProxyType::Any),
+			(ProxyType::NonTransfer, PortableProxyType::NonTransfer),
+			(ProxyType::CancelProxy, PortableProxyType::CancelProxy),
+			(ProxyType::ParaRegistration, PortableProxyType::ParaRegistration),
+		]
+	);
+}

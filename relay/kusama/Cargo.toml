@@ -11,7 +11,9 @@ version.workspace = true
 [dependencies]
 
 # Asset Hub Migration concerning deps
+migrator-types = { workspace = true }
 pallet-rc-migrator = { workspace = true }
+pallet-rc2-migrator = { workspace = true }
 # End: Asset Hub Migration concerning deps
 
 codec = { features = ["derive", "max-encoded-len"], workspace = true }
@@ -148,6 +150,7 @@ std = [
 	"hex/std",
 	"kusama-runtime-constants/std",
 	"log/std",
+	"migrator-types/std",
 	"pallet-asset-rate/std",
 	"pallet-authority-discovery/std",
 	"pallet-authorship/std",
@@ -179,6 +182,7 @@ std = [
 	"pallet-proxy/std",
 	"pallet-ranked-collective/std",
 	"pallet-rc-migrator/std",
+	"pallet-rc2-migrator/std",
 	"pallet-recovery/std",
 	"pallet-referenda/std",
 	"pallet-scheduler/std",
@@ -262,6 +266,7 @@ runtime-benchmarks = [
 	"pallet-proxy/runtime-benchmarks",
 	"pallet-ranked-collective/runtime-benchmarks",
 	"pallet-rc-migrator/runtime-benchmarks",
+	"pallet-rc2-migrator/runtime-benchmarks",
 	"pallet-recovery/runtime-benchmarks",
 	"pallet-referenda/runtime-benchmarks",
 	"pallet-scheduler/runtime-benchmarks",
@@ -323,6 +328,7 @@ try-runtime = [
 	"pallet-proxy/try-runtime",
 	"pallet-ranked-collective/try-runtime",
 	"pallet-rc-migrator/try-runtime",
+	"pallet-rc2-migrator/try-runtime",
 	"pallet-recovery/try-runtime",
 	"pallet-referenda/try-runtime",
 	"pallet-scheduler/try-runtime",
