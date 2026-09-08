@@ -13,6 +13,10 @@ license.workspace = true
 migrator-types = { workspace = true }
 pallet-rc-migrator = { workspace = true }
 pallet-rc2-migrator = { workspace = true }
+pallet-registrar-relay = { workspace = true }
+pallet-hrmp-relay = { workspace = true }
+registrar-primitives = { workspace = true }
+hrmp-primitives = { workspace = true }
 # End: Asset Hub Migration concerning deps
 
 codec = { features = ["derive", "max-encoded-len"], workspace = true }
@@ -138,9 +142,13 @@ polkadot-ahm = [
 	"pallet-rc-migrator/polkadot-ahm",
 ]
 std = [
+	"hrmp-primitives/std",
 	"migrator-types/std",
+	"pallet-hrmp-relay/std",
 	"pallet-rc-migrator/std",
 	"pallet-rc2-migrator/std",
+	"pallet-registrar-relay/std",
+	"registrar-primitives/std",
 
 	"authority-discovery-primitives/std",
 	"babe-primitives/std",
@@ -237,8 +245,10 @@ std = [
 	"xcm/std",
 ]
 runtime-benchmarks = [
+	"hrmp-primitives/runtime-benchmarks",
 	"pallet-rc-migrator/runtime-benchmarks",
 	"pallet-rc2-migrator/runtime-benchmarks",
+	"registrar-primitives/runtime-benchmarks",
 
 	"frame-benchmarking/runtime-benchmarks",
 	"frame-election-provider-support/runtime-benchmarks",
@@ -298,8 +308,10 @@ runtime-benchmarks = [
 	"xcm/runtime-benchmarks",
 ]
 try-runtime = [
+	"pallet-hrmp-relay/try-runtime",
 	"pallet-rc-migrator/try-runtime",
 	"pallet-rc2-migrator/try-runtime",
+	"pallet-registrar-relay/try-runtime",
 
 	"frame-election-provider-support/try-runtime",
 	"frame-executive/try-runtime",

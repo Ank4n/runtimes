@@ -129,6 +129,8 @@ parameter_types! {
 }
 
 impl parachains_hrmp::Config for Test {
+	type ParaSelfOrigin = runtime_parachains::origin::EnsureParachain;
+	type ParaRequests = ();
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type ChannelManager = EnsureRoot<AccountId32>;
@@ -144,6 +146,8 @@ parameter_types! {
 }
 
 impl paras_registrar::Config for Test {
+	type ParaSelfOrigin = runtime_parachains::origin::EnsureParachain;
+	type ParaRequests = ();
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;

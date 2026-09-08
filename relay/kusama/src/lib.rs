@@ -154,6 +154,7 @@ mod bag_thresholds;
 mod past_payouts;
 
 // XCM configurations.
+pub mod para_control;
 pub mod xcm_config;
 
 // Governance configurations.
@@ -246,8 +247,59 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 			// Coretime: request_revenue_at is allowed, rest handled by catch-all.
 			Coretime(coretime::Call::<Runtime>::request_revenue_at { .. }) => true,
 
-			// Fellowship and its preimages explicitly allowed.
-			FellowshipCollective(..) | FellowshipReferenda(..) | Preimage(..) => true,
+			// The parachain control plane, which must stay reachable. These calls do **not**
+			// arrive as Root and so do not bypass this filter: Coretime's requests convert to
+			// `parachains_origin::Origin::Parachain(BROKER_ID)`, and the two validation-code
+			// uploads are unsigned. Blocking them — by a broader rule added later, or by folding
+			// them in with the pallets below — severs every registrar and HRMP flow on both
+			// chains, and does it silently, because a filtered call inside XCM surfaces only as a
+			// `Transact` that did nothing.
+			RegistrarRelay(..) | HrmpRelay(..) => true,
+
+			// The para-facing registrar and HRMP calls a parachain dispatches for *itself*. These
+			// stay reachable for good, because after the migration their bodies no longer touch
+			// this chain — they forward the request to Coretime on the para's behalf (see
+			// `para_control::ForwardToCoretime`). Keeping them is what lets every parachain go on
+			// encoding exactly the call it encodes today: same pallet index, same call index, same
+			// arguments, no coordination with fifty teams.
+			//
+			// Blocked only *while the migration runs*, and that window is load-bearing: the
+			// forwarder turns on when the migration is **finished**, so mid-migration these would
+			// still take the local path and act on a half-drained registry. `is_ongoing` is
+			// therefore the right predicate here where `has_started` is right below.
+			//
+			// `schedule_code_upgrade` is deliberately **not** in this list: it carries the whole
+			// validation code, which cannot be forwarded — see `registrar_primitives`. It falls
+			// through to the blanket arm below.
+			Registrar(
+				paras_registrar::Call::<Runtime>::deregister { .. } |
+				paras_registrar::Call::<Runtime>::add_lock { .. } |
+				paras_registrar::Call::<Runtime>::remove_lock { .. } |
+				paras_registrar::Call::<Runtime>::set_current_head { .. },
+			) |
+			Hrmp(
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_init_open_channel { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_accept_open_channel { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_close_channel { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::hrmp_cancel_open_request { .. } |
+				runtime_parachains::hrmp::Call::<Runtime>::establish_channel_with_system { .. },
+			) => !pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_ongoing(),
+
+			// Everything else on those two pallets moves to the Coretime chain; see
+			// `para_control`. Closing them here is what stops there being two live control planes,
+			// which would diverge the moment either side acted. Root still reaches both — Root
+			// bypasses this filter — which is what governance and the migration need, and the
+			// relay-side pallets above drive them by direct call rather than by dispatch, so they
+			// are unaffected.
+			//
+			// Gated on the migration rather than on the upgrade, and the distinction matters: the
+			// Coretime pallets hold no state until the migration hands it over, so closing these
+			// at the upgrade would leave nobody able to register a para or open a channel on
+			// *either* chain for however long governance takes to schedule the start. A scheduled
+			// migration has not started, so the relay chain serves its users right up to the
+			// start block, and never again after it.
+			Registrar(..) | Hrmp(..) =>
+				!pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started(),
 
 			// Everything else is allowed.
 			_ => true,
@@ -1548,7 +1600,7 @@ impl parachains_paras::Config for Runtime {
 	type UnsignedPriority = ParasUnsignedPriority;
 	type QueueFootprinter = ParaInclusion;
 	type NextSessionRotation = Babe;
-	type OnNewHead = Registrar;
+	type OnNewHead = (Registrar, crate::para_control::NoteFirstHeadToCoretime);
 	type AssignCoretime = ParaScheduler;
 	type Fungible = Balances;
 	// Per day the cooldown is removed earlier, it should cost 1000.
@@ -1614,6 +1666,8 @@ parameter_types! {
 }
 
 impl parachains_hrmp::Config for Runtime {
+	type ParaRequests = crate::para_control::ForwardToCoretime;
+	type ParaSelfOrigin = crate::para_control::EnsureAnyParaSelf;
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type ChannelManager = EitherOfDiverse<
@@ -1640,6 +1694,35 @@ impl parachains_scheduler::Config for Runtime {}
 
 parameter_types! {
 	pub const BrokerId: u32 = system_parachain::BROKER_ID;
+	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
+	/// Leftover pots emptied by the migration's `Sweep` stage.
+	///
+	/// Kusama's list is not Polkadot's: there is no retired direct-allocation pot here, and the
+	/// Society pot is Kusama-only. Each entry is a pot whose balance has no owner to migrate it
+	/// to, so it is swept rather than left stranded on a chain that will hold no DOT/KSM.
+	pub SweepAccounts: Vec<AccountId> = vec![
+		TreasuryPalletId::get().into_account_truncating(),
+		SocietyPalletId::get().into_account_truncating(),
+		OnDemandPalletId::get().into_account_truncating(),
+	];
+	/// Where swept pots and dust land on Asset Hub. Kusama sweeps to the treasury; Polkadot
+	/// sweeps to its DAP buffer. Same `PalletId` derivation, so the same address on both sides.
+	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
+	/// Audited issuance held by no account ("phantom issuance"), burned at the end of the
+	/// migration.
+	///
+	/// Measured by the `balance_census` test against the 28 Aug 2026 snapshot, which prints the
+	/// exact planck value. Re-measure and update ahead of the real run: this is a one-shot burn,
+	/// and burning more than the chain actually carries is unrecoverable.
+	pub const TiCorrection: u128 = 2_052_086_889_496;
+	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
+	/// One KSM, mirroring Polkadot's one DOT — the two are different amounts of money, and the
+	/// point is a usable buffer on each chain rather than a matching number.
+	pub const CtFreeBuffer: Balance = UNITS;
+	/// Asset Hub's existential deposit; mirrors
+	/// `system_parachains_constants::kusama::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
+	/// without pulling that crate into the relay runtime.
+	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
 	pub const BrokerPalletId: PalletId = PalletId(*b"py/broke");
 	pub MaxXcmTransactWeight: Weight = Weight::from_parts(
 		250 * WEIGHT_REF_TIME_PER_MICROS,
@@ -1722,6 +1805,8 @@ parameter_types! {
 }
 
 impl paras_registrar::Config for Runtime {
+	type ParaRequests = crate::para_control::ForwardToCoretime;
+	type ParaSelfOrigin = crate::para_control::EnsureAnyParaSelf;
 	type RuntimeOrigin = RuntimeOrigin;
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
@@ -1979,30 +2064,6 @@ impl pallet_rc_migrator::Config for Runtime {
 	type Currency = Balances;
 }
 
-parameter_types! {
-	pub const AssetHubId: u32 = system_parachain::ASSET_HUB_ID;
-	/// Leftover pots emptied by the migration's sweep stage. The on-demand pot can accrue order
-	/// revenue right up to the migration.
-	pub SweepAccounts: Vec<AccountId> = vec![
-		TreasuryPalletId::get().into_account_truncating(),
-		SocietyPalletId::get().into_account_truncating(),
-		OnDemandPalletId::get().into_account_truncating(),
-	];
-	/// Where swept pots and dust land on Asset Hub: the treasury account, which derives from the
-	/// same `PalletId` there and so has the same address.
-	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
-	/// Audited issuance that no account holds ("phantom issuance"), burned at the end of the
-	/// migration. Re-measure and update ahead of the real run.
-	pub const TiCorrection: u128 = 2_052_086_889_496;
-	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain, so
-	/// the receiving account can pay for the holds placed on it.
-	pub const CtFreeBuffer: Balance = UNITS;
-	/// Asset Hub's existential deposit; mirrors
-	/// `system_parachains_constants::kusama::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
-	/// (= relay ED / 10) without pulling that crate into the relay runtime.
-	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
-}
-
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type Currency = Balances;
@@ -2148,6 +2209,12 @@ construct_runtime! {
 		// Relay Chain Migrator
 		// The pallet must be located below `MessageQueue` to get the XCM message acknowledgements
 		// from Asset Hub before we get the `RcMigrator` `on_initialize` executed.
+		// The parachain control plane's relay-chain half. Driven only by the Coretime chain
+		// over XCM; see `para_control`. Indices match Polkadot's so both networks encode the
+		// same bytes.
+		RegistrarRelay: pallet_registrar_relay = 250,
+		HrmpRelay: pallet_hrmp_relay = 251,
+
 		RcMigrator: pallet_rc_migrator = 255,
 
 		// Relay-chain side of the registrar and HRMP move to the Coretime chain. Below

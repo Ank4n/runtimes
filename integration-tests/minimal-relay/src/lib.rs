@@ -13,16 +13,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Integration-test harness for the Minimal Relay migration (AHM v2).
+//! Integration tests for the Minimal Relay migration.
 //!
-//! Three chains — the RC, CT and AH — are snapshots of live network state driven by hand: blocks
-//! are produced by calling the relevant hooks directly and DMP/UMP messages are shuttled between
-//! the chains manually. There are no nodes and no networking involved, so the whole suite runs in
-//! seconds, and the same tests run against Polkadot (default) or Kusama (`--features kusama`).
+//! Three chains -- the RC, CT and AH -- are snapshots of network state and driven by
+//! hand: blocks are produced by calling the relevant hooks directly and DMP/UMP messages
+//! are shuttled between the chains manually. There are no nodes and no networking
+//! involved, so the whole suite runs in seconds.
 //!
-//! See this crate's `README.md` for how to obtain the snapshots.
+//! See the `README.md` of this crate for how to create the snapshots.
 
 #![cfg(test)]
 
+pub mod events;
+pub mod kusama_probe;
 pub mod mock;
 pub mod tests;

@@ -8,15 +8,32 @@ description = "Polkadot integration tests for the Minimal Relay migration"
 publish = false
 
 [dependencies]
+migrator-types = { workspace = true, default-features = true }
 codec = { workspace = true, default-features = true }
 cumulus-pallet-parachain-system = { workspace = true, default-features = true }
 cumulus-primitives-core = { workspace = true, default-features = true }
 frame-support = { workspace = true, default-features = true }
 frame-system = { workspace = true, default-features = true }
 log = { workspace = true, default-features = true }
+pallet-babe = { workspace = true, default-features = true }
+pallet-balances = { workspace = true, default-features = true }
+pallet-ct-migrator = { workspace = true, default-features = true }
+pallet-registrar-para = { workspace = true, default-features = true }
+pallet-hrmp-para = { workspace = true, default-features = true }
+pallet-registrar-relay = { workspace = true, default-features = true }
+pallet-hrmp-relay = { workspace = true, default-features = true }
+registrar-primitives = { workspace = true, default-features = true }
+hrmp-primitives = { workspace = true, default-features = true }
 pallet-message-queue = { workspace = true, default-features = true }
+pallet-proxy = { workspace = true, default-features = true }
+pallet-rc2-migrator = { workspace = true, default-features = true }
+pallet-session = { workspace = true, default-features = true }
+pallet-xcm = { workspace = true, default-features = true }
+polkadot-primitives = { workspace = true, default-features = true }
+polkadot-runtime-common = { workspace = true, default-features = true }
 remote-externalities = { workspace = true }
 runtime-parachains = { workspace = true, default-features = true }
+serde_json = { workspace = true, default-features = true }
 sp-core = { workspace = true, default-features = true }
 sp-io = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }
@@ -25,24 +42,23 @@ sp-tracing = { workspace = true, default-features = true }
 tokio = { features = ["macros", "rt-multi-thread", "sync"], workspace = true }
 xcm = { workspace = true, default-features = true }
 
-asset-hub-polkadot-runtime = { workspace = true }
-coretime-polkadot-runtime = { workspace = true }
-polkadot-runtime = { workspace = true }
+asset-hub-polkadot-runtime = { workspace = true, default-features = true }
+coretime-polkadot-runtime = { workspace = true, default-features = true }
+polkadot-runtime = { workspace = true, default-features = true }
+kusama-runtime = { workspace = true, default-features = true }
+pallet-society = { workspace = true, default-features = true }
+pallet-preimage = { workspace = true, default-features = true }
+pallet-multisig = { workspace = true, default-features = true }
+pallet-delegated-staking = { workspace = true, default-features = true }
+pallet-referenda = { workspace = true, default-features = true }
+pallet-scheduler = { workspace = true, default-features = true }
+asset-hub-kusama-runtime = { workspace = true, default-features = true }
+coretime-kusama-runtime = { workspace = true, default-features = true }
+kusama-runtime-constants = { workspace = true, default-features = true }
 polkadot-runtime-constants = { workspace = true, default-features = true }
-
-# Only compiled with the `kusama` feature, so the default build pulls in one set of runtimes.
-asset-hub-kusama-runtime = { workspace = true, optional = true }
-coretime-kusama-runtime = { workspace = true, optional = true }
-kusama-runtime = { workspace = true, optional = true }
-kusama-runtime-constants = { workspace = true, default-features = true, optional = true }
 
 [features]
 default = []
 # Run the whole suite against Kusama instead of Polkadot. The tests are network-agnostic; this
-# only swaps which runtimes `mock::network` resolves to.
-kusama = [
-	"dep:asset-hub-kusama-runtime",
-	"dep:coretime-kusama-runtime",
-	"dep:kusama-runtime",
-	"dep:kusama-runtime-constants",
-]
+# only swaps which runtimes `mock::network` resolves to, and which snapshots the justfile passes.
+kusama = []
