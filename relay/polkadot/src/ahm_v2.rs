@@ -22,15 +22,28 @@
 
 use crate::{
 	xcm_config::{CoretimeLocation, XcmRouter},
-	BlockNumber, BrokerId, Runtime, RuntimeEvent,
+	AccountId, BlockNumber, BrokerId, Runtime, RuntimeCall, RuntimeEvent,
 };
+use alloc::{vec, vec::Vec};
 use frame_support::{parameter_types, traits::Equals};
+use frame_system::EnsureRoot;
 use pallet_xcm::EnsureXcm;
 use polkadot_runtime_constants::time::MINUTES;
 
 parameter_types! {
 	/// Manual verification window between the last data stage and finishing.
 	pub const MigrationCoolOffPeriod: BlockNumber = 30 * MINUTES;
+
+	/// The accounts that may drive the migration collectively. Governance seeds the real set
+	/// before a migration is scheduled; empty means only root and the appointed manager can act.
+	pub MigrationMultisigMembers: Vec<AccountId> = vec![];
+	/// Votes needed from distinct members.
+	pub const MigrationMultisigThreshold: u32 = 3;
+	/// Votes one member may cast per round.
+	pub const MigrationMultisigMaxVotesPerRound: u32 = 5;
+	/// A vote is signed over (who, call, round) and nothing else, so two networks sitting at the
+	/// same round would accept each other's signatures. This is what keeps them apart.
+	pub const MigrationMultisigStartRound: u32 = 100;
 }
 
 impl pallet_rc2_migrator::Config for Runtime {
@@ -40,6 +53,12 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = crate::Timestamp;
 	type CtOrigin = EnsureXcm<Equals<CoretimeLocation>>;
 	type CoolOffPeriod = MigrationCoolOffPeriod;
+	type RuntimeCall = RuntimeCall;
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type MultisigMembers = MigrationMultisigMembers;
+	type MultisigThreshold = MigrationMultisigThreshold;
+	type MultisigMaxVotesPerRound = MigrationMultisigMaxVotesPerRound;
+	type MultisigStartRound = MigrationMultisigStartRound;
 }
 
 #[cfg(test)]

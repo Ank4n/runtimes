@@ -21,12 +21,14 @@ use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
 	traits::{OnInitialize, Time},
 };
-use frame_system::EnsureSignedBy;
-use sp_runtime::BuildStorage;
+use frame_system::{EnsureRoot, EnsureSignedBy};
+use sp_runtime::{traits::IdentityLookup, AccountId32, BuildStorage};
 use xcm::prelude::*;
 
 type Block = frame_system::mocking::MockBlock<Test>;
-pub type AccountId = u64;
+/// `AccountId32`, not the usual mock `u64`: the manager multisig verifies real signatures over
+/// member account ids, so the mock has to use the type those ids actually are.
+pub type AccountId = AccountId32;
 
 frame_support::construct_runtime! {
 	pub enum Test {
@@ -38,13 +40,15 @@ frame_support::construct_runtime! {
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
 	type Block = Block;
+	type AccountId = AccountId;
+	type Lookup = IdentityLookup<AccountId>;
 }
 
 /// The account the mock treats as the Coretime chain's dispatch origin.
-pub const CORETIME: AccountId = 1005;
+pub const CORETIME: AccountId = AccountId32::new([5u8; 32]);
 
 /// Somebody
-pub const ALICE: AccountId = 1;
+pub const ALICE: AccountId = AccountId32::new([1u8; 32]);
 
 pub const CT_PARA_ID: u32 = 1005;
 pub const COOL_OFF: u64 = 10;
@@ -105,6 +109,13 @@ ord_parameter_types! {
 	pub const CoretimeAccount: AccountId = CORETIME;
 }
 
+parameter_types! {
+	pub MultisigMembers: Vec<AccountId> = vec![];
+	pub const MultisigThreshold: u32 = 3;
+	pub const MultisigMaxVotesPerRound: u32 = 5;
+	pub const MultisigStartRound: u32 = 0;
+}
+
 impl pallet_rc2_migrator::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = RecordingRouter;
@@ -112,6 +123,12 @@ impl pallet_rc2_migrator::Config for Test {
 	type TimeProvider = MockTime;
 	type CtOrigin = EnsureSignedBy<CoretimeAccount, AccountId>;
 	type CoolOffPeriod = CoolOffPeriod;
+	type RuntimeCall = RuntimeCall;
+	type AdminOrigin = EnsureRoot<AccountId>;
+	type MultisigMembers = MultisigMembers;
+	type MultisigThreshold = MultisigThreshold;
+	type MultisigMaxVotesPerRound = MultisigMaxVotesPerRound;
+	type MultisigStartRound = MultisigStartRound;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
