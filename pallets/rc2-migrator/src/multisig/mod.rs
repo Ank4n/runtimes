@@ -97,6 +97,7 @@ pub struct ManagerMultisig<T>(PhantomData<T>);
 
 impl<T: Config> ManagerMultisig<T> {
 	/// The account the manager multisig dispatches as, once it reaches its threshold.
+	// TODO(ahm-v2): `ensure_admin_or_manager` accepts a signed origin of this account.
 	pub fn manager_multisig_id() -> T::AccountId {
 		PalletId(*b"rc2migmt").into_account_truncating()
 	}
@@ -106,6 +107,7 @@ impl<T: Config> ManagerMultisig<T> {
 	/// A vote is signed over (who, call, round) and nothing else, so two chains sitting at the
 	/// same round would accept each other's signatures. Each network starts its counter
 	/// somewhere different.
+	// TODO(ahm-v2): called from `on_runtime_upgrade`.
 	pub fn init_round() {
 		if !ManagerMultisigRound::<T>::exists() {
 			ManagerMultisigRound::<T>::put(T::MultisigStartRound::get());
@@ -118,6 +120,8 @@ impl<T: Config> ManagerMultisig<T> {
 	/// [`Config::MultisigThreshold`] members have voted for the same call it is dispatched as the
 	/// multisig's account, the map is cleared and the round advances, which is what stops an old
 	/// round's signatures from being replayed.
+	// TODO(ahm-v2): `vote_manager_multisig` (call index 7) does `ensure_none` and then this;
+	// the pallet `Error` maps this module's `Error` one to one.
 	pub fn vote(payload: &ManagerMultisigVote<T>, sig: &MultiSignature) -> Result<(), Error> {
 		Self::validate_unsigned(payload, sig).map_err(|_| Error::UnsignedValidationFailed)?;
 		let who = payload.who.clone().into_account();
@@ -159,6 +163,7 @@ impl<T: Config> ManagerMultisig<T> {
 
 	/// Whether an unsigned vote may enter the pool: a member's own signature over the payload,
 	/// for the current round, with votes left this round.
+	// TODO(ahm-v2): the `#[pallet::validate_unsigned]` impl delegates `vote_manager_multisig` here.
 	pub fn validate_unsigned(
 		payload: &ManagerMultisigVote<T>,
 		sig: &MultiSignature,
