@@ -22,6 +22,7 @@
 
 use crate::{Runtime, RuntimeEvent};
 
+// TODO(ahm-v2): the stage machine's wiring replaces this impl with the full `Config`.
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 }

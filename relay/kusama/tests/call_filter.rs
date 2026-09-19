@@ -53,6 +53,8 @@ fn allowed_at(stage: &Stage, call: &RuntimeCall) -> bool {
 fn open_stages() -> [Stage; 2] {
 	[Stage::Pending, Stage::Scheduled { start: 1_000 }]
 }
+// TODO(ahm-v2): with the stage machine, `Paused` becomes a flag beside the stage rather than a
+// variant, and `AccountsOngoing` exists to stand in for `RegistrarOngoing` here.
 fn closed_stages() -> [Stage; 5] {
 	[
 		Stage::WaitingForCt,
