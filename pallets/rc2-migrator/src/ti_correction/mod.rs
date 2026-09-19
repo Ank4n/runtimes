@@ -95,8 +95,9 @@ impl<T: Config> TiCorrector<T> {
 	///
 	/// `still_held` is the balance that legitimately remains on this chain at this point — the
 	/// manager's, which stays funded through `CoolOff` — and is not counted as phantom.
-	// TODO(ahm-v2): the stage machine passes the manager's total balance here; `Manager` lands
-	// with #1285.
+	// TODO(ahm-v2): the `TiCorrection` arm runs this once, passing the manager's total balance
+	// (`Manager` lands with the stage machine), then signals the Coretime chain with the ledger's
+	// `kept` and `ct_reserved + ct_free`.
 	pub fn correct_total_issuance(still_held: u128) -> Result<Correction, Error> {
 		let expected = T::TiCorrection::get();
 		let total = pallet_balances::TotalIssuance::<T>::get();
