@@ -21,11 +21,18 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
+pub mod sweep;
+
 pub use pallet::*;
 
+use alloc::vec::Vec;
 use frame_support::pallet_prelude::*;
 use frame_system::pallet_prelude::BlockNumberFor;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
+use sp_runtime::AccountId32;
+use sweep::MigratedBalances;
 
 pub type MigrationStageOf<T> = MigrationStage<BlockNumberFor<T>>;
 
@@ -72,10 +79,23 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config:
+		frame_system::Config<
+			AccountId = AccountId32,
+			AccountData = pallet_balances::AccountData<u128>,
+		> + pallet_balances::Config<Balance = u128>
+	{
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+
+		/// Leftover module pots to empty in the `Sweep` stage (e.g. the old treasury pot).
+		/// Their full balance teleports to `SweepBeneficiary`.
+		type SweepAccounts: Get<Vec<AccountId32>>;
+
+		/// Where swept pots and reaped dust land on Asset Hub — the treasury / DAP buffer
+		/// account designated by governance.
+		type SweepBeneficiary: Get<AccountId32>;
 	}
 
 	#[pallet::pallet]
@@ -85,8 +105,31 @@ pub mod pallet {
 	#[pallet::unbounded]
 	pub type RcMigrationStage<T: Config> = StorageValue<_, MigrationStageOf<T>, ValueQuery>;
 
+	/// Balance kept on the relay chain versus migrated away. Seeded and maintained by the
+	/// accounts stage; the conservation ledger every later stage keeps exact.
+	#[pallet::storage]
+	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances, ValueQuery>;
+
 	#[pallet::event]
+	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
 	pub enum Event<T: Config> {
-		StageTransition { old: MigrationStageOf<T>, new: MigrationStageOf<T> },
+		StageTransition {
+			old: MigrationStageOf<T>,
+			new: MigrationStageOf<T>,
+		},
+		/// A leftover pot was emptied; its balance teleports to the sweep beneficiary on AH.
+		AccountSwept {
+			who: AccountId32,
+			amount: u128,
+		},
+		/// Below-ED dust accounts were reaped; the sum teleports to the sweep beneficiary.
+		DustSwept {
+			count: u32,
+			amount: u128,
+		},
+		/// Zero-balance records held alive only by stale provider references were reaped.
+		HusksReaped {
+			count: u32,
+		},
 	}
 }
