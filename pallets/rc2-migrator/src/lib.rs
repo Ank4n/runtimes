@@ -21,11 +21,17 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+extern crate alloc;
+
+pub mod multisig;
+
 pub use pallet::*;
 
-use frame_support::pallet_prelude::*;
+use alloc::vec::Vec;
+use frame_support::{dispatch::GetDispatchInfo, pallet_prelude::*};
 use frame_system::pallet_prelude::BlockNumberFor;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
+use sp_runtime::{traits::Dispatchable, AccountId32};
 
 pub type MigrationStageOf<T> = MigrationStage<BlockNumberFor<T>>;
 
@@ -76,6 +82,23 @@ pub mod pallet {
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+
+		/// Calls the manager multisig may dispatch once it reaches its threshold.
+		type RuntimeCall: Parameter
+			+ Dispatchable<RuntimeOrigin = <Self as frame_system::Config>::RuntimeOrigin>
+			+ GetDispatchInfo;
+
+		/// Members of a multisig that can submit unsigned txs and act as the manager.
+		type MultisigMembers: Get<Vec<AccountId32>>;
+
+		/// Threshold of `MultisigMembers`.
+		type MultisigThreshold: Get<u32>;
+
+		/// Limit the number of votes of each participant per round.
+		type MultisigMaxVotesPerRound: Get<u32>;
+
+		/// Round the vote counter starts at. Must differ per network.
+		type MultisigStartRound: Get<u32>;
 	}
 
 	#[pallet::pallet]
@@ -85,8 +108,35 @@ pub mod pallet {
 	#[pallet::unbounded]
 	pub type RcMigrationStage<T: Config> = StorageValue<_, MigrationStageOf<T>, ValueQuery>;
 
+	/// The multisig members that voted to execute a specific call.
+	#[pallet::storage]
+	#[pallet::unbounded]
+	pub type ManagerMultisigs<T: Config> =
+		StorageMap<_, Twox64Concat, <T as Config>::RuntimeCall, Vec<AccountId32>, ValueQuery>;
+
+	/// The current round of the multisig voting. Votes are only valid for the current round.
+	#[pallet::storage]
+	pub type ManagerMultisigRound<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+	/// How often each member voted in the current round. Cleared at the end of each round.
+	#[pallet::storage]
+	pub type ManagerVotesInCurrentRound<T: Config> =
+		StorageMap<_, Blake2_128Concat, AccountId32, u32, ValueQuery>;
+
 	#[pallet::event]
+	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
 	pub enum Event<T: Config> {
-		StageTransition { old: MigrationStageOf<T>, new: MigrationStageOf<T> },
+		StageTransition {
+			old: MigrationStageOf<T>,
+			new: MigrationStageOf<T>,
+		},
+		/// The manager multisig dispatched a call.
+		ManagerMultisigDispatched {
+			res: DispatchResult,
+		},
+		/// The manager multisig received a vote.
+		ManagerMultisigVoted {
+			votes: u32,
+		},
 	}
 }
