@@ -86,6 +86,7 @@ impl<T: Config> ProxyMigrator<T> {
 	/// dropped.
 	///
 	/// One-shot; the map is small. The caller wraps this in a storage transaction.
+	// TODO(ahm-v2): the `ProxyInit` arm of the stage machine runs this once.
 	pub fn drain_announcements() -> u32 {
 		let mut dropped = 0u32;
 		let records: Vec<_> = pallet_proxy::Announcements::<T>::iter().collect();
@@ -114,6 +115,8 @@ impl<T: Config> ProxyMigrator<T> {
 	///
 	/// The caller wraps this in a storage transaction and ships the result. Each entry is
 	/// migrated in a transaction of its own, so one that cannot be is skipped whole.
+	// TODO(ahm-v2): the `ProxyOngoing { last_key }` arm runs this once per block and ships
+	// `BlockProxies::proxies` with `send_proxies`, 50 sets per XCM.
 	pub fn migrate_many(last_key: Option<T::AccountId>) -> BlockProxies {
 		// Get iterator starting after last processed key
 		let mut iter = match &last_key {

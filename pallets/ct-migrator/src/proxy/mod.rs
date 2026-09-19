@@ -64,6 +64,7 @@ impl<T: Config> ProxyReceiver<T> {
 	///
 	/// Every set is processed in a transaction of its own: one that fails is rolled back and
 	/// parked in `FailedProxies`, the rest of the batch continues.
+	// TODO(ahm-v2): `receive_proxies` (call index 6, root) invokes this.
 	pub fn receive(proxies: Vec<PortableProxyOf<T>>) {
 		let (count_good, count_bad) = Self::receive_batch(
 			proxies,
