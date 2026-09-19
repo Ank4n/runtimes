@@ -21,11 +21,15 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod proxy;
+
 pub use pallet::*;
 
 use frame_support::pallet_prelude::*;
 use frame_system::pallet_prelude::BlockNumberFor;
+use migrator_types::PortableProxyType;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
+use sp_runtime::AccountId32;
 
 pub type MigrationStageOf<T> = MigrationStage<BlockNumberFor<T>>;
 
@@ -72,7 +76,19 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config:
+		frame_system::Config<
+			AccountId = AccountId32,
+			AccountData = pallet_balances::AccountData<u128>,
+		> + pallet_balances::Config<Balance = u128>
+		// The `Currency` equalities pin every recorded deposit to the native u128 balance. The
+		// `ProxyType` bound is where the runtime declares which proxy permissions travel to the
+		// Coretime chain; untranslatable ones stay here.
+		+ pallet_proxy::Config<
+			Currency = pallet_balances::Pallet<Self>,
+			ProxyType: TryInto<PortableProxyType>,
+		>
+	{
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;

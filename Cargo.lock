@@ -9826,6 +9826,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "migrator-types"
+version = "0.1.0"
+dependencies = [
+ "frame-support",
+ "parity-scale-codec",
+ "polkadot-parachain-primitives",
+ "scale-info",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11217,8 +11229,14 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "log",
+ "migrator-types",
+ "pallet-balances",
+ "pallet-proxy",
  "parity-scale-codec",
  "scale-info",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
 ]
 
 [[package]]
@@ -12145,9 +12163,16 @@ version = "0.1.0"
 dependencies = [
  "frame-support",
  "frame-system",
+ "log",
+ "migrator-types",
+ "pallet-balances",
+ "pallet-proxy",
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",
+ "sp-core 43.0.0",
+ "sp-io 48.0.0",
+ "sp-runtime 48.0.0",
 ]
 
 [[package]]

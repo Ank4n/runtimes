@@ -21,9 +21,16 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod proxy;
+
 pub use pallet::*;
 
-use frame_support::pallet_prelude::*;
+use frame_support::{
+	pallet_prelude::*,
+	traits::fungible::{Mutate, MutateHold},
+};
+use migrator_types::PortableProxyType;
+use proxy::PortableProxyOf;
 
 /// Progress of the migration. Advanced by messages from `pallet-rc2-migrator`.
 #[derive(
@@ -60,10 +67,36 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config:
+		frame_system::Config
+		// Migrated proxy delegations are written into the real proxy pallet so keyless (pure)
+		// delegators keep control here. The `ProxyType` bound is where the runtime declares
+		// what each portable permission becomes locally.
+		+ pallet_proxy::Config<ProxyType: From<PortableProxyType>>
+	{
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+
+		/// Native currency. Migrated relay-chain deposits sit here as holds.
+		type Currency: Mutate<Self::AccountId>
+			+ MutateHold<Self::AccountId, Reason = Self::RuntimeHoldReason>;
+
+		/// The overarching hold reason type.
+		type RuntimeHoldReason: From<HoldReason>;
+
+		/// How many of this chain's blocks fit in one relay-chain block's time. Used to convert
+		/// migrated proxy delays (relay: 6s blocks; this chain: 12s → ratio 2).
+		#[pallet::constant]
+		type RcBlockTimeRatio: Get<u32>;
+	}
+
+	#[pallet::composite_enum]
+	pub enum HoldReason {
+		/// A relay-chain proxy deposit whose definitions travel here. Released when they arrive:
+		/// the recreated entry is re-reserved at this chain's rates and the rest becomes free.
+		#[codec(index = 1)]
+		ProxyDeposit,
 	}
 
 	#[pallet::pallet]
@@ -72,8 +105,22 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type CtMigrationStage<T: Config> = StorageValue<_, MigrationStage, ValueQuery>;
 
+	/// Migrated proxy sets that failed to integrate, parked verbatim for recovery.
+	#[pallet::storage]
+	pub type FailedProxies<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, PortableProxyOf<T>, OptionQuery>;
+
 	#[pallet::event]
+	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
 	pub enum Event<T: Config> {
-		StageTransition { old: MigrationStage, new: MigrationStage },
+		StageTransition {
+			old: MigrationStage,
+			new: MigrationStage,
+		},
+		/// A batch of migrated proxy sets was processed.
+		ProxiesReceived {
+			count_good: u32,
+			count_bad: u32,
+		},
 	}
 }
