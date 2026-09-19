@@ -110,6 +110,8 @@ pub struct SweepMigrator<T>(PhantomData<T>);
 impl<T: Config> SweepMigrator<T> {
 	/// Empty the configured leftover pots. Returns the total to teleport to the sweep
 	/// beneficiary on Asset Hub. One-shot: the pot list is a short config item.
+	// TODO(ahm-v2): the `Sweep` arm runs this once and teleports the total to
+	// `Config::SweepBeneficiary`.
 	pub fn sweep_pots() -> Result<u128, Error> {
 		let mut total: u128 = 0;
 
@@ -147,6 +149,9 @@ impl<T: Config> SweepMigrator<T> {
 	/// held-against accounts, hence the direct write (same pattern as the accounts-stage shell
 	/// drain). A record survives only while something still references it (session key-holders
 	/// being the known case) or it is a module account.
+	// TODO(ahm-v2): the `SweepDust { last_key }` arm runs this once per block and teleports
+	// `BlockSweep::amount` to `Config::SweepBeneficiary`. Reaping the manager at `MigrationDone`
+	// (`reap_manager`) needs `Manager` and lands with the stage machine.
 	pub fn sweep_dust(last_key: Option<T::AccountId>) -> Result<BlockSweep, Error> {
 		// Get iterator starting after last processed key
 		let mut iter = match &last_key {
