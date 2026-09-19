@@ -66,6 +66,7 @@ impl<T: Config> AccountsReceiver<T> {
 	/// Every account is processed in a transaction of its own: one that fails is rolled back and
 	/// parked in `FailedAccounts`, the rest of the batch continues. Successful mints accrue to
 	/// `CtMintedTotal`.
+	// TODO(ahm-v2): `receive_accounts` (call index 4, root) invokes this.
 	pub fn receive(accounts: Vec<PortableAccountOf<T>>) {
 		let mut minted: BalanceOf<T> = Zero::zero();
 		let (count_good, count_bad) = Self::receive_batch(

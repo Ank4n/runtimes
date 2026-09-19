@@ -181,6 +181,7 @@ impl<T: Config> AccountsMigrator<T> {
 	/// One-time preparation before the first block of withdrawals: releases every preimage
 	/// deposit, seeds the conservation ledger with the current total issuance and indexes the
 	/// expected reserves. Returns the number of deposit records indexed.
+	// TODO(ahm-v2): the `AccountsInit` arm of the stage machine runs this once.
 	pub fn init() -> u32 {
 		// Before anything is measured: drop every preimage deposit, so accounts that hold one
 		// are not skipped by `can_migrate`.
@@ -268,6 +269,9 @@ impl<T: Config> AccountsMigrator<T> {
 	/// The caller wraps this in a storage transaction and ships the result; an `Err` rolls back
 	/// the whole block's withdrawals. Each account is withdrawn in a transaction of its own, so
 	/// one that cannot be withdrawn cleanly is skipped whole, never half-withdrawn.
+	// TODO(ahm-v2): the `AccountsOngoing { last_key }` arm runs this once per block with `Manager`,
+	// then ships `BlockWithdrawals::ct` with `send_accounts` (100 accounts per XCM) and
+	// `BlockWithdrawals::ah` with `send_teleport` (40 per XCM).
 	pub fn migrate_many(
 		last_key: Option<T::AccountId>,
 		manager: Option<&T::AccountId>,
