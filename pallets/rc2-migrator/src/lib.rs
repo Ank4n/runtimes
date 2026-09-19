@@ -21,11 +21,15 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
+pub mod ti_correction;
+
 pub use pallet::*;
 
 use frame_support::pallet_prelude::*;
 use frame_system::pallet_prelude::BlockNumberFor;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
+use sp_runtime::AccountId32;
+use ti_correction::MigratedBalances;
 
 pub type MigrationStageOf<T> = MigrationStage<BlockNumberFor<T>>;
 
@@ -72,10 +76,26 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config:
+		frame_system::Config<
+			AccountId = AccountId32,
+			AccountData = pallet_balances::AccountData<u128>,
+		> + pallet_balances::Config<Balance = u128>
+	{
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+
+		/// The audited amount of total issuance that no account holds ("phantom issuance"),
+		/// burned by the `TiCorrection` stage at the end of the migration.
+		///
+		/// Governance-legible tunable: measured off-chain ahead of the migration
+		/// (`balance_census` prints the exact planck value) and pinned here. The stage burns
+		/// `min(this, measured-on-chain)` — anything unaccounted beyond it is left for
+		/// investigation, and a measured value *below* it is reported as an anomaly; the stage
+		/// never burns issuance that an account actually holds.
+		#[pallet::constant]
+		type TiCorrection: Get<u128>;
 	}
 
 	#[pallet::pallet]
@@ -85,8 +105,31 @@ pub mod pallet {
 	#[pallet::unbounded]
 	pub type RcMigrationStage<T: Config> = StorageValue<_, MigrationStageOf<T>, ValueQuery>;
 
+	/// Balance kept on the relay chain versus migrated away. Seeded and maintained by the
+	/// accounts stage; the conservation ledger every later stage keeps exact.
+	#[pallet::storage]
+	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances, ValueQuery>;
+
 	#[pallet::event]
+	#[pallet::generate_deposit(pub(crate) fn deposit_event)]
 	pub enum Event<T: Config> {
-		StageTransition { old: MigrationStageOf<T>, new: MigrationStageOf<T> },
+		StageTransition {
+			old: MigrationStageOf<T>,
+			new: MigrationStageOf<T>,
+		},
+		/// Phantom issuance burned: `burned = min(expected, unaccounted)`. Any
+		/// `unaccounted - burned` remainder is left on the books for investigation.
+		TiCorrected {
+			expected: u128,
+			unaccounted: u128,
+			burned: u128,
+		},
+		/// The measured unaccounted issuance was BELOW the audited expectation — the phantom
+		/// shrank since it was measured, which no known mechanism explains. Observability only;
+		/// the correction still burned the measured amount.
+		TiCorrectionAnomaly {
+			expected: u128,
+			unaccounted: u128,
+		},
 	}
 }
