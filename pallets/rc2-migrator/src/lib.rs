@@ -38,9 +38,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod sweep;
+
 pub use pallet::*;
 
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use frame_support::{
 	pallet_prelude::*,
 	sp_runtime::traits::Saturating,
@@ -248,6 +250,14 @@ pub mod pallet {
 
 		/// The origin that can perform permissioned operations like setting the migration stage.
 		type AdminOrigin: EnsureOrigin<<Self as frame_system::Config>::RuntimeOrigin>;
+
+		/// Leftover module pots to empty in the `Sweep` stage (e.g. the old treasury pot).
+		/// Their full balance teleports to `SweepBeneficiary`.
+		type SweepAccounts: Get<Vec<AccountId32>>;
+
+		/// Where swept pots and reaped dust land on Asset Hub — the treasury / DAP buffer
+		/// account designated by governance.
+		type SweepBeneficiary: Get<AccountId32>;
 	}
 
 	#[pallet::pallet]
@@ -347,6 +357,12 @@ pub mod pallet {
 			/// The stage from which the migration continues.
 			stage: MigrationStageOf<T>,
 		},
+		/// A leftover pot was emptied; its balance teleports to the sweep beneficiary on AH.
+		AccountSwept { who: AccountId32, amount: u128 },
+		/// Below-ED dust accounts were reaped; the sum teleports to the sweep beneficiary.
+		DustSwept { count: u32, amount: u128 },
+		/// Zero-balance records held alive only by stale provider references were reaped.
+		HusksReaped { count: u32 },
 	}
 
 	#[pallet::hooks]

@@ -22,11 +22,32 @@
 
 use crate::{
 	xcm_config::{Broker, XcmRouter},
-	AccountId, BrokerId, Runtime, RuntimeEvent, Timestamp,
+	AccountId, AccumulateForwardPalletId, BrokerId, OnDemandPalletId, Runtime, RuntimeEvent,
+	SocietyPalletId, Timestamp, TreasuryPalletId,
 };
-use frame_support::traits::Equals;
+use alloc::{vec, vec::Vec};
+use frame_support::{parameter_types, traits::Equals};
 use frame_system::EnsureRoot;
 use pallet_xcm::EnsureXcm;
+use sp_runtime::traits::AccountIdConversion;
+
+parameter_types! {
+	/// Leftover pots emptied by the migration's `Sweep` stage.
+	///
+	/// Kusama's list is not Polkadot's: there is no retired direct-allocation pot here, and the
+	/// Society pot is Kusama-only. Each entry is a pot whose balance has no owner to migrate it
+	/// to, so it is swept rather than left stranded on a chain that will hold no KSM.
+	pub SweepAccounts: Vec<AccountId> = vec![
+		TreasuryPalletId::get().into_account_truncating(),
+		SocietyPalletId::get().into_account_truncating(),
+		OnDemandPalletId::get().into_account_truncating(),
+		// The accumulate-and-forward pot that collects relay-chain dust for Asset Hub.
+		AccumulateForwardPalletId::get().into_account_truncating(),
+	];
+	/// Where swept pots and dust land on Asset Hub: the AH treasury account (same `PalletId`
+	/// derivation, so the same address).
+	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
+}
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -35,6 +56,8 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<Broker>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
+	type SweepAccounts = SweepAccounts;
+	type SweepBeneficiary = SweepBeneficiary;
 }
 
 #[cfg(test)]

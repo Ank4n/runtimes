@@ -22,11 +22,28 @@
 
 use crate::{
 	xcm_config::{CoretimeLocation, XcmRouter},
-	AccountId, BrokerId, Runtime, RuntimeEvent, Timestamp,
+	AccountId, BrokerId, OnDemandPalletId, Runtime, RuntimeEvent, Timestamp, TreasuryPalletId,
 };
-use frame_support::traits::Equals;
+use alloc::{vec, vec::Vec};
+use frame_support::{parameter_types, traits::Equals, PalletId};
 use frame_system::EnsureRoot;
 use pallet_xcm::EnsureXcm;
+use sp_runtime::traits::AccountIdConversion;
+
+parameter_types! {
+	/// Leftover pots emptied by the migration's `Sweep` stage. `dap/satl` is the retired
+	/// direct-allocation pot's `PalletId`; the on-demand pot can accrue order revenue up to
+	/// the migration.
+	pub SweepAccounts: Vec<AccountId> = vec![
+		TreasuryPalletId::get().into_account_truncating(),
+		PalletId(*b"dap/satl").into_account_truncating(),
+		OnDemandPalletId::get().into_account_truncating(),
+	];
+	/// Where swept pots and dust land on Asset Hub: the AH treasury account (same `PalletId`
+	/// derivation, so the same address).
+	// TODO(ahm-v2): point at the DAP buffer account once governance designates it.
+	pub SweepBeneficiary: AccountId = TreasuryPalletId::get().into_account_truncating();
+}
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -35,6 +52,8 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<CoretimeLocation>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
+	type SweepAccounts = SweepAccounts;
+	type SweepBeneficiary = SweepBeneficiary;
 }
 
 #[cfg(test)]
