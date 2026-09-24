@@ -45,8 +45,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod accounts;
+
 pub use pallet::*;
 
+use accounts::PortableAccountOf;
 use alloc::{vec, vec::Vec};
 use frame_support::{
 	pallet_prelude::*,
@@ -182,6 +185,20 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type Manager<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
+	/// Accounts that failed to integrate, parked verbatim for recovery after the migration.
+	///
+	/// A batch never fails on a single bad account: it is rolled back, stored here, and the rest
+	/// of the batch continues. Each entry is balance the relay chain burned and this chain never
+	/// minted, so this map is both the record of the gap and the data needed to close it.
+	#[pallet::storage]
+	pub type FailedAccounts<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, PortableAccountOf<T>, OptionQuery>;
+
+	/// Total balance minted on this chain by the accounts stage. Reconciled against the relay
+	/// chain's burned total once the migration ends.
+	#[pallet::storage]
+	pub type CtMintedTotal<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
+
 	#[pallet::error]
 	pub enum Error<T> {
 		/// The migration has already finished on this chain.
@@ -209,6 +226,8 @@ pub mod pallet {
 			/// The new manager account id.
 			new: Option<T::AccountId>,
 		},
+		/// A batch of migrated accounts was processed.
+		AccountsReceived { count_good: u32, count_bad: u32 },
 	}
 
 	#[pallet::call]
@@ -356,7 +375,6 @@ impl From<PortableHoldReason> for HoldReason {
 	}
 }
 
-// TODO(ahm-v2): the helper below has no caller and no test until the accounts stage lands.
 impl<T: Config> Pallet<T> {
 	/// Run `integrate` over every item in its own storage transaction. A failing item is rolled
 	/// back and handed to `park`; the other items are unaffected. Returns `(count_good,

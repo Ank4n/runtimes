@@ -31,6 +31,7 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
+use frame_support::{traits::ConstU32, BoundedVec};
 use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use scale_info::TypeInfo;
 use sp_runtime::{traits::AccountIdConversion, AccountId32};
@@ -58,6 +59,34 @@ pub fn translate_destination(who: &AccountId32) -> AccountId32 {
 		Some(para_id) => sibling_account(para_id.into()),
 		None => who.clone(),
 	}
+}
+
+/// Account balance payload in portable format.
+///
+/// The relay chain withdraws an account into this shape and the receiving chain integrates it
+/// through its regular fungible APIs, so refcounts and events are indistinguishable from locally
+/// created state.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableAccount<AccountId, Balance> {
+	/// The account address. Sent verbatim; no account-id translation happens for regular
+	/// accounts.
+	pub who: AccountId,
+	/// Balance that stays liquid on the receiving chain.
+	pub free: Balance,
+	/// Balance that was not liquid on the relay chain; re-established as holds on the receiving
+	/// chain, one per entry, translated via `From<PortableHoldReason>`.
+	pub holds: BoundedVec<PortableHold<Balance>, ConstU32<5>>,
+}
+
+/// One non-liquid part of a migrated account's balance.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableHold<Balance> {
+	pub reason: PortableHoldReason,
+	pub amount: Balance,
 }
 
 /// Relay Chain reserve, classified for the receiving chain.

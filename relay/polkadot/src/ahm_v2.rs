@@ -22,11 +22,23 @@
 
 use crate::{
 	xcm_config::{CoretimeLocation, XcmRouter},
-	AccountId, BrokerId, Runtime, RuntimeEvent, Timestamp,
+	AccountId, Balance, BrokerId, ProxyType, Runtime, RuntimeEvent, Timestamp,
+	TransparentProxyType,
 };
-use frame_support::traits::Equals;
+use frame_support::{parameter_types, traits::Equals};
 use frame_system::EnsureRoot;
+use migrator_types::PortableProxyType;
 use pallet_xcm::EnsureXcm;
+use polkadot_runtime_constants::currency::{EXISTENTIAL_DEPOSIT, UNITS};
+
+parameter_types! {
+	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
+	pub const CtFreeBuffer: Balance = UNITS;
+	/// Asset Hub's existential deposit; mirrors
+	/// `system_parachains_constants::polkadot::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
+	/// (= relay ED / 10) without pulling that crate into the relay runtime.
+	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
+}
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -35,6 +47,27 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<CoretimeLocation>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
+	type CtFreeBuffer = CtFreeBuffer;
+	type AhExistentialDeposit = AhExistentialDeposit;
+}
+
+/// Which proxy permissions travel to the Coretime chain in the migration. Permissions with no
+/// meaning there (staking, governance, …) return `Err` and their definitions stay on this chain.
+impl TryFrom<TransparentProxyType<ProxyType>> for PortableProxyType {
+	type Error = ();
+
+	fn try_from(t: TransparentProxyType<ProxyType>) -> Result<Self, ()> {
+		match t.0 {
+			ProxyType::Any => Ok(PortableProxyType::Any),
+			ProxyType::NonTransfer => Ok(PortableProxyType::NonTransfer),
+			ProxyType::CancelProxy => Ok(PortableProxyType::CancelProxy),
+			ProxyType::ParaRegistration => Ok(PortableProxyType::ParaRegistration),
+			ProxyType::Governance |
+			ProxyType::Staking |
+			ProxyType::Auction |
+			ProxyType::NominationPools => Err(()),
+		}
+	}
 }
 
 #[cfg(test)]
