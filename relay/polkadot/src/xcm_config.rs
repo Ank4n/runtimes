@@ -17,9 +17,9 @@
 //! XCM configuration for Polkadot.
 
 use super::{
-	parachains_origin, AccountId, AllPalletsWithSystem, Balances, Dmp, FellowshipAdmin,
-	GeneralAdmin, ParaId, Runtime, RuntimeCall, RuntimeEvent, RuntimeOrigin, StakingAdmin,
-	TransactionByteFee, Treasurer, Treasury, WeightToFee, XcmPallet,
+	ahm_v2_started, parachains_origin, AccountId, AllPalletsWithSystem, Balances, Dmp,
+	FellowshipAdmin, GeneralAdmin, ParaId, Runtime, RuntimeCall, RuntimeEvent, RuntimeOrigin,
+	StakingAdmin, TransactionByteFee, Treasurer, Treasury, WeightToFee, XcmPallet,
 };
 use frame_support::{
 	parameter_types,
@@ -166,15 +166,13 @@ pub type TrustedTeleporters = (
 	Case<DotForBulletin>,
 );
 
-/// Teleport trust, withdrawn for good once the AHM v2 migration starts.
+/// [`TrustedTeleporters`] until the AHM v2 migration starts, nothing after.
 ///
-/// This chain's balances drain to Asset Hub and the Coretime chain and must not come back. This
-/// chain keeps no teleport checking account (`NoTeleportTracking`), so an inbound teleport it
-/// accepts mints fresh issuance.
+/// The chain runs `NoTeleportTracking`, so an accepted inbound teleport mints.
 pub struct TrustedTeleportersBeforeMigration;
 impl ContainsPair<Asset, Location> for TrustedTeleportersBeforeMigration {
 	fn contains(asset: &Asset, origin: &Location) -> bool {
-		TrustedTeleporters::contains(asset, origin) && !crate::ahm_v2_started()
+		TrustedTeleporters::contains(asset, origin) && !ahm_v2_started()
 	}
 }
 

@@ -197,13 +197,14 @@ parameter_types! {
 	pub const SS58Prefix: u8 = 0;
 }
 
-/// Whether the AHM v2 migration has started. Constant `false` without the `ahm-v2` feature.
+/// Whether the AHM v2 migration has started. Constant `false` when the migrator is not compiled
+/// in.
 #[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
-pub(crate) fn ahm_v2_started() -> bool {
+fn ahm_v2_started() -> bool {
 	pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started()
 }
 #[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
-pub(crate) fn ahm_v2_started() -> bool {
+fn ahm_v2_started() -> bool {
 	false
 }
 
@@ -215,30 +216,21 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 		match call {
 			// --- AHM v2 ---
 
-			// The ways a signed origin can move value or resize a reserve while the accounts stage
-			// is draining them. A reserve created after that stage has passed its owner is backed
-			// by no pallet record, and an unattributable reserve holds the whole account back on
-			// this chain.
+			// Closed from the first block of the migration. The accounts stage needs a fixed set of
+			// balances, reserves and holds: one taken while it runs can strand its whole account on
+			// this chain. Registrar and HRMP calls start on the Coretime chain instead.
 			Balances(..) | XcmPallet(..) | Multisig(..) | Preimage(..) | OnDemand(..) |
-			Crowdloan(..)
+			Crowdloan(..) | Registrar(..) | Hrmp(..)
 				if ahm_v2_started() =>
 				false,
 
-			// Using a proxy stays open; anything that creates or resizes a proxy or announcement
-			// deposit does not. Named this way round so a call added to `pallet_proxy` is closed
-			// by default rather than open by omission.
+			// Using a proxy stays open. Every other proxy call, including any added later, closes
+			// with the migration.
 			Proxy(
 				pallet_proxy::Call::<Runtime>::proxy { .. } |
 				pallet_proxy::Call::<Runtime>::proxy_announced { .. },
 			) => true,
 			Proxy(..) if ahm_v2_started() => false,
-
-			// The parachain control plane moves to the Coretime chain. Gated on the migration
-			// rather than on the runtime upgrade: the Coretime pallets hold nothing until the
-			// migration hands state over, so closing at the upgrade would leave nobody able to
-			// register a para or open a channel on either chain for as long as governance takes
-			// to schedule the start.
-			Registrar(..) | Hrmp(..) if ahm_v2_started() => false,
 
 			Scheduler(..) |
 			Indices(..) |
