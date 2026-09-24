@@ -17,10 +17,11 @@
 //! Test runtime for `pallet-rc2-migrator`.
 
 use crate as pallet_rc2_migrator;
+use crate::{MigratedBalances, RcMigratedBalance};
 use codec::Decode;
 use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
-	traits::{OnInitialize, Time},
+	traits::{Currency, OnInitialize, Time},
 };
 use frame_system::EnsureSignedBy;
 use sp_runtime::{traits::IdentityLookup, AccountId32, BuildStorage};
@@ -45,10 +46,18 @@ impl frame_system::Config for Test {
 	type AccountData = pallet_balances::AccountData<u128>;
 }
 
+/// The relay chain's existential deposit.
+pub const ED: u128 = 10;
+
+parameter_types! {
+	pub const ExistentialDeposit: u128 = ED;
+}
+
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
 	type Balance = u128;
 	type AccountStore = System;
+	type ExistentialDeposit = ExistentialDeposit;
 }
 
 /// The account the mock treats as the Coretime chain's dispatch origin.
@@ -120,6 +129,11 @@ ord_parameter_types! {
 	pub const AdminAccount: AccountId = ADMIN;
 }
 
+parameter_types! {
+	pub static SweepAccounts: Vec<AccountId> = vec![pot()];
+	pub SweepBeneficiary: AccountId = acc(200);
+}
+
 impl pallet_rc2_migrator::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = RecordingRouter;
@@ -127,6 +141,8 @@ impl pallet_rc2_migrator::Config for Test {
 	type TimeProvider = MockTime;
 	type CtOrigin = EnsureSignedBy<CoretimeAccount, AccountId>;
 	type AdminOrigin = EnsureSignedBy<AdminAccount, AccountId>;
+	type SweepAccounts = SweepAccounts;
+	type SweepBeneficiary = SweepBeneficiary;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
@@ -174,4 +190,66 @@ pub fn sent_call(n: usize) -> crate::CtRuntimeCall {
 		}
 	}
 	panic!("message {n} carried no Transact");
+}
+
+pub fn acc(n: u8) -> AccountId {
+	AccountId32::new([n; 32])
+}
+
+/// A pallet (module) account: the kind the migration leaves for the sweep stage.
+pub fn pot() -> AccountId {
+	let mut bytes = [0u8; 32];
+	bytes[..12].copy_from_slice(b"modlpy/trsry");
+	AccountId32::new(bytes)
+}
+
+pub fn fund(who: &AccountId, amount: u128) {
+	let _ = <Balances as Currency<AccountId>>::make_free_balance_be(who, amount);
+}
+
+pub fn free(who: &AccountId) -> u128 {
+	pallet_balances::Pallet::<Test>::free_balance(who)
+}
+
+pub fn total_issuance() -> u128 {
+	pallet_balances::TotalIssuance::<Test>::get()
+}
+
+pub fn exists(who: &AccountId) -> bool {
+	frame_system::Account::<Test>::contains_key(who)
+}
+
+/// Seed the conservation ledger the way the accounts stage does before anything moves.
+pub fn seed_ledger() {
+	RcMigratedBalance::<Test>::put(MigratedBalances {
+		kept: total_issuance(),
+		..Default::default()
+	});
+}
+
+/// All `pallet-rc2-migrator` events since the last call to this function.
+pub fn migrator_events() -> Vec<crate::Event<Test>> {
+	let events = System::events()
+		.into_iter()
+		.filter_map(|r| match r.event {
+			RuntimeEvent::Rc2Migrator(e) => Some(e),
+			_ => None,
+		})
+		.collect();
+	System::reset_events();
+	events
+}
+
+/// Create the below-ED / broken-refcount account shapes that exist on chain but cannot be
+/// produced through the balances API (it refuses sub-ED accounts).
+pub fn force_anomalous_account(who: &AccountId, free: u128, reserved: u128, consumers: u32) {
+	let _ = frame_system::Pallet::<Test>::inc_providers(who);
+	frame_system::Account::<Test>::mutate(who, |a| {
+		a.data.free = free;
+		a.data.reserved = reserved;
+	});
+	for _ in 0..consumers {
+		frame_system::Pallet::<Test>::inc_consumers(who).unwrap();
+	}
+	pallet_balances::TotalIssuance::<Test>::mutate(|ti| *ti += free + reserved);
 }
