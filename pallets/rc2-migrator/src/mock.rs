@@ -17,13 +17,18 @@
 //! Test runtime for `pallet-rc2-migrator`.
 
 use crate as pallet_rc2_migrator;
+use crate::{multisig::ManagerMultisigVote, ManagerMultisigRound, ManagerMultisigs};
 use codec::Decode;
 use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
 	traits::{OnInitialize, Time},
 };
 use frame_system::EnsureSignedBy;
-use sp_runtime::{traits::IdentityLookup, AccountId32, BuildStorage};
+use sp_core::{sr25519, Pair};
+use sp_runtime::{
+	traits::{IdentifyAccount, IdentityLookup},
+	AccountId32, BuildStorage, MultiSignature, MultiSigner,
+};
 use xcm::prelude::*;
 
 type Block = frame_system::mocking::MockBlock<Test>;
@@ -120,6 +125,14 @@ ord_parameter_types! {
 	pub const AdminAccount: AccountId = ADMIN;
 }
 
+parameter_types! {
+	/// Members of the manager multisig; set per test.
+	pub static MultisigMembers: Vec<AccountId> = vec![];
+	pub const MultisigThreshold: u32 = 2;
+	pub const MultisigMaxVotesPerRound: u32 = 3;
+	pub const MultisigStartRound: u32 = 7;
+}
+
 impl pallet_rc2_migrator::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = RecordingRouter;
@@ -127,6 +140,11 @@ impl pallet_rc2_migrator::Config for Test {
 	type TimeProvider = MockTime;
 	type CtOrigin = EnsureSignedBy<CoretimeAccount, AccountId>;
 	type AdminOrigin = EnsureSignedBy<AdminAccount, AccountId>;
+	type RuntimeCall = RuntimeCall;
+	type MultisigMembers = MultisigMembers;
+	type MultisigThreshold = MultisigThreshold;
+	type MultisigMaxVotesPerRound = MultisigMaxVotesPerRound;
+	type MultisigStartRound = MultisigStartRound;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
@@ -174,4 +192,63 @@ pub fn sent_call(n: usize) -> crate::CtRuntimeCall {
 		}
 	}
 	panic!("message {n} carried no Transact");
+}
+
+/// A multisig member: its signing key and its account id.
+pub fn member(n: u8) -> (sr25519::Pair, AccountId) {
+	let pair = sr25519::Pair::from_seed(&[n; 32]);
+	let who = MultiSigner::Sr25519(pair.public()).into_account();
+	(pair, who)
+}
+
+/// One member's signed vote for `call` in the current round, ready to submit.
+pub fn vote(
+	pair: &sr25519::Pair,
+	call: RuntimeCall,
+) -> (ManagerMultisigVote<Test>, MultiSignature) {
+	vote_in_round(pair, call, ManagerMultisigRound::<Test>::get())
+}
+
+pub fn vote_in_round(
+	pair: &sr25519::Pair,
+	call: RuntimeCall,
+	round: u32,
+) -> (ManagerMultisigVote<Test>, MultiSignature) {
+	let payload =
+		ManagerMultisigVote::<Test>::new(MultiSigner::Sr25519(pair.public()), call, round);
+	let sig = MultiSignature::Sr25519(pair.sign(&payload.encode_with_bytes_wrapper()));
+	(payload, sig)
+}
+
+/// A call any signed origin may dispatch, distinguishable by its bytes.
+pub fn remark(n: u8) -> RuntimeCall {
+	RuntimeCall::System(frame_system::Call::<Test>::remark_with_event { remark: vec![n] })
+}
+
+pub fn votes_for(call: &RuntimeCall) -> Vec<AccountId> {
+	ManagerMultisigs::<Test>::get(call)
+}
+
+/// All `pallet-rc2-migrator` events since the last call to this function.
+pub fn migrator_events() -> Vec<crate::Event<Test>> {
+	let events = System::events()
+		.into_iter()
+		.filter_map(|r| match r.event {
+			RuntimeEvent::Rc2Migrator(e) => Some(e),
+			_ => None,
+		})
+		.collect();
+	System::reset_events();
+	events
+}
+
+/// Who `System::remark_with_event` recorded as the sender, for every remark so far.
+pub fn remark_senders() -> Vec<AccountId> {
+	System::events()
+		.into_iter()
+		.filter_map(|r| match r.event {
+			RuntimeEvent::System(frame_system::Event::Remarked { sender, .. }) => Some(sender),
+			_ => None,
+		})
+		.collect()
 }

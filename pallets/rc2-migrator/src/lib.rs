@@ -38,17 +38,20 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod multisig;
+
 pub use pallet::*;
 
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use frame_support::{
+	dispatch::GetDispatchInfo,
 	pallet_prelude::*,
 	sp_runtime::traits::Saturating,
 	traits::{EnsureOrigin, Time},
 };
 use frame_system::pallet_prelude::*;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
-use sp_runtime::AccountId32;
+use sp_runtime::{traits::Dispatchable, AccountId32};
 use xcm::prelude::*;
 
 const LOG_TARGET: &str = "runtime::rc2-migrator";
@@ -248,6 +251,23 @@ pub mod pallet {
 
 		/// The origin that can perform permissioned operations like setting the migration stage.
 		type AdminOrigin: EnsureOrigin<<Self as frame_system::Config>::RuntimeOrigin>;
+
+		/// Calls the manager multisig may dispatch once it reaches its threshold.
+		type RuntimeCall: Parameter
+			+ Dispatchable<RuntimeOrigin = <Self as frame_system::Config>::RuntimeOrigin>
+			+ GetDispatchInfo;
+
+		/// Members of a multisig that can submit unsigned txs and act as the manager.
+		type MultisigMembers: Get<Vec<AccountId32>>;
+
+		/// Threshold of `MultisigMembers`.
+		type MultisigThreshold: Get<u32>;
+
+		/// Limit the number of votes of each participant per round.
+		type MultisigMaxVotesPerRound: Get<u32>;
+
+		/// Round the vote counter starts at. Must differ per network.
+		type MultisigStartRound: Get<u32>;
 	}
 
 	#[pallet::pallet]
@@ -261,6 +281,21 @@ pub mod pallet {
 	/// Balance kept on the Relay Chain versus migrated away. Set up by the accounts stage.
 	#[pallet::storage]
 	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances, ValueQuery>;
+
+	/// The multisig members that voted to execute a specific call.
+	#[pallet::storage]
+	#[pallet::unbounded]
+	pub type ManagerMultisigs<T: Config> =
+		StorageMap<_, Twox64Concat, <T as Config>::RuntimeCall, Vec<AccountId32>, ValueQuery>;
+
+	/// The current round of the multisig voting. Votes are only valid for the current round.
+	#[pallet::storage]
+	pub type ManagerMultisigRound<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+	/// How often each member voted in the current round. Cleared at the end of each round.
+	#[pallet::storage]
+	pub type ManagerVotesInCurrentRound<T: Config> =
+		StorageMap<_, Blake2_128Concat, AccountId32, u32, ValueQuery>;
 
 	/// The duration of the pre migration warm-up period.
 	///
@@ -347,6 +382,10 @@ pub mod pallet {
 			/// The stage from which the migration continues.
 			stage: MigrationStageOf<T>,
 		},
+		/// The manager multisig dispatched a call.
+		ManagerMultisigDispatched { res: DispatchResult },
+		/// The manager multisig received a vote.
+		ManagerMultisigVoted { votes: u32 },
 	}
 
 	#[pallet::hooks]
