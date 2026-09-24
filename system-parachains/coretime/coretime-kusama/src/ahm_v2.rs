@@ -20,8 +20,12 @@
 //! Compiled only with the `ahm-v2` feature, which released runtimes do not enable. The
 //! integration tests turn it on to drive the real runtime.
 
-use crate::{xcm_config::XcmRouter, AccountId, Balances, Runtime, RuntimeEvent, RuntimeHoldReason};
+use crate::{
+	xcm_config::XcmRouter, AccountId, Balances, ProxyType, Runtime, RuntimeEvent, RuntimeHoldReason,
+};
+use frame_support::traits::ConstU32;
 use frame_system::EnsureRoot;
+use migrator_types::PortableProxyType;
 
 impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -29,6 +33,21 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
+	// Relay blocks are 6s, this chain's are 12s: migrated proxy delays halve.
+	type RcBlockTimeRatio = ConstU32<2>;
+}
+
+/// What each migrated relay-chain proxy permission becomes locally. Total by construction: the
+/// relay side only sends permissions this chain represents.
+impl From<PortableProxyType> for ProxyType {
+	fn from(portable: PortableProxyType) -> Self {
+		match portable {
+			PortableProxyType::Any => ProxyType::Any,
+			PortableProxyType::NonTransfer => ProxyType::NonTransfer,
+			PortableProxyType::CancelProxy => ProxyType::CancelProxy,
+			PortableProxyType::ParaRegistration => ProxyType::ParaRegistration,
+		}
+	}
 }
 
 #[cfg(test)]

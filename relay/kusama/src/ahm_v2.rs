@@ -22,10 +22,11 @@
 
 use crate::{
 	xcm_config::{Broker, XcmRouter},
-	AccountId, BrokerId, Runtime, RuntimeEvent, Timestamp,
+	AccountId, BrokerId, ProxyType, Runtime, RuntimeEvent, Timestamp, TransparentProxyType,
 };
 use frame_support::traits::Equals;
 use frame_system::EnsureRoot;
+use migrator_types::PortableProxyType;
 use pallet_xcm::EnsureXcm;
 
 impl pallet_rc2_migrator::Config for Runtime {
@@ -35,6 +36,29 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<Broker>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
+}
+
+/// Which proxy permissions travel to the Coretime chain in the migration. The portable set is
+/// the same on both networks: it is a property of what the destination can represent, not of the
+/// source. Kusama's extra variants (`Society`, `Spokesperson`) return `Err` like `Governance` and
+/// `Staking`, and their definitions stay on this chain.
+impl TryFrom<TransparentProxyType> for PortableProxyType {
+	type Error = ();
+
+	fn try_from(t: TransparentProxyType) -> Result<Self, ()> {
+		match t.0 {
+			ProxyType::Any => Ok(PortableProxyType::Any),
+			ProxyType::NonTransfer => Ok(PortableProxyType::NonTransfer),
+			ProxyType::CancelProxy => Ok(PortableProxyType::CancelProxy),
+			ProxyType::ParaRegistration => Ok(PortableProxyType::ParaRegistration),
+			ProxyType::Governance |
+			ProxyType::Staking |
+			ProxyType::Auction |
+			ProxyType::Society |
+			ProxyType::Spokesperson |
+			ProxyType::NominationPools => Err(()),
+		}
+	}
 }
 
 #[cfg(test)]

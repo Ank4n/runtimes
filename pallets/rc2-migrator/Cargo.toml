@@ -13,12 +13,15 @@ log = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 frame-support = { workspace = true }
 frame-system = { workspace = true }
+migrator-types = { workspace = true }
 pallet-balances = { workspace = true }
+pallet-proxy = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
 sp-runtime = { workspace = true }
 xcm = { workspace = true }
 
 [dev-dependencies]
+sp-core = { workspace = true, default-features = true }
 sp-io = { workspace = true, default-features = true }
 sp-runtime = { workspace = true, default-features = true }
 
@@ -29,7 +32,9 @@ std = [
 	"frame-support/std",
 	"frame-system/std",
 	"log/std",
+	"migrator-types/std",
 	"pallet-balances/std",
+	"pallet-proxy/std",
 	"polkadot-parachain-primitives/std",
 	"scale-info/std",
 	"sp-runtime/std",
@@ -39,6 +44,7 @@ runtime-benchmarks = [
 	"frame-support/runtime-benchmarks",
 	"frame-system/runtime-benchmarks",
 	"pallet-balances/runtime-benchmarks",
+	"pallet-proxy/runtime-benchmarks",
 	"polkadot-parachain-primitives/runtime-benchmarks",
 	"sp-runtime/runtime-benchmarks",
 	"xcm/runtime-benchmarks",
@@ -47,5 +53,6 @@ try-runtime = [
 	"frame-support/try-runtime",
 	"frame-system/try-runtime",
 	"pallet-balances/try-runtime",
+	"pallet-proxy/try-runtime",
 	"sp-runtime/try-runtime",
 ]
