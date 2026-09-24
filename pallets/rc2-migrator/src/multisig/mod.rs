@@ -22,45 +22,35 @@
 //! prepend to `signRaw`. The round advances on every dispatch, so an old round's signatures
 //! cannot be replayed; each network starts its counter at `Config::MultisigStartRound`, so two
 //! chains at the same round do not accept each other's votes. Each member has
-//! `Config::MultisigMaxVotesPerRound` votes per round, which bounds what the unsigned path lets
-//! one member put into blocks.
+//! `Config::MultisigMaxVotesPerRound` votes per round and one vote in the pool at a time, which
+//! bounds what the unsigned path lets one member put into blocks.
 //!
-//! The `vote_manager_multisig` call, its `ValidateUnsigned` and accepting the multisig's account
-//! wherever the manager is accepted are the stage machine's; [`ManagerMultisig::vote`] and
-//! [`ManagerMultisig::validate_unsigned`] are what they invoke, and
-//! [`ManagerMultisig::init_round`] runs from `on_runtime_upgrade`.
+//! The `vote_manager_multisig` call, its `ValidateUnsigned`, a call that ends a stuck round, and
+//! accepting the multisig's account wherever the manager is accepted all live in `lib.rs`
+//! (TODO). [`ManagerMultisig::vote`], [`ManagerMultisig::validate_unsigned`] and
+//! [`ManagerMultisig::end_round`] are what they invoke.
 
 #[cfg(test)]
 mod tests;
 
 use crate::{
-	Config, Event, ManagerMultisigRound, ManagerMultisigs, ManagerVotesInCurrentRound, Pallet,
+	Config, Error, Event, ManagerMultisigRound, ManagerMultisigs, ManagerVotesInCurrentRound,
+	Pallet,
 };
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 use codec::{Decode, DecodeWithMemTracking, Encode};
 use core::marker::PhantomData;
 use frame_support::{
-	traits::Get, CloneNoBound, DebugNoBound, EqNoBound, PalletId, PartialEqNoBound,
+	ensure, traits::Get, CloneNoBound, DebugNoBound, EqNoBound, PalletId, PartialEqNoBound,
 };
 use scale_info::TypeInfo;
 use sp_runtime::{
-	traits::{AccountIdConversion, Bounded, Dispatchable, IdentifyAccount, Verify},
-	transaction_validity::{InvalidTransaction, TransactionValidity, ValidTransaction},
-	MultiSignature, MultiSigner,
+	traits::{AccountIdConversion, Dispatchable, Hash, IdentifyAccount, Verify},
+	transaction_validity::{
+		InvalidTransaction, TransactionPriority, TransactionValidity, ValidTransaction,
+	},
+	AccountId32, DispatchResult, MultiSignature, MultiSigner,
 };
-
-/// Why a vote was refused. The caller maps it to its own error.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-	/// The unsigned multisig vote did not validate.
-	UnsignedValidationFailed,
-	/// The vote carries a round that is no longer open.
-	RoundStale,
-	/// The member has used up its votes for this round.
-	MaxVotesPerRound,
-	/// The member has already voted for this call in this round.
-	DuplicateVote,
-}
 
 /// One member's vote for `call`, signed offline and submitted by anyone.
 #[derive(
@@ -76,18 +66,23 @@ pub enum Error {
 #[scale_info(skip_type_params(T))]
 pub struct ManagerMultisigVote<T: Config> {
 	pub who: MultiSigner,
-	pub call: <T as Config>::RuntimeCall,
+	pub call: <T as frame_system::Config>::RuntimeCall,
 	pub round: u32,
 }
 
 impl<T: Config> ManagerMultisigVote<T> {
-	pub fn new(who: MultiSigner, call: <T as Config>::RuntimeCall, round: u32) -> Self {
-		Self { who, call, round }
-	}
-
 	/// The bytes a member signs. The wrapper is what wallet `signRaw` prepends.
 	pub fn encode_with_bytes_wrapper(&self) -> Vec<u8> {
 		(b"<Bytes>", self, b"</Bytes>").encode()
+	}
+}
+
+/// How the pool reports a vote that [`ManagerMultisig::vote`] would refuse with `e`.
+pub(crate) fn invalid<T: Config>(e: &Error<T>) -> InvalidTransaction {
+	match e {
+		Error::NotMultisigMember => InvalidTransaction::BadSigner,
+		Error::BadMultisigSignature => InvalidTransaction::BadProof,
+		_ => InvalidTransaction::Stale,
 	}
 }
 
@@ -100,92 +95,101 @@ impl<T: Config> ManagerMultisig<T> {
 		PalletId(*b"rc2migmt").into_account_truncating()
 	}
 
-	/// Seed this network's round counter. Idempotent; runs from `on_runtime_upgrade`.
-	///
-	/// A vote is signed over (who, call, round) and nothing else, so two chains sitting at the
-	/// same round would accept each other's signatures. Each network starts its counter
-	/// somewhere different.
-	// TODO(ahm-v2): called from `on_runtime_upgrade`.
-	pub fn init_round() {
-		if !ManagerMultisigRound::<T>::exists() {
-			ManagerMultisigRound::<T>::put(T::MultisigStartRound::get());
-		}
-	}
-
 	/// Vote on behalf of any of the members in `MultisigMembers`.
 	///
-	/// Each vote adds the member to `ManagerMultisigs` under `payload.call`. Once
+	/// Each vote adds the member to `ManagerMultisigs` under the call's hash. Once
 	/// [`Config::MultisigThreshold`] members have voted for the same call it is dispatched as the
-	/// multisig's account, the map is cleared and the round advances, which is what stops an old
-	/// round's signatures from being replayed.
-	// TODO(ahm-v2): `vote_manager_multisig` (call index 7) does `ensure_none` and then this;
-	// the pallet `Error` maps this module's `Error` one to one.
-	pub fn vote(payload: &ManagerMultisigVote<T>, sig: &MultiSignature) -> Result<(), Error> {
-		Self::validate_unsigned(payload, sig).map_err(|_| Error::UnsignedValidationFailed)?;
-		let who = payload.who.clone().into_account();
+	/// multisig's account and the round ends.
+	// TODO(ahm-v2): `vote_manager_multisig` (call index 7) does `ensure_none` and then this.
+	pub fn vote(payload: &ManagerMultisigVote<T>, sig: &MultiSignature) -> DispatchResult {
+		let call_hash = T::Hashing::hash_of(&payload.call);
+		let who = Self::check(payload, sig, &call_hash)?;
+		let mut votes_for_call = ManagerMultisigs::<T>::get(call_hash);
+		votes_for_call.push(who.clone());
+		let votes = votes_for_call.len() as u32;
+		Pallet::<T>::deposit_event(Event::ManagerMultisigVoted {
+			who: who.clone(),
+			call_hash,
+			votes,
+		});
 
-		if ManagerMultisigRound::<T>::get() != payload.round {
-			return Err(Error::RoundStale);
+		if votes < T::MultisigThreshold::get() {
+			ManagerVotesInCurrentRound::<T>::mutate(&who, |n| *n = n.saturating_add(1));
+			ManagerMultisigs::<T>::insert(call_hash, votes_for_call);
+			return Ok(());
 		}
-		let num_votes = ManagerVotesInCurrentRound::<T>::get(&who);
-		if num_votes >= T::MultisigMaxVotesPerRound::get() {
-			return Err(Error::MaxVotesPerRound);
-		}
-		ManagerVotesInCurrentRound::<T>::insert(&who, num_votes.saturating_add(1));
 
-		let mut votes_for_call = ManagerMultisigs::<T>::get(&payload.call);
-		if votes_for_call.contains(&who) {
-			return Err(Error::DuplicateVote);
-		}
-		votes_for_call.push(who);
-
-		if votes_for_call.len() >= T::MultisigThreshold::get() as usize {
-			let origin: <T as frame_system::Config>::RuntimeOrigin =
-				frame_system::RawOrigin::Signed(Self::manager_multisig_id()).into();
-			let res = payload.call.clone().dispatch(origin);
-			let _ = ManagerMultisigs::<T>::clear(u32::MAX, None);
-			let _ = ManagerVotesInCurrentRound::<T>::clear(u32::MAX, None);
-			ManagerMultisigRound::<T>::mutate(|round| *round = round.saturating_add(1));
-
-			Pallet::<T>::deposit_event(Event::ManagerMultisigDispatched {
-				res: res.map(|_| ()).map_err(|e| e.error),
-			});
-		} else {
-			Pallet::<T>::deposit_event(Event::ManagerMultisigVoted {
-				votes: votes_for_call.len() as u32,
-			});
-			ManagerMultisigs::<T>::insert(payload.call.clone(), votes_for_call);
-		}
+		// Dispatched like any signed call, so it goes through the origin's call filter: the
+		// lockdown has to leave this pallet's calls open.
+		let res = payload
+			.call
+			.clone()
+			.dispatch(frame_system::RawOrigin::Signed(Self::manager_multisig_id()).into());
+		Pallet::<T>::deposit_event(Event::ManagerMultisigDispatched {
+			call_hash,
+			res: res.map(|_| ()).map_err(|e| e.error),
+		});
+		Self::end_round();
 		Ok(())
 	}
 
-	/// Whether an unsigned vote may enter the pool: a member's own signature over the payload,
-	/// for the current round, with votes left this round.
+	/// End the current round: forget every vote and advance the counter, so nothing signed for
+	/// it can be replayed. Runs after a threshold dispatch, and by hand for a round that can no
+	/// longer reach the threshold because too few members have votes left.
+	// TODO(ahm-v2): `end_manager_multisig_round` lets the admin or the manager call this, so
+	// the manager can unstick a round without a referendum.
+	pub fn end_round() {
+		let _ = ManagerMultisigs::<T>::clear(u32::MAX, None);
+		let _ = ManagerVotesInCurrentRound::<T>::clear(u32::MAX, None);
+		let round = ManagerMultisigRound::<T>::mutate(|round| {
+			let ended = *round;
+			*round = round.saturating_add(1);
+			ended
+		});
+		Pallet::<T>::deposit_event(Event::ManagerMultisigRoundEnded { round });
+	}
+
+	/// Whether an unsigned vote may enter the pool: what [`Self::check`] accepts, tagged so the
+	/// pool holds one pending vote per member, at the highest priority.
 	// TODO(ahm-v2): the `#[pallet::validate_unsigned]` impl delegates `vote_manager_multisig` here.
 	pub fn validate_unsigned(
 		payload: &ManagerMultisigVote<T>,
 		sig: &MultiSignature,
 	) -> TransactionValidity {
-		let account = payload.who.clone().into_account();
-
-		if !T::MultisigMembers::get().contains(&account) {
-			return InvalidTransaction::BadSigner.into();
-		}
-		if !sig.verify(&payload.encode_with_bytes_wrapper()[..], &account) {
-			return InvalidTransaction::BadProof.into();
-		}
-		if ManagerMultisigRound::<T>::get() != payload.round {
-			return InvalidTransaction::Stale.into();
-		}
-		if ManagerVotesInCurrentRound::<T>::get(&account) >= T::MultisigMaxVotesPerRound::get() {
-			return InvalidTransaction::Stale.into();
-		}
+		let call_hash = T::Hashing::hash_of(&payload.call);
+		let account = Self::check(payload, sig, &call_hash).map_err(|e| invalid(&e))?;
 
 		ValidTransaction::with_tag_prefix("Ahm2Multisig")
-			.priority(Bounded::max_value())
-			.and_provides(vec![("ahm2_multi", account).encode()])
+			.priority(TransactionPriority::MAX)
+			.and_provides(account)
 			.propagate(true)
 			.longevity(30)
 			.build()
+	}
+
+	/// What makes a vote valid, for the pool and for dispatch alike: a member's own signature
+	/// over the wrapped payload, for the current round, with a vote left this round and none
+	/// yet for this call. Returns the member.
+	fn check(
+		payload: &ManagerMultisigVote<T>,
+		sig: &MultiSignature,
+		call_hash: &T::Hash,
+	) -> Result<AccountId32, Error<T>> {
+		let who = payload.who.clone().into_account();
+		ensure!(T::MultisigMembers::get().contains(&who), Error::<T>::NotMultisigMember);
+		ensure!(
+			sig.verify(&payload.encode_with_bytes_wrapper()[..], &who),
+			Error::<T>::BadMultisigSignature
+		);
+		ensure!(ManagerMultisigRound::<T>::get() == payload.round, Error::<T>::MultisigRoundStale);
+		ensure!(
+			ManagerVotesInCurrentRound::<T>::get(&who) < T::MultisigMaxVotesPerRound::get(),
+			Error::<T>::MultisigMaxVotesPerRound
+		);
+		ensure!(
+			!ManagerMultisigs::<T>::get(call_hash).contains(&who),
+			Error::<T>::MultisigDuplicateVote
+		);
+		Ok(who)
 	}
 }

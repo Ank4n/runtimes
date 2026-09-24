@@ -22,24 +22,21 @@
 
 use crate::{
 	xcm_config::{CoretimeLocation, XcmRouter},
-	AccountId, BrokerId, Runtime, RuntimeCall, RuntimeEvent, Timestamp,
+	AccountId, BrokerId, Runtime, RuntimeEvent, Timestamp,
 };
 use alloc::vec::Vec;
-use frame_support::{parameter_types, traits::Equals};
+use frame_support::{
+	parameter_types,
+	traits::{ConstU32, Equals},
+};
 use frame_system::EnsureRoot;
 use pallet_xcm::EnsureXcm;
 
 parameter_types! {
-	/// The accounts that may drive the migration collectively. Governance seeds the real set
-	/// before a migration is scheduled; empty means only root and the appointed manager can act.
+	/// The accounts that may drive the migration collectively. A constant, so the real set goes
+	/// in with a runtime upgrade before a migration is scheduled. While it is empty only root
+	/// and the appointed manager can act.
 	pub MigrationMultisigMembers: Vec<AccountId> = Vec::new();
-	/// Votes needed from distinct members.
-	pub const MigrationMultisigThreshold: u32 = 3;
-	/// Votes one member may cast per round.
-	pub const MigrationMultisigMaxVotesPerRound: u32 = 5;
-	/// A vote is signed over (who, call, round) and nothing else, so two networks sitting at the
-	/// same round would accept each other's signatures. This is what keeps them apart.
-	pub const MigrationMultisigStartRound: u32 = 100;
 }
 
 impl pallet_rc2_migrator::Config for Runtime {
@@ -49,11 +46,12 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<CoretimeLocation>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
-	type RuntimeCall = RuntimeCall;
 	type MultisigMembers = MigrationMultisigMembers;
-	type MultisigThreshold = MigrationMultisigThreshold;
-	type MultisigMaxVotesPerRound = MigrationMultisigMaxVotesPerRound;
-	type MultisigStartRound = MigrationMultisigStartRound;
+	type MultisigThreshold = ConstU32<3>;
+	type MultisigMaxVotesPerRound = ConstU32<5>;
+	// Polkadot and Kusama start a million rounds apart, more dispatches than either migration
+	// will make; see `Config::MultisigStartRound`.
+	type MultisigStartRound = ConstU32<1_000_000>;
 }
 
 #[cfg(test)]
