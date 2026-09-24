@@ -86,7 +86,7 @@ fn sub_ed_free_survives_the_deposit_resize() {
 }
 
 #[test]
-fn delay_conversion_rounds_down() {
+fn delay_conversion_rounds_up() {
 	new_test_ext().execute_with(|| {
 		let delegator = acc(10);
 		let d1 = acc(11);
@@ -97,44 +97,41 @@ fn delay_conversion_rounds_down() {
 			vec![(d1, PortableProxyType::Any, 3), (d2, PortableProxyType::Any, 1)],
 		)]);
 
-		// 3 / 2 = 1, and 1 / 2 = 0: a 1-block delay disappears entirely. Pinned so a change of
-		// rounding policy shows up as a test change, not silently.
-		assert_eq!(entry(&delegator).0, vec![(d1, ProxyType::Any, 1), (d2, ProxyType::Any, 0)]);
+		// ceil(3 / 2) = 2 and ceil(1 / 2) = 1: a delayed proxy stays delayed, so the
+		// announcement requirement is never lost in the conversion.
+		assert_eq!(entry(&delegator).0, vec![(d1, ProxyType::Any, 2), (d2, ProxyType::Any, 1)]);
 	});
 }
 
 #[test]
-fn receive_merges_with_existing_local_defs_and_dedups() {
+fn receive_merges_with_existing_local_defs_sorted_and_dedups() {
 	new_test_ext().execute_with(|| {
 		let dan = acc(10); // delegator with a pre-existing local proxy
-		let local = acc(11); // local delegate, added before the migration reaches this chain
-		let migrated = acc(12); // delegate arriving from the relay chain
+		let local = acc(12); // local delegate, added before the migration reaches this chain
+		let migrated = acc(11); // delegate arriving from the relay chain; sorts before `local`
 
 		// GIVEN a local entry priced at local rates.
 		<Balances as Mutate<AccountId>>::mint_into(&dan, 1_000).unwrap();
-		assert_ok!(Proxy::add_proxy(
-			RuntimeOrigin::signed(dan),
-			local,
-			ProxyType::Any,
-			0
-		));
+		assert_ok!(Proxy::add_proxy(RuntimeOrigin::signed(dan), local, ProxyType::Any, 0));
 		assert_eq!(reserved(&dan), proxy_deposit(1));
 
 		// WHEN a migrated set arrives containing a new delegate AND a duplicate of the local one.
 		Receiver::receive(vec![portable_proxy(
 			&dan,
-			vec![
-				(migrated, PortableProxyType::Any, 0),
-				(local, PortableProxyType::Any, 0),
-			],
+			vec![(migrated, PortableProxyType::Any, 0), (local, PortableProxyType::Any, 0)],
 		)]);
 
-		// THEN the duplicate is not re-added and the deposit tops up to the 2-def requirement.
+		// THEN the duplicate is not re-added, the merged vec is sorted the way the pallet keeps
+		// it, and the deposit tops up to the 2-def requirement.
 		assert_eq!(
 			entry(&dan),
-			(vec![(local, ProxyType::Any, 0), (migrated, ProxyType::Any, 0)], proxy_deposit(2))
+			(vec![(migrated, ProxyType::Any, 0), (local, ProxyType::Any, 0)], proxy_deposit(2))
 		);
 		assert_eq!(reserved(&dan), proxy_deposit(2));
+
+		// AND the pallet's own binary search still finds the local definition.
+		assert_ok!(Proxy::remove_proxy(RuntimeOrigin::signed(dan), local, ProxyType::Any, 0));
+		assert_eq!(entry(&dan), (vec![(migrated, ProxyType::Any, 0)], proxy_deposit(1)));
 	});
 }
 
@@ -163,12 +160,7 @@ fn overflowing_merged_set_is_parked_and_rolled_back() {
 		// GIVEN a full local entry and a migrated deposit waiting to be resized.
 		<Balances as Mutate<AccountId>>::mint_into(&max, 10_000).unwrap();
 		for i in 41..45u8 {
-			assert_ok!(Proxy::add_proxy(
-				RuntimeOrigin::signed(max),
-				acc(i),
-				ProxyType::Any,
-				0
-			));
+			assert_ok!(Proxy::add_proxy(RuntimeOrigin::signed(max), acc(i), ProxyType::Any, 0));
 		}
 		give_proxy_deposit(&max, 400, 0);
 		let before = entry(&max);

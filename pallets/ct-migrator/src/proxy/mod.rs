@@ -15,16 +15,13 @@
 
 //! Proxy stage, receiving side: recreates the proxy delegations the relay chain sent.
 //!
-//! Delegations are written into the real proxy pallet, merged with any the delegator already has
-//! here. The migrated relay-chain deposit (a `ProxyDeposit` hold placed by the accounts stage) is
-//! released whole and the entry re-reserved at this chain's rates; the difference stays free in
-//! the delegator's hands. Delays arrive in relay-chain blocks and are converted with
-//! `Config::RcBlockTimeRatio`. A bad set is rolled back and parked in `FailedProxies` without
-//! failing the batch: the migration cannot stop mid-run to deal with it, and the parked entry is
-//! what makes it recoverable afterwards.
-//!
-//! The call that carries a batch over XCM is the stage machine's; [`ProxyReceiver::receive`] is
-//! what it invokes.
+//! Delegations are written into the proxy pallet, merged with any the delegator already has here,
+//! whether or not the delegator has an account here. The migrated `ProxyDeposit` hold is released
+//! and the entry re-reserved at this chain's rates. An entry whose deposit cannot be reserved is
+//! kept under-backed: it can be removed whole, but removing one definition at a time needs the
+//! missing deposit first. Delays are converted from relay-chain blocks with
+//! `Config::RcBlocksPerLocalBlock`, rounding up. A set that cannot be written is rolled back and
+//! parked in `FailedProxies`.
 
 #[cfg(test)]
 mod tests;
@@ -64,7 +61,7 @@ impl<T: Config> ProxyReceiver<T> {
 	///
 	/// Every set is processed in a transaction of its own: one that fails is rolled back and
 	/// parked in `FailedProxies`, the rest of the batch continues.
-	// TODO(ahm-v2): `receive_proxies` (call index 6, root) invokes this.
+	// TODO(ahm-v2): the root call that receives a batch invokes this.
 	pub fn receive(proxies: Vec<PortableProxyOf<T>>) {
 		let (count_good, count_bad) = Pallet::<T>::receive_batch(
 			proxies,
@@ -76,7 +73,7 @@ impl<T: Config> ProxyReceiver<T> {
 					"Failed to integrate proxies of {:?}: {e:?}; parking them",
 					proxy.delegator,
 				);
-				FailedProxies::<T>::insert(proxy.delegator.clone(), proxy);
+				FailedProxies::<T>::insert(&proxy.delegator, &proxy);
 			},
 		);
 		Pallet::<T>::deposit_event(Event::ProxiesReceived { count_good, count_bad });
@@ -84,40 +81,35 @@ impl<T: Config> ProxyReceiver<T> {
 
 	/// Receive a single proxy set and write it to storage.
 	fn do_receive_proxy(proxy: &PortableProxyOf<T>) -> Result<(), Error> {
-		// Resize the migrated relay-chain deposit to this chain's rates: release it whole —
-		// making it free balance — and re-reserve below only what the recreated entry needs.
-		// The difference stays free on this chain, in the delegator's hands.
+		// Release the migrated deposit; the entry is re-reserved below at this chain's rates.
 		let proxy_reason: T::RuntimeHoldReason = HoldReason::ProxyDeposit.into();
 		let migrated = <T as Config>::Currency::balance_on_hold(&proxy_reason, &proxy.delegator);
 		if !migrated.is_zero() {
 			Self::release_hold(&proxy_reason, &proxy.delegator, migrated)
 				.map_err(|_| Error::FailedToProcessProxy)?;
 		}
-		let delay_ratio = T::RcBlockTimeRatio::get().max(1);
+		let delay_ratio = T::RcBlocksPerLocalBlock::get().max(1);
 
 		pallet_proxy::Proxies::<T>::try_mutate(&proxy.delegator, |(defs, deposit)| {
 			for delegate in proxy.delegates.iter() {
 				let def = pallet_proxy::ProxyDefinition {
 					delegate: delegate.delegate.clone(),
 					proxy_type: delegate.proxy_type.into(),
-					delay: (delegate.delay / delay_ratio).saturated_into(),
+					delay: delegate.delay.div_ceil(delay_ratio).saturated_into(),
 				};
-				if !defs.contains(&def) {
-					defs.try_push(def).map_err(|_| Error::FailedToProcessProxy)?;
+				// Inserted the way `add_proxy_delegate` does: the pallet binary-searches this
+				// vec, so it has to stay sorted.
+				if let Err(i) = defs.binary_search(&def) {
+					defs.try_insert(i, def).map_err(|_| Error::FailedToProcessProxy)?;
 				}
 			}
 
-			// Back the entry at this chain's rates (normally from the released deposit above),
-			// topping up whatever is already reserved for pre-existing local proxies. Priced by
-			// the proxy pallet itself, so a migrated entry can never diverge from what the
-			// pallet would charge.
+			// Top up the reserve to what the proxy pallet charges for the merged set.
 			let required = pallet_proxy::Pallet::<T>::deposit(defs.len() as u32);
 			let top_up = required.saturating_sub(*deposit);
 			if !top_up.is_zero() {
 				match <T as pallet_proxy::Config>::Currency::reserve(&proxy.delegator, top_up) {
 					Ok(()) => *deposit = required,
-					// Access outranks the deposit; the entry stays under-backed until the owner
-					// tops it up.
 					Err(_) => log::warn!(
 						target: LOG_TARGET,
 						"Proxies of {:?} under-backed: could not reserve {top_up:?}",
@@ -129,17 +121,11 @@ impl<T: Config> ProxyReceiver<T> {
 		})
 	}
 
-	/// Move `amount` from a hold back to free balance without the account ever sitting at zero
-	/// reserve mid-operation. For the stages that re-attribute a migrated reserve to the pallet
-	/// owning the deposit.
+	/// Move `amount` from a hold back to free balance, leaving total issuance untouched.
 	///
-	/// `MutateHold::release` decreases the hold first, and if that takes it to zero while the
-	/// free part is still sub-ED, pallet-balances dusts the remainder. Deposit holders whose
-	/// liquid dust deliberately travelled here alongside the deposit are in exactly that shape,
-	/// so the free part is credited *first* and the hold never passes through zero while free
-	/// is below ED. The two primitives are mint-and-burn of the same amount, so total issuance
-	/// is untouched, just as `release` would be.
-	pub fn release_hold(
+	/// Credits the free part before decreasing the hold. `MutateHold::release` does the reverse,
+	/// which dusts a sub-ED free balance once the hold reaches zero.
+	fn release_hold(
 		reason: &T::RuntimeHoldReason,
 		who: &T::AccountId,
 		amount: BalanceOf<T>,

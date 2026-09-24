@@ -14,11 +14,6 @@
 // limitations under the License.
 
 //! Unit tests for the proxy stage.
-//!
-//! The stage's contract: every portable definition is sent to the Coretime chain, whatever the
-//! delegator's balance; the rest stays with its deposit record clamped to what is still reserved,
-//! and an entry with nothing left is removed. The tests pin that contract with exact values; the
-//! Coretime chain appears only as the returned payloads.
 
 use super::*;
 use crate::mock::*;

@@ -15,22 +15,14 @@
 
 //! Proxy stage: migrates proxy delegations to the Coretime chain.
 //!
-//! - Every definition whose permission the Coretime chain represents (the runtime's
-//!   `TryInto<PortableProxyType>`: `Any`, `NonTransfer`, `CancelProxy`, `ParaRegistration`) is sent
-//!   there and recreated, whatever the delegator's balance. Keyless (pure) delegators can only ever
-//!   act through the recreated definitions — the accounts stage routes their whole balance there
-//!   for the same reason; for keyed delegators the recreation is a harmless convenience.
-//! - Definitions it does not represent (staking, governance, …) stay here. Deposits do not travel:
-//!   the accounts stage moved them, so the recorded deposit is clamped to what is still reserved
-//!   and no entry claims money that is gone.
-//! - An entry with nothing left to keep, or whose delegator has no account, is removed.
+//! Every definition whose permission the Coretime chain represents (the runtime's
+//! `TryInto<PortableProxyType>`) travels there and is recreated, whatever the delegator's
+//! balance. The rest stay here with the recorded deposit clamped to what is still reserved; the
+//! deposits themselves moved with the accounts stage. An entry with nothing left to keep, or
+//! whose delegator has no account, is removed.
 //!
 //! Announcements are not migrated. A record whose announcer's account is gone is removed; the
 //! others get their recorded deposit clamped the same way.
-//!
-//! Shipping the batches over XCM and driving the stage from `on_initialize` is the stage
-//! machine's job: [`ProxyMigrator::drain_announcements`] runs once before the first block and
-//! [`ProxyMigrator::migrate_many`] once per block, inside a storage transaction the caller owns.
 
 #[cfg(test)]
 mod tests;
@@ -44,10 +36,8 @@ use migrator_types::{
 };
 use sp_runtime::{traits::UniqueSaturatedInto, AccountId32, DispatchError};
 
-/// Maximum number of proxy entries processed per relay-chain block.
-///
-/// Bounds the unbenchmarked work of one `on_initialize` here and of the resulting
-/// `receive_proxies` calls on the Coretime chain.
+/// Maximum number of proxy entries processed per relay-chain block. Bounds the unbenchmarked
+/// work of one `on_initialize` here and of the resulting batch on the Coretime chain.
 pub const MAX_PROXIES_PER_BLOCK: u32 = 100;
 
 type ProxyDefinitionOf<T> = pallet_proxy::ProxyDefinition<
@@ -118,26 +108,26 @@ impl<T: Config> ProxyMigrator<T> {
 	/// The caller wraps this in a storage transaction and ships the result. Each entry is
 	/// migrated in a transaction of its own, so one that cannot be is skipped whole.
 	// TODO(ahm-v2): the `ProxyOngoing { last_key }` arm runs this once per block and ships
-	// `BlockProxies::proxies` with `send_proxies`, 50 sets per XCM.
+	// `BlockProxies::proxies` in batches.
 	pub fn migrate_many(last_key: Option<T::AccountId>) -> BlockProxies {
 		// Get iterator starting after last processed key
-		let mut iter = match &last_key {
+		let iter = match &last_key {
 			Some(last_key) => pallet_proxy::Proxies::<T>::iter_from(
 				pallet_proxy::Proxies::<T>::hashed_key_for(last_key),
 			),
 			None => pallet_proxy::Proxies::<T>::iter(),
 		};
 
-		let mut out = BlockProxies::default();
+		let mut proxies = Vec::new();
+		let mut last_key = None;
 		let mut processed = 0u32;
-		out.last_key = loop {
-			let Some((who, (defs, deposit))) = iter.next() else { break None };
+		for (who, (defs, deposit)) in iter {
 			processed += 1;
 
 			match with_storage_layer(|| {
 				Self::migrate_single(&who, defs.into_inner(), deposit).map_err(DispatchError::from)
 			}) {
-				Ok(Some(proxy)) => out.proxies.push(proxy),
+				Ok(Some(proxy)) => proxies.push(proxy),
 				Ok(None) => (),
 				Err(e) => {
 					log::warn!(target: LOG_TARGET, "Skipping proxy entry of {who:?}: {e:?}");
@@ -145,10 +135,11 @@ impl<T: Config> ProxyMigrator<T> {
 			}
 
 			if processed >= MAX_PROXIES_PER_BLOCK {
-				break Some(who);
+				last_key = Some(who);
+				break;
 			}
-		};
-		out
+		}
+		BlockProxies { proxies, last_key }
 	}
 
 	/// Migrate a single proxy entry. `Ok(None)` means none of its definitions is portable.
@@ -157,29 +148,26 @@ impl<T: Config> ProxyMigrator<T> {
 		defs: Vec<ProxyDefinitionOf<T>>,
 		deposit: u128,
 	) -> Result<Option<PortableProxy<AccountId32>>, Error> {
-		// Convert each definition once; `Ok` means the Coretime chain represents the permission
-		// and the definition travels, `Err` means it stays here.
-		let (travel, stay): (Vec<_>, Vec<_>) = defs
-			.into_iter()
-			.map(|def| {
-				let portable: Option<PortableProxyType> = def.proxy_type.clone().try_into().ok();
-				(def, portable)
-			})
-			.partition(|(_, portable)| portable.is_some());
+		// A definition travels if the Coretime chain represents its permission, else it stays.
+		// Account ids on the wire are the destination's address for them, see
+		// `migrator_types::translate_destination`.
+		let mut delegates = Vec::new();
+		let mut stay = Vec::new();
+		for def in defs {
+			let portable: Result<PortableProxyType, _> = def.proxy_type.clone().try_into();
+			match portable {
+				Ok(proxy_type) => delegates.push(PortableProxyDelegate {
+					delegate: translate_destination(&def.delegate),
+					proxy_type,
+					delay: def.delay.unique_saturated_into(),
+				}),
+				Err(_) => stay.push(def),
+			}
+		}
 
-		let proxy = if travel.is_empty() {
+		let proxy = if delegates.is_empty() {
 			None
 		} else {
-			// Account ids on the wire are always the destination's address for them — see
-			// `migrator_types::translate_destination`.
-			let delegates: Vec<_> = travel
-				.into_iter()
-				.map(|(def, portable)| PortableProxyDelegate {
-					delegate: translate_destination(&def.delegate),
-					proxy_type: portable.expect("partition kept only converted definitions; qed"),
-					delay: def.delay.unique_saturated_into(),
-				})
-				.collect();
 			Some(PortableProxy {
 				delegator: translate_destination(who),
 				delegates: delegates.try_into().map_err(|_| Error::TooManyDelegates)?,
@@ -187,15 +175,18 @@ impl<T: Config> ProxyMigrator<T> {
 		};
 
 		// Whatever stays keeps a deposit record no larger than what is still reserved.
-		let stay: Vec<_> = stay.into_iter().map(|(def, _)| def).collect();
-		match frame_system::Account::<T>::try_get(who) {
-			Ok(account) if !stay.is_empty() => {
-				let backed = deposit.min(account.data.reserved);
-				let stay: BoundedVec<_, <T as pallet_proxy::Config>::MaxProxies> =
-					stay.try_into().expect("subset of a bounded vec; qed");
-				pallet_proxy::Proxies::<T>::insert(who, (stay, backed));
-			},
-			_ => pallet_proxy::Proxies::<T>::remove(who),
+		if stay.is_empty() {
+			pallet_proxy::Proxies::<T>::remove(who);
+		} else {
+			match frame_system::Account::<T>::try_get(who) {
+				Ok(account) => {
+					let backed = deposit.min(account.data.reserved);
+					let stay: BoundedVec<_, <T as pallet_proxy::Config>::MaxProxies> =
+						BoundedVec::truncate_from(stay);
+					pallet_proxy::Proxies::<T>::insert(who, (stay, backed));
+				},
+				Err(()) => pallet_proxy::Proxies::<T>::remove(who),
+			}
 		}
 
 		// TODO(ahm-v2): definitions that do not travel are dropped with the entry of a delegator

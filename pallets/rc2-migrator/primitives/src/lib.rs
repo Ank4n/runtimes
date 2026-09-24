@@ -31,10 +31,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame_support::{traits::ConstU32, BoundedVec};
 use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use scale_info::TypeInfo;
-use sp_runtime::{traits::AccountIdConversion, AccountId32};
+use sp_runtime::{
+	traits::{AccountIdConversion, ConstU32},
+	AccountId32, BoundedVec,
+};
 
 /// Sovereign account of `para_id` as seen from a sibling parachain (`sibl` + para id).
 ///
@@ -135,11 +137,8 @@ pub struct PortableProxyDelegate<AccountId> {
 	pub delay: u32,
 }
 
-/// Proxy delegations of one delegator, in portable format.
-///
-/// The deposit does not travel with the delegations: the accounts stage moves it as a
-/// `ProxyDeposit` hold, which the receiving chain resizes to its own rates when the delegations
-/// arrive.
+/// Proxy delegations of one delegator, in portable format. The deposit travels separately, as a
+/// `ProxyDeposit` hold.
 #[derive(
 	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
 )]

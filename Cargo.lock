@@ -9835,7 +9835,6 @@ dependencies = [
 name = "migrator-types"
 version = "0.1.0"
 dependencies = [
- "frame-support",
  "parity-scale-codec",
  "polkadot-parachain-primitives",
  "scale-info",

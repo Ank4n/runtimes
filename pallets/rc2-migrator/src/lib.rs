@@ -231,9 +231,7 @@ pub mod pallet {
 			AccountId = AccountId32,
 			AccountData = pallet_balances::AccountData<u128>,
 		> + pallet_balances::Config<Balance = u128>
-		// The `Currency` equality pins the recorded deposit to the native u128 balance. The
-		// `ProxyType` bound is where the runtime declares which proxy permissions travel to the
-		// Coretime chain; untranslatable ones stay here.
+		// The `Currency` equality pins the recorded deposit to the native u128 balance.
 		+ pallet_proxy::Config<
 			Currency = pallet_balances::Pallet<Self>,
 			ProxyType: TryInto<PortableProxyType>,

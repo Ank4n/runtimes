@@ -26,6 +26,9 @@ use crate::{
 use frame_support::traits::ConstU32;
 use frame_system::EnsureRoot;
 use migrator_types::PortableProxyType;
+use system_parachains_constants::{
+	polkadot::consensus::RELAY_CHAIN_SLOT_DURATION_MILLIS, MILLISECS_PER_BLOCK,
+};
 
 impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -33,12 +36,11 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
-	// Relay blocks are 6s, this chain's are 12s: migrated proxy delays halve.
-	type RcBlockTimeRatio = ConstU32<2>;
+	type RcBlocksPerLocalBlock =
+		ConstU32<{ (MILLISECS_PER_BLOCK / RELAY_CHAIN_SLOT_DURATION_MILLIS as u64) as u32 }>;
 }
 
-/// What each migrated relay-chain proxy permission becomes locally. Total by construction: the
-/// relay side only sends permissions this chain represents.
+/// What each migrated relay-chain proxy permission becomes locally.
 impl From<PortableProxyType> for ProxyType {
 	fn from(portable: PortableProxyType) -> Self {
 		match portable {

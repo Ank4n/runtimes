@@ -134,9 +134,7 @@ pub mod pallet {
 	#[pallet::config]
 	pub trait Config:
 		frame_system::Config
-		// Migrated proxy delegations are written into the real proxy pallet so keyless (pure)
-		// delegators keep control here. The `ProxyType` bound is where the runtime declares
-		// what each portable permission becomes locally.
+		// Migrated proxy delegations are written into the proxy pallet.
 		+ pallet_proxy::Config<ProxyType: From<PortableProxyType>>
 	{
 		/// The overarching event type.
@@ -156,10 +154,10 @@ pub mod pallet {
 		/// The overarching hold reason type.
 		type RuntimeHoldReason: From<HoldReason>;
 
-		/// How many of this chain's blocks fit in one relay-chain block's time. Used to convert
-		/// migrated proxy delays (relay: 6s blocks; this chain: 12s → ratio 2).
+		/// Relay-chain blocks per block of this chain. Converts migrated proxy delays, which
+		/// arrive in relay-chain blocks: 6s relay blocks and 12s local blocks give 2.
 		#[pallet::constant]
-		type RcBlockTimeRatio: Get<u32>;
+		type RcBlocksPerLocalBlock: Get<u32>;
 	}
 
 	#[pallet::composite_enum]

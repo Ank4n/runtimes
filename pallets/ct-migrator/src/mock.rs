@@ -24,7 +24,7 @@ use frame_support::{
 	traits::{
 		fungible::{InspectHold, Mutate, Unbalanced, UnbalancedHold},
 		tokens::{Fortitude, Precision, Preservation},
-		ConstU32, InstanceFilter,
+		ConstU128, ConstU32, InstanceFilter,
 	},
 };
 use frame_system::EnsureSignedBy;
@@ -39,8 +39,6 @@ use xcm::prelude::*;
 type Block = frame_system::mocking::MockBlock<Test>;
 pub type AccountId = u64;
 
-// The proxy pallet is the real one, so recreated entries are priced the way the chain prices
-// them.
 frame_support::construct_runtime! {
 	pub enum Test {
 		System: frame_system,
@@ -59,20 +57,15 @@ impl frame_system::Config for Test {
 /// Existential deposit of the receiving chain.
 pub const ED: u128 = 10;
 
-parameter_types! {
-	pub const ExistentialDeposit: u128 = ED;
-}
-
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
 	type Balance = u128;
 	type AccountStore = System;
-	type ExistentialDeposit = ExistentialDeposit;
+	type ExistentialDeposit = ConstU128<ED>;
 	type RuntimeHoldReason = RuntimeHoldReason;
 }
 
-/// Local proxy permissions. Mirrors the shape of the Coretime runtime's `ProxyType`: a total
-/// `From<PortableProxyType>` because the wire only carries permissions this chain represents.
+/// Local proxy permissions.
 #[derive(
 	Copy,
 	Clone,
@@ -190,7 +183,7 @@ impl pallet_ct_migrator::Config for Test {
 	type AdminOrigin = EnsureSignedBy<AdminAccount, AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
-	type RcBlockTimeRatio = ConstU32<2>;
+	type RcBlocksPerLocalBlock = ConstU32<2>;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {

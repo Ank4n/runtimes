@@ -20,9 +20,10 @@ use crate as pallet_rc2_migrator;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
-	traits::{Currency, InstanceFilter, OnInitialize, ReservableCurrency, Time},
+	traits::{ConstU128, Currency, InstanceFilter, OnInitialize, ReservableCurrency, Time},
 };
 use frame_system::EnsureSignedBy;
+use migrator_types::PortableProxyType;
 use polkadot_parachain_primitives::primitives::Id as ParaId;
 use scale_info::TypeInfo;
 use sp_runtime::{
@@ -34,8 +35,6 @@ use xcm::prelude::*;
 type Block = frame_system::mocking::MockBlock<Test>;
 pub type AccountId = AccountId32;
 
-// The proxy pallet is the real one, so every entry in the tests is placed the way mainnet placed
-// it.
 frame_support::construct_runtime! {
 	pub enum Test {
 		System: frame_system,
@@ -56,19 +55,14 @@ impl frame_system::Config for Test {
 /// The relay chain's existential deposit.
 pub const ED: u128 = 10;
 
-parameter_types! {
-	pub const ExistentialDeposit: u128 = ED;
-}
-
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
 	type Balance = u128;
 	type AccountStore = System;
-	type ExistentialDeposit = ExistentialDeposit;
+	type ExistentialDeposit = ConstU128<ED>;
 }
 
-/// Relay-side proxy permissions: two portable ones and one (`Staking`) that the destination does
-/// not represent, mirroring the production `TryFrom` split.
+/// Relay-side proxy permissions; `Staking` is not portable.
 #[derive(
 	Copy,
 	Clone,
@@ -91,14 +85,13 @@ pub enum ProxyType {
 	Staking,
 }
 
-impl TryFrom<ProxyType> for migrator_types::PortableProxyType {
+impl TryFrom<ProxyType> for PortableProxyType {
 	type Error = ();
 
 	fn try_from(t: ProxyType) -> Result<Self, ()> {
-		use migrator_types::PortableProxyType as P;
 		match t {
-			ProxyType::Any => Ok(P::Any),
-			ProxyType::NonTransfer => Ok(P::NonTransfer),
+			ProxyType::Any => Ok(PortableProxyType::Any),
+			ProxyType::NonTransfer => Ok(PortableProxyType::NonTransfer),
 			ProxyType::Staking => Err(()),
 		}
 	}
