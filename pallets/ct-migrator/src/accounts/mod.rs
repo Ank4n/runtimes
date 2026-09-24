@@ -59,6 +59,9 @@ impl<T: Config> Pallet<T> {
 					"Failed to integrate account {:?}: {e:?}; parking it",
 					account.who,
 				);
+				// TODO(ahm-v2): two relay accounts can map to the same destination (a child
+				// sovereign and a stray sibling-format account); a second failure overwrites the
+				// first entry and loses its record.
 				FailedAccounts::<T>::insert(account.who.clone(), account);
 			},
 		);
