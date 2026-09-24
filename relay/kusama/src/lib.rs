@@ -207,12 +207,53 @@ parameter_types! {
 	pub const SS58Prefix: u8 = 2;
 }
 
+/// Whether the AHM v2 migration has started. Constant `false` without the `ahm-v2` feature.
+#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
+pub(crate) fn ahm_v2_started() -> bool {
+	pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started()
+}
+#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
+pub(crate) fn ahm_v2_started() -> bool {
+	false
+}
+
 /// Pallets that are blocked for user calls after the AHM.
 pub struct PostAhmFilter;
 impl Contains<RuntimeCall> for PostAhmFilter {
 	fn contains(call: &RuntimeCall) -> bool {
 		use RuntimeCall::*;
 		match call {
+			// --- AHM v2 ---
+
+			// The ways a signed origin can move value or resize a reserve while the accounts stage
+			// is draining them. A reserve created after that stage has passed its owner is backed
+			// by no pallet record, and an unattributable reserve holds the whole account back on
+			// this chain.
+			Balances(..) |
+			XcmPallet(..) |
+			Multisig(..) |
+			Preimage(..) |
+			OnDemandAssignmentProvider(..) |
+			Crowdloan(..)
+				if ahm_v2_started() =>
+				false,
+
+			// Using a proxy stays open; anything that creates or resizes a proxy or announcement
+			// deposit does not. Named this way round so a call added to `pallet_proxy` is closed
+			// by default rather than open by omission.
+			Proxy(
+				pallet_proxy::Call::<Runtime>::proxy { .. } |
+				pallet_proxy::Call::<Runtime>::proxy_announced { .. },
+			) => true,
+			Proxy(..) if ahm_v2_started() => false,
+
+			// The parachain control plane moves to the Coretime chain. Gated on the migration
+			// rather than on the runtime upgrade: the Coretime pallets hold nothing until the
+			// migration hands state over, so closing at the upgrade would leave nobody able to
+			// register a para or open a channel on either chain for as long as governance takes
+			// to schedule the start.
+			Registrar(..) | Hrmp(..) if ahm_v2_started() => false,
+
 			Scheduler(..) |
 			Indices(..) |
 			Staking(..) |
