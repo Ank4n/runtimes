@@ -33,7 +33,10 @@
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use scale_info::TypeInfo;
-use sp_runtime::{traits::AccountIdConversion, AccountId32};
+use sp_runtime::{
+	traits::{AccountIdConversion, ConstU32},
+	AccountId32, BoundedVec,
+};
 
 /// Sovereign account of `para_id` as seen from a sibling parachain (`sibl` + para id).
 ///
@@ -118,6 +121,33 @@ pub enum PortableProxyType {
 	CancelProxy,
 	#[codec(index = 3)]
 	ParaRegistration,
+}
+
+/// One proxy delegation of a migrated delegator.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableProxyDelegate<AccountId> {
+	/// The account which may act on behalf of the delegator; already translated by the sender.
+	pub delegate: AccountId,
+	pub proxy_type: PortableProxyType,
+	/// The number of blocks that an announcement must be in place for before the corresponding
+	/// call may be dispatched. In relay-chain blocks; the receiving chain converts it to its own
+	/// block time.
+	pub delay: u32,
+}
+
+/// Proxy delegations of one delegator, in portable format. The deposit travels separately, as a
+/// `ProxyDeposit` hold.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableProxy<AccountId> {
+	/// The account that is delegating to their proxies; already translated by the sender.
+	pub delegator: AccountId,
+	/// The proxies that were delegated to and that can act on behalf of the delegator. Bounded
+	/// by the relay chain's `MaxProxies`.
+	pub delegates: BoundedVec<PortableProxyDelegate<AccountId>, ConstU32<32>>,
 }
 
 #[cfg(test)]

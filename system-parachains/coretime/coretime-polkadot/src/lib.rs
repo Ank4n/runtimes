@@ -580,6 +580,9 @@ pub enum ProxyType {
 	OnDemandPurchaser,
 	/// Collator selection proxy. Can execute calls related to collator selection mechanism.
 	Collator,
+	/// Proxy for parachain registration operations. Allows nothing until the registrar pallet
+	/// lands here.
+	ParaRegistration,
 }
 
 impl InstanceFilter<RuntimeCall> for ProxyType {
@@ -641,6 +644,9 @@ impl InstanceFilter<RuntimeCall> for ProxyType {
 					RuntimeCall::Utility { .. } |
 					RuntimeCall::Multisig { .. }
 			),
+			// TODO(ahm-v2): once the registrar lands, mirror the relay chain's `ParaRegistration`
+			// filter exactly: `reserve`, `register`, utility batches, `remove_proxy`.
+			ProxyType::ParaRegistration => false,
 		}
 	}
 

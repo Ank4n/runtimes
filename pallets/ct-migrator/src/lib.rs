@@ -45,6 +45,8 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod proxy;
+
 pub use pallet::*;
 
 use alloc::{vec, vec::Vec};
@@ -57,7 +59,8 @@ use frame_support::{
 	},
 };
 use frame_system::pallet_prelude::*;
-use migrator_types::PortableHoldReason;
+use migrator_types::{PortableHoldReason, PortableProxyType};
+use proxy::PortableProxyOf;
 use sp_runtime::DispatchError;
 use xcm::prelude::*;
 
@@ -129,7 +132,11 @@ pub mod pallet {
 	use super::*;
 
 	#[pallet::config]
-	pub trait Config: frame_system::Config {
+	pub trait Config:
+		frame_system::Config
+		// Migrated proxy delegations are written into the proxy pallet.
+		+ pallet_proxy::Config<ProxyType: From<PortableProxyType>>
+	{
 		/// The overarching event type.
 		#[allow(deprecated)]
 		type RuntimeEvent: From<Event<Self>> + IsType<<Self as frame_system::Config>::RuntimeEvent>;
@@ -146,6 +153,11 @@ pub mod pallet {
 
 		/// The overarching hold reason type.
 		type RuntimeHoldReason: From<HoldReason>;
+
+		/// Relay-chain blocks per block of this chain. Converts migrated proxy delays, which
+		/// arrive in relay-chain blocks: 6s relay blocks and 12s local blocks give 2.
+		#[pallet::constant]
+		type RcBlocksPerLocalBlock: Get<u32>;
 	}
 
 	#[pallet::composite_enum]
@@ -182,6 +194,11 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type Manager<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
+	/// Migrated proxy sets that failed to integrate, parked verbatim for recovery.
+	#[pallet::storage]
+	pub type FailedProxies<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, PortableProxyOf<T>, OptionQuery>;
+
 	#[pallet::error]
 	pub enum Error<T> {
 		/// The migration has already finished on this chain.
@@ -209,6 +226,8 @@ pub mod pallet {
 			/// The new manager account id.
 			new: Option<T::AccountId>,
 		},
+		/// A batch of migrated proxy sets was processed.
+		ProxiesReceived { count_good: u32, count_bad: u32 },
 	}
 
 	#[pallet::call]

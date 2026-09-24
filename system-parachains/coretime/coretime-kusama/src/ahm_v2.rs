@@ -20,8 +20,15 @@
 //! Compiled only with the `ahm-v2` feature, which released runtimes do not enable. The
 //! integration tests turn it on to drive the real runtime.
 
-use crate::{xcm_config::XcmRouter, AccountId, Balances, Runtime, RuntimeEvent, RuntimeHoldReason};
+use crate::{
+	xcm_config::XcmRouter, AccountId, Balances, ProxyType, Runtime, RuntimeEvent, RuntimeHoldReason,
+};
+use frame_support::traits::ConstU32;
 use frame_system::EnsureRoot;
+use migrator_types::PortableProxyType;
+use system_parachains_constants::{
+	kusama::consensus::RELAY_CHAIN_SLOT_DURATION_MILLIS, MILLISECS_PER_BLOCK,
+};
 
 impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -29,6 +36,20 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
+	type RcBlocksPerLocalBlock =
+		ConstU32<{ (MILLISECS_PER_BLOCK / RELAY_CHAIN_SLOT_DURATION_MILLIS as u64) as u32 }>;
+}
+
+/// What each migrated relay-chain proxy permission becomes locally.
+impl From<PortableProxyType> for ProxyType {
+	fn from(portable: PortableProxyType) -> Self {
+		match portable {
+			PortableProxyType::Any => ProxyType::Any,
+			PortableProxyType::NonTransfer => ProxyType::NonTransfer,
+			PortableProxyType::CancelProxy => ProxyType::CancelProxy,
+			PortableProxyType::ParaRegistration => ProxyType::ParaRegistration,
+		}
+	}
 }
 
 #[cfg(test)]

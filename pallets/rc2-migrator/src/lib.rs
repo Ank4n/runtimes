@@ -38,6 +38,8 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod proxy;
+
 pub use pallet::*;
 
 use alloc::vec;
@@ -47,6 +49,7 @@ use frame_support::{
 	traits::{EnsureOrigin, Time},
 };
 use frame_system::pallet_prelude::*;
+use migrator_types::PortableProxyType;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
 use sp_runtime::AccountId32;
 use xcm::prelude::*;
@@ -228,6 +231,11 @@ pub mod pallet {
 			AccountId = AccountId32,
 			AccountData = pallet_balances::AccountData<u128>,
 		> + pallet_balances::Config<Balance = u128>
+		// The `Currency` equality pins the recorded deposit to the native u128 balance.
+		+ pallet_proxy::Config<
+			Currency = pallet_balances::Pallet<Self>,
+			ProxyType: TryInto<PortableProxyType>,
+		>
 	{
 		/// The overarching event type.
 		#[allow(deprecated)]
