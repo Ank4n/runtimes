@@ -23,6 +23,7 @@ use frame_support::{
 	traits::{OnInitialize, Time},
 };
 use frame_system::EnsureSignedBy;
+use sp_keyring::Sr25519Keyring::{Alice, Bob, Charlie};
 use sp_runtime::{traits::IdentityLookup, AccountId32, BuildStorage};
 use xcm::prelude::*;
 
@@ -120,6 +121,14 @@ ord_parameter_types! {
 	pub const AdminAccount: AccountId = ADMIN;
 }
 
+parameter_types! {
+	/// Members of the manager multisig. `new_test_ext` seeds Alice, Bob and Charlie.
+	pub static MultisigMembers: Vec<AccountId> = vec![];
+	pub const MultisigThreshold: u32 = 2;
+	pub const MultisigMaxVotesPerRound: u32 = 3;
+	pub const MultisigStartRound: u32 = 7;
+}
+
 impl pallet_rc2_migrator::Config for Test {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = RecordingRouter;
@@ -127,12 +136,17 @@ impl pallet_rc2_migrator::Config for Test {
 	type TimeProvider = MockTime;
 	type CtOrigin = EnsureSignedBy<CoretimeAccount, AccountId>;
 	type AdminOrigin = EnsureSignedBy<AdminAccount, AccountId>;
+	type MultisigMembers = MultisigMembers;
+	type MultisigThreshold = MultisigThreshold;
+	type MultisigMaxVotesPerRound = MultisigMaxVotesPerRound;
+	type MultisigStartRound = MultisigStartRound;
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
 	SentXcm::set(vec![]);
 	SendFails::set(false);
 	MockNow::set(BLOCK_TIME_MS);
+	MultisigMembers::set(vec![Alice.to_account_id(), Bob.to_account_id(), Charlie.to_account_id()]);
 
 	let storage = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
 	let mut ext = sp_io::TestExternalities::new(storage);

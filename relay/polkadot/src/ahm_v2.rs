@@ -24,9 +24,20 @@ use crate::{
 	xcm_config::{CoretimeLocation, XcmRouter},
 	AccountId, BrokerId, Runtime, RuntimeEvent, Timestamp,
 };
-use frame_support::traits::Equals;
+use alloc::vec::Vec;
+use frame_support::{
+	parameter_types,
+	traits::{ConstU32, Equals},
+};
 use frame_system::EnsureRoot;
 use pallet_xcm::EnsureXcm;
+
+parameter_types! {
+	/// The accounts that may drive the migration collectively. A constant, so the real set goes
+	/// in with a runtime upgrade before a migration is scheduled. While it is empty only root
+	/// and the appointed manager can act.
+	pub MigrationMultisigMembers: Vec<AccountId> = Vec::new();
+}
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -35,6 +46,12 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<CoretimeLocation>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
+	type MultisigMembers = MigrationMultisigMembers;
+	type MultisigThreshold = ConstU32<3>;
+	type MultisigMaxVotesPerRound = ConstU32<5>;
+	// Polkadot and Kusama start a million rounds apart, more dispatches than either migration
+	// will make; see `Config::MultisigStartRound`.
+	type MultisigStartRound = ConstU32<1_000_000>;
 }
 
 #[cfg(test)]

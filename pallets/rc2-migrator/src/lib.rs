@@ -38,9 +38,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod multisig;
+
 pub use pallet::*;
 
-use alloc::vec;
+use alloc::{vec, vec::Vec};
 use frame_support::{
 	pallet_prelude::*,
 	sp_runtime::traits::Saturating,
@@ -248,6 +250,19 @@ pub mod pallet {
 
 		/// The origin that can perform permissioned operations like setting the migration stage.
 		type AdminOrigin: EnsureOrigin<<Self as frame_system::Config>::RuntimeOrigin>;
+
+		/// Members of a multisig that can submit unsigned txs and act as the manager.
+		type MultisigMembers: Get<Vec<AccountId32>>;
+
+		/// Threshold of `MultisigMembers`.
+		type MultisigThreshold: Get<u32>;
+
+		/// Limit the number of votes of each participant per round.
+		type MultisigMaxVotesPerRound: Get<u32>;
+
+		/// Round the vote counter starts at, far enough from every other network's that their
+		/// counters never meet: a vote is signed over (who, call, round) and nothing else.
+		type MultisigStartRound: Get<u32>;
 	}
 
 	#[pallet::pallet]
@@ -261,6 +276,23 @@ pub mod pallet {
 	/// Balance kept on the Relay Chain versus migrated away. Set up by the accounts stage.
 	#[pallet::storage]
 	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances, ValueQuery>;
+
+	/// The multisig members that voted to execute a call, by the call's hash.
+	#[pallet::storage]
+	#[pallet::unbounded]
+	pub type ManagerMultisigs<T: Config> =
+		StorageMap<_, Identity, T::Hash, Vec<AccountId32>, ValueQuery>;
+
+	/// The current round of the multisig voting. Votes are only valid for the current round.
+	/// Starts at [`Config::MultisigStartRound`].
+	#[pallet::storage]
+	pub type ManagerMultisigRound<T: Config> =
+		StorageValue<_, u32, ValueQuery, T::MultisigStartRound>;
+
+	/// How often each member voted in the current round. Cleared at the end of each round.
+	#[pallet::storage]
+	pub type ManagerVotesInCurrentRound<T: Config> =
+		StorageMap<_, Blake2_128Concat, AccountId32, u32, ValueQuery>;
 
 	/// The duration of the pre migration warm-up period.
 	///
@@ -318,6 +350,17 @@ pub mod pallet {
 		AlreadyPaused,
 		/// The migration is not paused.
 		NotPaused,
+		/// The manager multisig vote's signer is not one of `Config::MultisigMembers`.
+		NotMultisigMember,
+		/// The manager multisig vote's signature is not its signer's, or not over the wrapped
+		/// payload.
+		BadMultisigSignature,
+		/// The manager multisig vote carries a round that is no longer open.
+		MultisigRoundStale,
+		/// The member has used up its manager multisig votes for this round.
+		MultisigMaxVotesPerRound,
+		/// The member has already voted for this call in this round.
+		MultisigDuplicateVote,
 	}
 
 	#[pallet::event]
@@ -347,6 +390,12 @@ pub mod pallet {
 			/// The stage from which the migration continues.
 			stage: MigrationStageOf<T>,
 		},
+		/// A member voted for a call, which now has `votes` votes.
+		ManagerMultisigVoted { who: T::AccountId, call_hash: T::Hash, votes: u32 },
+		/// The manager multisig reached its threshold and dispatched the call.
+		ManagerMultisigDispatched { call_hash: T::Hash, res: DispatchResult },
+		/// The manager multisig's `round` ended; votes are now signed for the next one.
+		ManagerMultisigRoundEnded { round: u32 },
 	}
 
 	#[pallet::hooks]

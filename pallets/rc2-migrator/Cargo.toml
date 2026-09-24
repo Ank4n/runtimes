@@ -20,6 +20,7 @@ xcm = { workspace = true }
 
 [dev-dependencies]
 sp-io = { workspace = true, default-features = true }
+sp-keyring = { workspace = true }
 sp-runtime = { workspace = true, default-features = true }
 
 [features]

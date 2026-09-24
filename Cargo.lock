@@ -12171,6 +12171,7 @@ dependencies = [
  "polkadot-parachain-primitives",
  "scale-info",
  "sp-io 48.0.0",
+ "sp-keyring",
  "sp-runtime 48.0.0",
  "staging-xcm",
 ]
