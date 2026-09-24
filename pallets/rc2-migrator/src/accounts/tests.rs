@@ -22,13 +22,11 @@
 
 use super::*;
 use crate::{mock::*, ExpectedReserves, RcMigratedBalance};
-use frame_support::{
-	assert_ok, hypothetically,
-	traits::{LockableCurrency, WithdrawReasons},
-	weights::Weight,
+use frame_support::{assert_ok, hypothetically, weights::Weight};
+use sp_runtime::{
+	testing::H256,
+	traits::{BlakeTwo256, Hash},
 };
-use sp_core::H256;
-use sp_runtime::traits::{BlakeTwo256, Hash};
 
 type Migrator = AccountsMigrator<Test>;
 
@@ -41,20 +39,6 @@ fn ct_holds(w: &Withdrawal) -> Vec<(PortableHoldReason, u128)> {
 	w.ct.as_ref()
 		.map(|a| a.holds.iter().map(|h| (h.reason, h.amount)).collect())
 		.unwrap_or_default()
-}
-
-/// Seed the conservation ledger the way `init` does, for tests that drive `migrate_many`
-/// directly.
-fn seed_ledger() {
-	RcMigratedBalance::<Test>::put(MigratedBalances {
-		kept: total_issuance(),
-		..Default::default()
-	});
-}
-
-fn migrate_block(last_key: Option<AccountId32>) -> BlockWithdrawals {
-	with_storage_layer(|| Migrator::migrate_many(last_key, None).map_err(DispatchError::from))
-		.expect("block succeeds")
 }
 
 // ---------------------------------------------------------------------------
@@ -177,6 +161,34 @@ fn init_releases_preimage_deposits_and_seeds_the_ledger() {
 			RcMigratedBalance::<Test>::get(),
 			MigratedBalances { kept: ti, ..Default::default() }
 		);
+	});
+}
+
+#[test]
+fn init_reruns_after_a_rewind_without_double_counting() {
+	new_test_ext().execute_with(|| {
+		let alice = acc(1); // parachain manager, and the migration manager so she stays
+		let bob = acc(2); // regular account, withdrawn in the first block
+		fund(&alice, 1_000);
+		fund(&bob, 500);
+		register_para(2000, &alice);
+
+		// GIVEN the stage initialised and one block of withdrawals done.
+		assert_eq!(Migrator::init(), 1);
+		let out = Migrator::migrate_many(None, Some(&alice));
+		assert_eq!(out.ah, vec![(bob.clone(), 500)]);
+		let ledger = RcMigratedBalance::<Test>::get();
+		assert_eq!(ledger.ah_free, 500);
+
+		// WHEN the stage is initialised again.
+		assert_eq!(Migrator::init(), 1);
+
+		// THEN the index is rebuilt rather than accumulated, and the ledger keeps what it accrued.
+		assert_eq!(
+			ExpectedReserves::<Test>::get(&alice),
+			ExpectedReserve { registrar: 300, ..Default::default() }
+		);
+		assert_eq!(RcMigratedBalance::<Test>::get(), ledger);
 	});
 }
 
@@ -363,12 +375,7 @@ fn can_migrate_keeps_manager_module_below_ed_and_locked_accounts() {
 		// Locks cannot be translated; the account stays behind whole.
 		let locked = acc(10);
 		fund(&locked, 500);
-		<Balances as LockableCurrency<AccountId32>>::set_lock(
-			*b"testlock",
-			&locked,
-			100,
-			WithdrawReasons::all(),
-		);
+		lock(&locked, 100);
 		assert_eq!(withdraw(&locked), None);
 		assert_eq!(free(&locked), 500);
 	});
@@ -439,10 +446,7 @@ fn migrate_many_returns_exactly_what_it_burns_and_keeps_the_ledger_exact() {
 		let ti_before = total_issuance();
 		Migrator::init();
 
-		let out = with_storage_layer(|| {
-			Migrator::migrate_many(None, Some(&manager)).map_err(DispatchError::from)
-		})
-		.expect("block succeeds");
+		let out = Migrator::migrate_many(None, Some(&manager));
 
 		// One block covers everything; the payloads carry exactly the burned pieces.
 		assert_eq!(out.last_key, None);
@@ -491,17 +495,17 @@ fn migrate_many_stops_at_the_per_block_limit_and_resumes_from_the_cursor() {
 			fund(&AccountId32::new(bytes), 1_000);
 		}
 		let ti_before = total_issuance();
-		seed_ledger();
+		Migrator::init();
 
 		// WHEN the first block runs, it stops at the limit and hands back a cursor.
-		let first = migrate_block(None);
+		let first = Migrator::migrate_many(None, None);
 		assert_eq!(first.ah.len(), MAX_ACCOUNTS_PER_BLOCK as usize);
 		assert!(first.ct.is_empty(), "plain free balance has no Coretime leg");
 		let cursor = first.last_key.expect("more accounts remain than the per-block limit");
 		assert_eq!(frame_system::Account::<Test>::iter().count(), 20);
 
 		// AND the second block continues after the cursor and exhausts the account space.
-		let second = migrate_block(Some(cursor));
+		let second = Migrator::migrate_many(Some(cursor), None);
 		assert_eq!(second.ah.len(), 20);
 		assert_eq!(second.last_key, None);
 
@@ -522,17 +526,12 @@ fn migrate_many_leaves_kept_accounts_in_place_and_out_of_the_payloads() {
 		let locked = acc(10); // stays: untranslatable lock
 		fund(&alice, 1_000);
 		fund(&locked, 500);
-		<Balances as LockableCurrency<AccountId32>>::set_lock(
-			*b"testlock",
-			&locked,
-			100,
-			WithdrawReasons::all(),
-		);
+		lock(&locked, 100);
 		fund(&pot(), 300); // stays: module account
-		seed_ledger();
+		Migrator::init();
 		let ti_before = total_issuance();
 
-		let out = migrate_block(None);
+		let out = Migrator::migrate_many(None, None);
 
 		assert_eq!(out.ah, vec![(alice, 1_000)]);
 		assert_eq!(free(&locked), 500);

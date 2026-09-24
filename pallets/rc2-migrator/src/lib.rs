@@ -233,10 +233,8 @@ pub mod pallet {
 			AccountId = AccountId32,
 			AccountData = pallet_balances::AccountData<u128>,
 		> + pallet_balances::Config<Balance = u128>
-		// The `Currency` equalities pin the deposit balance types to u128; the `ProxyType`
-		// bound is where the runtime declares which proxy permissions travel to the Coretime
-		// chain (untranslatable ones stay here). Multisig is bound only to index its deposits:
-		// the one pallet whose calls stay open pre-migration, so new deposits can still appear.
+		// The `Currency` equalities pin the deposit balance types to u128. The `ProxyType` bound
+		// is where the runtime declares which proxy permissions travel to the Coretime chain.
 		+ paras_registrar::Config<Currency = pallet_balances::Pallet<Self>>
 		+ runtime_parachains::hrmp::Config
 		+ pallet_multisig::Config<Currency = pallet_balances::Pallet<Self>>
@@ -244,10 +242,8 @@ pub mod pallet {
 			Currency = pallet_balances::Pallet<Self>,
 			ProxyType: TryInto<PortableProxyType>,
 		>
-		// Preimage deposits are released before the accounts stage runs: they are named holds,
-		// and `can_migrate` refuses any account that has one. The bound is on the pallet rather
-		// than a `StorePreimage` seam because the deposits have to be *enumerated*, which only
-		// the pallet's storage can do. See `release_preimage_deposits`.
+		// Preimage deposits are named holds; the accounts stage releases them before it withdraws
+		// anything. See `accounts::AccountsMigrator::release_preimage_deposits`.
 		+ pallet_preimage::Config
 	{
 		/// The overarching event type.
@@ -294,12 +290,8 @@ pub mod pallet {
 	pub type RcMigratedBalance<T: Config> = StorageValue<_, MigratedBalances, ValueQuery>;
 
 	/// What each account's reserved balance is expected to be made of, built from the owning
-	/// pallets' recorded deposit fields before any account is withdrawn. The recorded fields are
-	/// the routing source of truth; the anonymous reserves are only trusted up to these amounts,
-	/// and anything beyond them travels as an unattributed hold, parked at the destination.
-	///
-	/// One record per account rather than one map per kind: the three amounts are always built
-	/// together and always read together in the withdrawal split.
+	/// pallets' recorded deposit fields before any account is withdrawn. The anonymous reserve is
+	/// attributed up to these amounts; anything beyond them travels as an unattributed hold.
 	#[pallet::storage]
 	pub type ExpectedReserves<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, ExpectedReserve, ValueQuery>;
@@ -360,6 +352,8 @@ pub mod pallet {
 		AlreadyPaused,
 		/// The migration is not paused.
 		NotPaused,
+		/// The account balance could not be fully withdrawn.
+		FailedToWithdrawAccount,
 	}
 
 	#[pallet::event]
@@ -399,6 +393,9 @@ pub mod pallet {
 		/// case) was drained to a zero-balance shell; the balance travels like any other
 		/// account's.
 		AccountShellDrained { who: AccountId32, amount: u128 },
+		/// An account that should have migrated could not be withdrawn cleanly and was left in
+		/// place with its balance.
+		AccountSkipped { who: AccountId32 },
 	}
 
 	#[pallet::hooks]

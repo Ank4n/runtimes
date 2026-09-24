@@ -20,9 +20,14 @@ use crate as pallet_rc2_migrator;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
-	traits::{ConstU128, Currency, InstanceFilter, OnInitialize, ReservableCurrency, Time},
+	traits::{
+		ConstU128, Currency, InstanceFilter, LockableCurrency, OnInitialize, ReservableCurrency,
+		Time, WithdrawReasons,
+	},
+	PalletId,
 };
 use frame_system::{EnsureRoot, EnsureSignedBy};
+use migrator_types::PortableProxyType;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
 use polkadot_runtime_common::paras_registrar;
 use runtime_parachains::{
@@ -197,14 +202,13 @@ pub enum ProxyType {
 	Staking,
 }
 
-impl TryFrom<ProxyType> for migrator_types::PortableProxyType {
+impl TryFrom<ProxyType> for PortableProxyType {
 	type Error = ();
 
 	fn try_from(t: ProxyType) -> Result<Self, ()> {
-		use migrator_types::PortableProxyType as P;
 		match t {
-			ProxyType::Any => Ok(P::Any),
-			ProxyType::NonTransfer => Ok(P::NonTransfer),
+			ProxyType::Any => Ok(PortableProxyType::Any),
+			ProxyType::NonTransfer => Ok(PortableProxyType::NonTransfer),
 			ProxyType::Staking => Err(()),
 		}
 	}
@@ -413,9 +417,7 @@ pub fn acc(n: u8) -> AccountId {
 
 /// A pallet (module) account: the kind the migration leaves for the sweep stage.
 pub fn pot() -> AccountId {
-	let mut bytes = [0u8; 32];
-	bytes[..12].copy_from_slice(b"modlpy/trsry");
-	AccountId32::new(bytes)
+	PalletId(*b"py/trsry").into_account_truncating()
 }
 
 /// The child sovereign account of a para on the relay chain (`para…`).
@@ -429,6 +431,15 @@ pub fn fund(who: &AccountId, amount: u128) {
 
 pub fn reserve(who: &AccountId, amount: u128) {
 	<Balances as ReservableCurrency<AccountId>>::reserve(who, amount).unwrap();
+}
+
+pub fn lock(who: &AccountId, amount: u128) {
+	<Balances as LockableCurrency<AccountId>>::set_lock(
+		*b"testlock",
+		who,
+		amount,
+		WithdrawReasons::all(),
+	);
 }
 
 pub fn free(who: &AccountId) -> u128 {

@@ -16,20 +16,17 @@
 //! Accounts stage, receiving side: integrates the account payloads the relay chain burned.
 //!
 //! Each account is minted whole and its non-liquid parts re-established as holds, one per
-//! [`PortableHoldReason`], through the regular fungible APIs — so refcounts and events are
+//! [`PortableHoldReason`], through the regular fungible APIs, so refcounts and events are
 //! indistinguishable from locally created state. A bad account is rolled back and parked in
-//! `FailedAccounts` without failing the batch: the migration cannot stop mid-run to deal with
-//! it, and the parked entry is what makes it recoverable afterwards.
-//!
-//! The call that carries a batch over XCM is the stage machine's; [`AccountsReceiver::receive`]
-//! is what it invokes.
+//! `FailedAccounts`; the rest of the batch continues.
 
 #[cfg(test)]
 mod tests;
 
-use crate::{Config, CtMintedTotal, Event, FailedAccounts, HoldReason, Pallet, LOG_TARGET};
+use crate::{
+	BalanceOf, Config, CtMintedTotal, Event, FailedAccounts, HoldReason, Pallet, LOG_TARGET,
+};
 use alloc::vec::Vec;
-use core::marker::PhantomData;
 use frame_support::{
 	defensive_assert,
 	traits::{
@@ -40,39 +37,21 @@ use frame_support::{
 use migrator_types::PortableAccount;
 use sp_runtime::{traits::Zero, DispatchError, Saturating};
 
-pub use crate::BalanceOf;
 pub type PortableAccountOf<T> =
 	PortableAccount<<T as frame_system::Config>::AccountId, BalanceOf<T>>;
 
-/// Why an account could not be integrated. The caller rolls the account back and parks it.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Error {
-	/// Minting the balance or placing one of its holds failed.
-	FailedToProcessAccount,
-}
-
-impl From<Error> for DispatchError {
-	fn from(e: Error) -> Self {
-		DispatchError::Other(match e {
-			Error::FailedToProcessAccount => "FailedToProcessAccount",
-		})
-	}
-}
-
-pub struct AccountsReceiver<T>(PhantomData<T>);
-
-impl<T: Config> AccountsReceiver<T> {
+impl<T: Config> Pallet<T> {
 	/// Integrate a batch of migrated accounts.
 	///
 	/// Every account is processed in a transaction of its own: one that fails is rolled back and
 	/// parked in `FailedAccounts`, the rest of the batch continues. Successful mints accrue to
 	/// `CtMintedTotal`.
 	// TODO(ahm-v2): `receive_accounts` (call index 4, root) invokes this.
-	pub fn receive(accounts: Vec<PortableAccountOf<T>>) {
+	pub fn do_receive_accounts(accounts: Vec<PortableAccountOf<T>>) {
 		let mut minted: BalanceOf<T> = Zero::zero();
-		let (count_good, count_bad) = Pallet::<T>::receive_batch(
+		let (count_good, count_bad) = Self::receive_batch(
 			accounts,
-			Self::receive_account,
+			Self::do_receive_account,
 			|amount| minted = minted.saturating_add(amount),
 			|account, e| {
 				log::error!(
@@ -86,7 +65,7 @@ impl<T: Config> AccountsReceiver<T> {
 		if !minted.is_zero() {
 			CtMintedTotal::<T>::mutate(|t| *t = t.saturating_add(minted));
 		}
-		Pallet::<T>::deposit_event(Event::AccountsReceived { count_good, count_bad });
+		Self::deposit_event(Event::AccountsReceived { count_good, count_bad });
 	}
 
 	/// Mint one account and place its holds. Returns the amount minted.
@@ -95,7 +74,7 @@ impl<T: Config> AccountsReceiver<T> {
 	/// the free balance cannot cover stays free with it. The owning pallet takes its deposit at
 	/// this chain's rates out of the free balance later, so a short hold surfaces only as a
 	/// shortfall on release.
-	fn receive_account(account: &PortableAccountOf<T>) -> Result<BalanceOf<T>, DispatchError> {
+	fn do_receive_account(account: &PortableAccountOf<T>) -> Result<BalanceOf<T>, DispatchError> {
 		let who = &account.who;
 		let held: BalanceOf<T> = account
 			.holds
@@ -103,8 +82,7 @@ impl<T: Config> AccountsReceiver<T> {
 			.fold(Zero::zero(), |acc: BalanceOf<T>, hold| acc.saturating_add(hold.amount));
 		let total = account.free.saturating_add(held);
 
-		let minted = <T as Config>::Currency::mint_into(who, total)
-			.map_err(|_| Error::FailedToProcessAccount)?;
+		let minted = <T as Config>::Currency::mint_into(who, total)?;
 		defensive_assert!(minted == total, "minted what the relay chain burned");
 
 		for hold in &account.holds {
@@ -118,8 +96,7 @@ impl<T: Config> AccountsReceiver<T> {
 				continue;
 			}
 			let reason: T::RuntimeHoldReason = HoldReason::from(hold.reason).into();
-			<T as Config>::Currency::hold(&reason, who, amount)
-				.map_err(|_| Error::FailedToProcessAccount)?;
+			<T as Config>::Currency::hold(&reason, who, amount)?;
 		}
 
 		Ok(minted)
@@ -127,10 +104,6 @@ impl<T: Config> AccountsReceiver<T> {
 
 	/// Release `min(wanted, actually-held)` of `who`'s migrated hold under `reason` to free
 	/// balance, returning `(released, shortfall)`.
-	///
-	/// The reconciliation rule of the whole receiving side: recorded deposits are honoured up to
-	/// what actually arrived held, and the difference is the caller's to park under its own key.
-	/// One implementation so every deposit kind reconciles identically.
 	pub fn release_migrated_deposit(
 		reason: HoldReason,
 		who: &T::AccountId,

@@ -31,10 +31,12 @@
 #![cfg_attr(not(feature = "std"), no_std)]
 
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
-use frame_support::{traits::ConstU32, BoundedVec};
 use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use scale_info::TypeInfo;
-use sp_runtime::{traits::AccountIdConversion, AccountId32};
+use sp_runtime::{
+	traits::{AccountIdConversion, ConstU32},
+	AccountId32, BoundedVec,
+};
 
 /// Sovereign account of `para_id` as seen from a sibling parachain (`sibl` + para id).
 ///
@@ -70,14 +72,13 @@ pub fn translate_destination(who: &AccountId32) -> AccountId32 {
 	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
 )]
 pub struct PortableAccount<AccountId, Balance> {
-	/// The account address. Sent verbatim; no account-id translation happens for regular
-	/// accounts.
+	/// The account address on the receiving chain; see [`translate_destination`].
 	pub who: AccountId,
 	/// Balance that stays liquid on the receiving chain.
 	pub free: Balance,
 	/// Balance that was not liquid on the relay chain; re-established as holds on the receiving
-	/// chain, one per entry, translated via `From<PortableHoldReason>`.
-	pub holds: BoundedVec<PortableHold<Balance>, ConstU32<5>>,
+	/// chain, at most one per [`PortableHoldReason`].
+	pub holds: BoundedVec<PortableHold<Balance>, ConstU32<4>>,
 }
 
 /// One non-liquid part of a migrated account's balance.

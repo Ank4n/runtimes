@@ -51,10 +51,9 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type AhExistentialDeposit = AhExistentialDeposit;
 }
 
-/// Which proxy permissions travel to the Coretime chain in the migration. The portable set is
-/// the same on both networks: it is a property of what the destination can represent, not of the
-/// source. Kusama's extra variants (`Society`, `Spokesperson`) return `Err` like `Governance` and
-/// `Staking`, and their definitions stay on this chain.
+/// Which proxy permissions travel to the Coretime chain in the migration. Permissions with no
+/// meaning there (staking, governance, society, …) return `Err` and their definitions stay on
+/// this chain.
 impl TryFrom<TransparentProxyType> for PortableProxyType {
 	type Error = ();
 

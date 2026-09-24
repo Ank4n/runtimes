@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 codec = { workspace = true, features = ["max-encoded-len"] }
-frame-support = { workspace = true }
 polkadot-parachain-primitives = { workspace = true }
 scale-info = { workspace = true, features = ["derive"] }
 sp-runtime = { workspace = true }
@@ -18,7 +17,6 @@ sp-runtime = { workspace = true }
 default = ["std"]
 std = [
 	"codec/std",
-	"frame-support/std",
 	"polkadot-parachain-primitives/std",
 	"scale-info/std",
 	"sp-runtime/std",

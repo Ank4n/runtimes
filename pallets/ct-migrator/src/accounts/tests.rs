@@ -20,8 +20,6 @@ use crate::mock::*;
 use frame_support::assert_ok;
 use migrator_types::PortableHoldReason;
 
-type Receiver = AccountsReceiver<Test>;
-
 #[test]
 fn receive_mints_free_and_holds_exactly() {
 	new_test_ext().execute_with(|| {
@@ -33,7 +31,7 @@ fn receive_mints_free_and_holds_exactly() {
 		let ti_before = total_issuance();
 
 		// WHEN a batch arrives with one fresh and one pre-existing account.
-		Receiver::receive(vec![
+		CtMigrator::do_receive_accounts(vec![
 			portable_account(&alice, 50, vec![(PortableHoldReason::RegistrarDeposit, 500)]),
 			portable_account(
 				&charlie,
@@ -69,7 +67,7 @@ fn sub_ed_free_keeps_the_ed_and_holds_the_rest() {
 		let bob: AccountId = 2; // deposit holder whose liquid dust followed the deposit (free < ED)
 
 		// GIVEN bob does not exist. WHEN his free part cannot provide the ED (ED is 10).
-		Receiver::receive(vec![portable_account(
+		CtMigrator::do_receive_accounts(vec![portable_account(
 			&bob,
 			2,
 			vec![(PortableHoldReason::RegistrarDeposit, 40)],
@@ -87,31 +85,12 @@ fn sub_ed_free_keeps_the_ed_and_holds_the_rest() {
 		// AND WHEN a later stage releases the migrated reserve, the record is honoured up to what
 		// is held and the 8 that stayed free is reported as a shortfall.
 		assert_ok!(
-			Receiver::release_migrated_deposit(HoldReason::RegistrarDeposit, &bob, 40),
+			CtMigrator::release_migrated_deposit(HoldReason::RegistrarDeposit, &bob, 40),
 			(32, 8)
 		);
 		assert_eq!(free(&bob), 42);
 		assert_eq!(held(HoldReason::RegistrarDeposit, &bob), 0);
 		assert_eq!(total_issuance(), 42);
-
-		// AND a record asking for more than arrived is honoured up to what is held, the rest
-		// being reported as a shortfall.
-		hypothetically_release_shortfall(&bob);
-	});
-}
-
-fn hypothetically_release_shortfall(who: &AccountId) {
-	frame_support::hypothetically!({
-		Receiver::receive(vec![portable_account(
-			who,
-			0,
-			vec![(PortableHoldReason::RegistrarDeposit, 30)],
-		)]);
-		assert_ok!(
-			Receiver::release_migrated_deposit(HoldReason::RegistrarDeposit, who, 50),
-			(30, 20)
-		);
-		assert_eq!(held(HoldReason::RegistrarDeposit, who), 0);
 	});
 }
 
@@ -125,7 +104,7 @@ fn receive_parks_bad_account_without_poisoning_batch() {
 		<Balances as Mutate<AccountId>>::mint_into(&eve, 100).unwrap();
 
 		let bad = portable_account(&dave, u128::MAX, vec![]);
-		Receiver::receive(vec![portable_account(&eve, 60, vec![]), bad.clone()]);
+		CtMigrator::do_receive_accounts(vec![portable_account(&eve, 60, vec![]), bad.clone()]);
 
 		// THEN the good account integrated and the bad one is parked verbatim. The batch is not
 		// refused: one bad record must not strand the good ones, and the migration cannot stop

@@ -185,11 +185,8 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type Manager<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
-	/// Accounts that failed to integrate, parked verbatim for recovery after the migration.
-	///
-	/// A batch never fails on a single bad account: it is rolled back, stored here, and the rest
-	/// of the batch continues. Each entry is balance the relay chain burned and this chain never
-	/// minted, so this map is both the record of the gap and the data needed to close it.
+	/// Accounts that failed to integrate, parked verbatim for recovery after the migration. Each
+	/// entry is balance the relay chain burned and this chain never minted.
 	#[pallet::storage]
 	pub type FailedAccounts<T: Config> =
 		StorageMap<_, Twox64Concat, T::AccountId, PortableAccountOf<T>, OptionQuery>;
