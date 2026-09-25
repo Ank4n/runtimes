@@ -326,6 +326,31 @@ fn withdraw_routes_never_signed_any_delegators_wholly_to_ct() {
 			assert_eq!(w.ah, Some((multisigish, 400)));
 		});
 
+		// A never-signed Any delegator whose definition carries no deposit (seen on chain) is
+		// still a pure: everything goes to the Coretime chain as free balance.
+		hypothetically!({
+			let depositless = acc(34);
+			fund(&depositless, 544);
+			pallet_proxy::Proxies::<Test>::insert(
+				&depositless,
+				(
+					BoundedVec::<_, MaxProxies>::truncate_from(vec![
+						pallet_proxy::ProxyDefinition {
+							delegate: delegate.clone(),
+							proxy_type: ProxyType::Any,
+							delay: 0,
+						},
+					]),
+					0,
+				),
+			);
+			Migrator::build_expected_reserves();
+			let w = withdraw(&depositless).expect("migrates");
+			assert!(ct_holds(&w).is_empty());
+			assert_eq!(w.ct.as_ref().unwrap().free, 544);
+			assert_eq!(w.ah, None);
+		});
+
 		// A signed delegator with an Any def is a regular account that happens to have a proxy.
 		hypothetically!({
 			let signer = acc(33);

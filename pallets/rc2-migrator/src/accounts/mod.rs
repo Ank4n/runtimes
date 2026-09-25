@@ -346,7 +346,7 @@ impl<T: Config> AccountsMigrator<T> {
 			.saturating_add(proxy_hold)
 			.saturating_add(unattributed);
 		let liquid = free.saturating_add(refunded);
-		let mut ct_free = if Self::is_pure_like(who, &info, &expected) {
+		let mut ct_free = if Self::is_pure_like(who, &info) {
 			liquid
 		} else if held.is_zero() {
 			0
@@ -418,17 +418,10 @@ impl<T: Config> AccountsMigrator<T> {
 	/// A delegator that never signed and grants a portable `Any` proxy: a pure proxy in all but
 	/// name, since a pure is always created with `Any` and one that never signed cannot have been
 	/// anything else. Its funds are reachable only through its delegate, so they follow the
-	/// delegate to the Coretime chain whole.
-	///
-	/// An `Any` definition is portable, so its deposit is indexed under
-	/// [`ExpectedReserve::proxy`]; accounts without one skip the `Proxies` read.
-	fn is_pure_like(
-		who: &T::AccountId,
-		info: &AccountInfoFor<T>,
-		expected: &ExpectedReserve,
-	) -> bool {
+	/// delegate to the Coretime chain whole. The deposit plays no part: a definition can carry
+	/// none.
+	fn is_pure_like(who: &T::AccountId, info: &AccountInfoFor<T>) -> bool {
 		info.nonce.is_zero() &&
-			!expected.proxy.is_zero() &&
 			pallet_proxy::Proxies::<T>::get(who).0.iter().any(|def| {
 				matches!(def.proxy_type.clone().try_into(), Ok(PortableProxyType::Any))
 			})
