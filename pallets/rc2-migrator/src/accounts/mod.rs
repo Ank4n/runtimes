@@ -13,29 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Accounts stage: withdraws account balances on the relay chain and routes the pieces to their
-//! destinations.
-//!
-//! Per account, the balance splits by destination:
-//! - reserved balance, up to what the registrar, HRMP and proxy pallets record as this account's
-//!   deposits, goes to the **Coretime chain** as holds, one per [`PortableHoldReason`];
-//! - a working buffer of free balance (`Config::CtFreeBuffer`) follows the deposits to Coretime;
-//! - all remaining free balance is **teleported to Asset Hub**.
-//!
-//! A delegator that never signed (`nonce == 0`) and grants an `Any` proxy is a keyless pure proxy
-//! in all but name. Its delegate keeps control only where the definitions are recreated (the
-//! Coretime chain), so all of its balance goes there.
-//!
-//! Nothing stays behind: reserve that no deposit record accounts for also travels to the Coretime
-//! chain, under its own hold reason. Accounts that a consumer reference forbids reaping (session
-//! key-holders) are drained to zero-balance shells.
-//!
-//! Para sovereign accounts are included: their child-sovereign id (`para…`) is translated to the
-//! sibling id (`sibl…`) that represents the same para on a parachain.
-//!
-//! [`AccountsMigrator::init`] runs once before the first block of withdrawals;
-//! [`AccountsMigrator::migrate_many`] runs once per block and returns what that block burned,
-//! ready to be shipped.
+#![doc = include_str!("accounts.md")]
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +30,7 @@ use frame_support::{
 	traits::{
 		fungible::{Inspect, Mutate},
 		tokens::{Fortitude, Precision, Preservation},
-		Get, ReservableCurrency, StorePreimage,
+		DefensiveTruncateFrom, Get, ReservableCurrency, StorePreimage,
 	},
 	BoundedVec, PalletId,
 };
@@ -66,8 +44,8 @@ use sp_runtime::{
 
 /// Maximum number of accounts processed per relay-chain block.
 ///
-/// Bounds the unbenchmarked work of one `on_initialize` here and of the resulting
-/// `receive_accounts` calls on the Coretime chain.
+/// Bounds the work of one `on_initialize` here and of the resulting `receive_accounts` calls on
+/// the Coretime chain.
 pub const MAX_ACCOUNTS_PER_BLOCK: u32 = 300;
 
 type NativeCurrency<T> = pallet_balances::Pallet<T>;
@@ -134,7 +112,6 @@ impl<T: Config> AccountsMigrator<T> {
 	///
 	/// Safe to run again after the stage is rewound: the index is rebuilt and a ledger that is
 	/// already seeded is left alone.
-	// TODO(ahm-v2): the `AccountsInit` arm of the stage machine runs this.
 	pub fn init() -> u32 {
 		// Before anything is measured: drop every preimage deposit, so accounts that hold one
 		// are not skipped by `can_migrate`.
@@ -215,9 +192,6 @@ impl<T: Config> AccountsMigrator<T> {
 	///
 	/// Each account is withdrawn in a storage transaction of its own, so one that cannot be
 	/// withdrawn cleanly is skipped whole, never half-withdrawn.
-	// TODO(ahm-v2): the `AccountsOngoing { last_key }` arm runs this once per block with `Manager`,
-	// then ships `BlockWithdrawals::ct` with `send_accounts` (100 accounts per XCM) and
-	// `BlockWithdrawals::ah` with `send_teleport` (40 per XCM).
 	pub fn migrate_many(
 		last_key: Option<T::AccountId>,
 		manager: Option<&T::AccountId>,
@@ -240,7 +214,8 @@ impl<T: Config> AccountsMigrator<T> {
 				},
 				Ok(None) => (),
 				Err(e) => {
-					log::warn!(target: LOG_TARGET, "Skipping account {who:?}: {e:?}");
+					defensive!("Error while migrating account");
+					log::error!(target: LOG_TARGET, "Skipping account {who:?}: {e:?}");
 					Pallet::<T>::deposit_event(Event::AccountSkipped { who: who.clone() });
 				},
 			}
@@ -311,8 +286,7 @@ impl<T: Config> AccountsMigrator<T> {
 		// still references this account (session keys being the known case) and the account
 		// record must survive. Its balance must not: drain it to a zero-balance shell. The
 		// fungible API keeps the ED for an account whose provider cannot be dropped, so the
-		// account data is written directly, with total issuance adjusted to match. Zero-balance
-		// consumer-referenced accounts already exist on chain, so this creates no new shape.
+		// account data is written directly, with total issuance adjusted to match.
 		let total = free.saturating_add(reserved);
 		if frame_system::Pallet::<T>::consumers(who) != 0 {
 			frame_system::Account::<T>::mutate(who, |a| {
@@ -402,7 +376,7 @@ impl<T: Config> AccountsMigrator<T> {
 			Some(PortableAccount {
 				who: dest.clone(),
 				free: ct_free,
-				holds: BoundedVec::truncate_from(holds),
+				holds: BoundedVec::defensive_truncate_from(holds),
 			})
 		};
 		let ah = (!ah_free.is_zero()).then_some((dest, ah_free));
@@ -461,9 +435,7 @@ impl<T: Config> AccountsMigrator<T> {
 	}
 
 	/// Whether `who` is an account class the migration never touches: pallet (module) accounts,
-	/// whose pots the `Sweep` stage empties. Child sovereigns (`para`) are migrated, translated
-	/// to their sibling id. Sibling-format accounts migrate untranslated: on a parachain the same
-	/// bytes are that para's sovereign.
+	/// whose pots the `Sweep` stage empties.
 	pub(crate) fn is_unmigrated(who: &T::AccountId) -> bool {
 		let bytes: &[u8] = who.as_ref();
 		bytes.starts_with(&<PalletId as TypeId>::TYPE_ID)

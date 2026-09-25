@@ -18,17 +18,24 @@
 //! The stage's contract: every account on this chain is withdrawn whole, its reserve attributed
 //! against the owning pallets' records, and the pieces routed to the Coretime chain or Asset Hub
 //! with the conservation ledger (`RcMigratedBalance`) exact after every block. The tests pin that
-//! contract with exact values; the counterpart chains appear only as the returned payloads.
+//! contract with exact values; the counterpart chains appear only as the returned payloads and the
+//! messages sent to them.
 
 use super::*;
-use crate::{mock::*, ExpectedReserves, RcMigratedBalance};
+use crate::{
+	mock::*, CtMigratorCall, CtRuntimeCall, Event, ExpectedReserves, Manager, MigrationStage,
+	RcMigratedBalance, RcMigrationStage, MAX_ACCOUNTS_PER_XCM,
+};
 use frame_support::{assert_ok, hypothetically, weights::Weight};
 use sp_runtime::{
 	testing::H256,
 	traits::{BlakeTwo256, Hash},
+	AccountId32,
 };
+use xcm::prelude::*;
 
 type Migrator = AccountsMigrator<Test>;
+type Stage = MigrationStage<AccountId, u64, u64>;
 
 fn withdraw(who: &AccountId32) -> Option<Withdrawal> {
 	let info = frame_system::Account::<Test>::get(who);
@@ -487,12 +494,8 @@ fn migrate_many_returns_exactly_what_it_burns_and_keeps_the_ledger_exact() {
 fn migrate_many_stops_at_the_per_block_limit_and_resumes_from_the_cursor() {
 	new_test_ext().execute_with(|| {
 		// GIVEN more accounts than one block may process.
-		let count = MAX_ACCOUNTS_PER_BLOCK + 20;
-		for i in 0..count {
-			let mut bytes = [0u8; 32];
-			bytes[..4].copy_from_slice(&i.to_le_bytes());
-			bytes[4] = 0xAA;
-			fund(&AccountId32::new(bytes), 1_000);
+		for who in many_accounts(MAX_ACCOUNTS_PER_BLOCK + 20) {
+			fund(&who, 1_000);
 		}
 		let ti_before = total_issuance();
 		Migrator::init();
@@ -538,5 +541,224 @@ fn migrate_many_leaves_kept_accounts_in_place_and_out_of_the_payloads() {
 		assert_eq!(free(&pot()), 300);
 		assert_eq!(total_issuance(), ti_before - 1_000);
 		assert_eq!(RcMigratedBalance::<Test>::get().kept, 800);
+	});
+}
+
+// ---------------------------------------------------------------------------
+// Stage machine: init, shipping, retry
+// ---------------------------------------------------------------------------
+
+fn assert_stage(expected: Stage) {
+	assert_eq!(RcMigrationStage::<Test>::get(), expected);
+}
+
+fn ct_dest() -> Location {
+	Location::new(0, [Parachain(CT_PARA_ID)])
+}
+
+fn ah_dest() -> Location {
+	Location::new(0, [Parachain(AH_PARA_ID)])
+}
+
+/// The `DepositAsset` beneficiaries of a teleport message, in order.
+fn teleported(message: &Xcm<()>) -> Vec<(AccountId, u128)> {
+	message
+		.0
+		.iter()
+		.filter_map(|instruction| match instruction {
+			DepositAsset { assets: AssetFilter::Definite(assets), beneficiary } => {
+				let [Asset { fun: Fungibility::Fungible(amount), .. }] = assets.inner().as_slice()
+				else {
+					panic!("one asset per deposit");
+				};
+				let [Junction::AccountId32 { id, .. }] = beneficiary.interior().as_slice() else {
+					panic!("beneficiary is a local account");
+				};
+				Some((AccountId32::new(*id), *amount))
+			},
+			_ => None,
+		})
+		.collect()
+}
+
+/// `n` accounts that sort nowhere near the `acc(_)` ones.
+fn many_accounts(n: u32) -> Vec<AccountId> {
+	(0..n)
+		.map(|i| {
+			let mut bytes = [0u8; 32];
+			bytes[..4].copy_from_slice(&i.to_le_bytes());
+			bytes[4] = 0xAA;
+			AccountId32::new(bytes)
+		})
+		.collect()
+}
+
+#[test]
+fn the_stage_ships_each_withdrawal_to_coretime_and_asset_hub() {
+	new_test_ext().execute_with(|| {
+		// GIVEN a parachain manager and the migration manager.
+		let alice = acc(1); // parachain manager, cleanly migrating
+		let manager = acc(20); // drives the migration; must stay
+		fund(&alice, 1_000);
+		fund(&manager, 500);
+		register_para(2000, &alice); // free 700, reserved 300
+		Manager::<Test>::put(&manager);
+		let ti_before = total_issuance();
+		RcMigrationStage::<Test>::put(Stage::AccountsInit);
+
+		// WHEN the init block runs.
+		run_blocks(1);
+
+		// THEN the reserves are indexed and the ledger seeded, and nothing is sent yet.
+		assert_stage(Stage::AccountsOngoing { last_key: None });
+		assert_eq!(ExpectedReserves::<Test>::get(&alice).registrar, 300);
+		assert_eq!(RcMigratedBalance::<Test>::get().kept, ti_before);
+		assert!(sent().is_empty());
+
+		// WHEN the next block runs.
+		run_blocks(1);
+
+		// THEN the account space is exhausted in one block, and the deposit with its buffer goes
+		// to the Coretime chain and the rest to Asset Hub.
+		assert_stage(Stage::AccountsDone);
+		assert_eq!(sent().len(), 2);
+		assert_eq!(sent()[0].0, ct_dest());
+		assert_eq!(
+			sent_call(0),
+			CtRuntimeCall::CtMigrator(CtMigratorCall::ReceiveAccounts {
+				accounts: vec![PortableAccount {
+					who: alice.clone(),
+					free: 100,
+					holds: vec![PortableHold {
+						reason: PortableHoldReason::RegistrarDeposit,
+						amount: 300
+					}]
+					.try_into()
+					.unwrap(),
+				}]
+			})
+		);
+		let native = |amount: u128| Asset {
+			id: AssetId(Location::parent()),
+			fun: Fungibility::Fungible(amount),
+		};
+		assert_eq!(
+			sent()[1],
+			(
+				ah_dest(),
+				Xcm(vec![
+					UnpaidExecution { weight_limit: WeightLimit::Unlimited, check_origin: None },
+					ReceiveTeleportedAsset(native(600).into()),
+					DepositAsset {
+						assets: AssetFilter::Definite(native(600).into()),
+						beneficiary: Location::new(
+							0,
+							[Junction::AccountId32 { network: None, id: alice.clone().into() }],
+						),
+					},
+				])
+			)
+		);
+		assert_eq!(
+			migrator_events()
+				.into_iter()
+				.filter(|e| matches!(
+					e,
+					Event::AccountsBatchSent { .. } | Event::AccountsTeleported { .. }
+				))
+				.collect::<Vec<_>>(),
+			vec![
+				Event::AccountsBatchSent { count: 1 },
+				Event::AccountsTeleported { count: 1, amount: 600 },
+			]
+		);
+
+		// AND the manager is untouched, and the ledger accounts for every burned unit.
+		assert_eq!(free(&manager), 500);
+		assert_eq!(
+			RcMigratedBalance::<Test>::get(),
+			MigratedBalances {
+				kept: ti_before - 1_000,
+				ct_reserved: 300,
+				ct_free: 100,
+				ah_free: 600,
+				ti_corrected: 0,
+			}
+		);
+	});
+}
+
+#[test]
+fn a_block_ships_in_xcm_sized_chunks() {
+	new_test_ext().execute_with(|| {
+		// GIVEN more deposit holders than one Coretime message carries. Each has an unattributed
+		// reserve of 10, so each has a Coretime leg (10 held + 100 buffer) and an Asset Hub leg
+		// (890).
+		let count = MAX_ACCOUNTS_PER_XCM + 1;
+		for who in many_accounts(count) {
+			fund(&who, 1_000);
+			reserve(&who, 10);
+		}
+		RcMigrationStage::<Test>::put(Stage::AccountsInit);
+
+		// WHEN the stage runs to the end.
+		run_blocks(2);
+		assert_stage(Stage::AccountsDone);
+
+		// THEN the Coretime legs go in messages of `MAX_ACCOUNTS_PER_XCM`, then the Asset Hub legs
+		// in messages of `MAX_TELEPORTS_PER_XCM`.
+		let ct_sizes: Vec<usize> = (0..sent().len())
+			.filter(|&n| sent()[n].0 == ct_dest())
+			.map(|n| match sent_call(n) {
+				CtRuntimeCall::CtMigrator(CtMigratorCall::ReceiveAccounts { accounts }) =>
+					accounts.len(),
+				other => panic!("unexpected call {other:?}"),
+			})
+			.collect();
+		assert_eq!(ct_sizes, vec![100, 1]);
+		let ah_messages: Vec<_> =
+			sent().into_iter().filter(|(dest, _)| *dest == ah_dest()).collect();
+		let ah_sizes: Vec<usize> = ah_messages.iter().map(|(_, m)| teleported(m).len()).collect();
+		assert_eq!(ah_sizes, vec![40, 40, 21]);
+		assert!(ah_messages
+			.iter()
+			.flat_map(|(_, m)| teleported(m))
+			.all(|(_, amount)| amount == 890));
+		assert_eq!(frame_system::Account::<Test>::iter().count(), 0);
+	});
+}
+
+#[test]
+fn a_failed_send_rolls_the_block_back_and_retries_it() {
+	new_test_ext().execute_with(|| {
+		// GIVEN an initialised stage with one migrating account.
+		let alice = acc(1); // parachain manager
+		fund(&alice, 1_000);
+		register_para(2000, &alice); // free 700, reserved 300
+		RcMigrationStage::<Test>::put(Stage::AccountsInit);
+		run_blocks(1);
+		let ti_before = total_issuance();
+		let ledger_before = RcMigratedBalance::<Test>::get();
+
+		// WHEN a block runs and its sends fail.
+		SendFails::set(true);
+		run_blocks(1);
+
+		// THEN nothing moved: the account, the issuance, the ledger and the stage are as before.
+		assert_stage(Stage::AccountsOngoing { last_key: None });
+		assert_eq!((free(&alice), reserved(&alice)), (700, 300));
+		assert_eq!(total_issuance(), ti_before);
+		assert_eq!(RcMigratedBalance::<Test>::get(), ledger_before);
+		assert!(sent().is_empty());
+
+		// WHEN the next block runs with a working router.
+		SendFails::set(false);
+		run_blocks(1);
+
+		// THEN the same key range is migrated and shipped.
+		assert_stage(Stage::AccountsDone);
+		assert_eq!(sent().len(), 2);
+		assert!(!frame_system::Account::<Test>::contains_key(&alice));
+		assert_eq!(total_issuance(), ti_before - 1_000);
 	});
 }

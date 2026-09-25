@@ -89,7 +89,9 @@ pub struct PortableAccount<AccountId, Balance> {
 	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
 )]
 pub struct PortableHold<Balance> {
+	/// Why the balance is held on the receiving chain.
 	pub reason: PortableHoldReason,
+	/// The held amount.
 	pub amount: Balance,
 }
 

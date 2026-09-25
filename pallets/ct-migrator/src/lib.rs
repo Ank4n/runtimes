@@ -306,6 +306,24 @@ pub mod pallet {
 			Self::deposit_event(Event::ManagerSet { old, new });
 			Ok(())
 		}
+
+		/// Receive a batch of accounts migrated from the Relay Chain.
+		///
+		/// Mints each account and places its holds; see [`Pallet::do_receive_accounts`].
+		// TODO(ahm-v2): proper benchmark
+		#[pallet::call_index(4)]
+		#[pallet::weight(
+			T::DbWeight::get().reads_writes(4, 4).saturating_mul(accounts.len() as u64)
+		)]
+		pub fn receive_accounts(
+			origin: OriginFor<T>,
+			accounts: Vec<PortableAccountOf<T>>,
+		) -> DispatchResult {
+			ensure_root(origin)?;
+
+			Self::do_receive_accounts(accounts);
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {

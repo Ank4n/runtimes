@@ -29,9 +29,14 @@ use frame_support::{parameter_types, traits::Equals};
 use frame_system::EnsureRoot;
 use migrator_types::PortableProxyType;
 use pallet_xcm::EnsureXcm;
-use polkadot_runtime_constants::currency::{EXISTENTIAL_DEPOSIT, UNITS};
+use polkadot_runtime_constants::{
+	currency::{EXISTENTIAL_DEPOSIT, UNITS},
+	system_parachain::ASSET_HUB_ID,
+};
 
 parameter_types! {
+	/// Para id of Asset Hub, where teleported free balances land.
+	pub const AhParaId: u32 = ASSET_HUB_ID;
 	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
 	pub const CtFreeBuffer: Balance = UNITS;
 	/// Asset Hub's existential deposit; mirrors
@@ -44,6 +49,7 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = XcmRouter;
 	type CtParaId = BrokerId;
+	type AhParaId = AhParaId;
 	type TimeProvider = Timestamp;
 	type CtOrigin = EnsureXcm<Equals<CoretimeLocation>>;
 	type AdminOrigin = EnsureRoot<AccountId>;
