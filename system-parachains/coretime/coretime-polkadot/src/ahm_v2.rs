@@ -31,6 +31,31 @@ impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeHoldReason = RuntimeHoldReason;
 }
 
+/// Contains all calls that are disabled while the migration writes the state they change: from the
+/// relay chain's start signal until it ends the lockdown. Everything reopens after.
+///
+/// Proxy definitions arrive from the relay chain and are merged into `pallet_proxy`, so every proxy
+/// call that changes the proxy map or an announcement is disabled. Using a proxy stays enabled.
+pub struct CallsDisabledDuringMigration;
+impl frame_support::traits::Contains<crate::RuntimeCall> for CallsDisabledDuringMigration {
+	fn contains(call: &crate::RuntimeCall) -> bool {
+		if !pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_ongoing() {
+			return false;
+		}
+		let disabled = match call {
+			crate::RuntimeCall::Proxy(
+				pallet_proxy::Call::proxy { .. } | pallet_proxy::Call::proxy_announced { .. },
+			) => false,
+			crate::RuntimeCall::Proxy(..) => true,
+			_ => false,
+		};
+		if disabled {
+			log::warn!("Call bounced by the filter during the migration: {call:?}");
+		}
+		disabled
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use crate::{AccountId, ProxyType, Runtime, RuntimeCall};

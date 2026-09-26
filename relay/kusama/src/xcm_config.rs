@@ -191,7 +191,6 @@ impl Contains<Location> for AssetHubPlurality {
 	}
 }
 
-/// The barriers one of which must be passed for an XCM message to be executed.
 /// Refuses every inbound message from the AHM v2 migration start on, and after it ends, except
 /// those from the Coretime chain and Asset Hub. Asset Hub carries this chain's governance. A
 /// message from any other chain could move value into an account the migration has drained.
@@ -214,6 +213,7 @@ impl DenyExecution for DenyOnceMigrationStarts {
 	}
 }
 
+/// The barriers one of which must be passed for an XCM message to be executed.
 pub type Barrier = TrailingSetTopicAsId<
 	DenyThenTry<
 		DenyOnceMigrationStarts,

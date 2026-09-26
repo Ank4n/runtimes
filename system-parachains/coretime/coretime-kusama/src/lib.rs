@@ -212,37 +212,11 @@ impl Contains<RuntimeCall> for IsFilteredBrokerCall {
 	}
 }
 
-/// Whether the AHM v2 migration is writing this chain's state: from the relay chain's start signal
-/// until it ends the lockdown. Constant `false` when the migrator is not compiled in.
+/// Calls the AHM v2 migration disables while it runs; none when the migrator is not compiled in.
 #[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
-fn ahm_v2_ongoing() -> bool {
-	pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_ongoing()
-}
+type CallsDisabledDuringMigration = ahm_v2::CallsDisabledDuringMigration;
 #[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
-fn ahm_v2_ongoing() -> bool {
-	false
-}
-
-/// Calls closed while the AHM v2 migration writes the state they change. Everything reopens when
-/// the relay chain ends the lockdown.
-///
-/// Proxy definitions arrive from the relay chain and are merged into `pallet_proxy`, so every proxy
-/// call that changes the proxy map or an announcement is closed. Using a proxy stays open.
-pub struct ClosedDuringAhmV2;
-impl Contains<RuntimeCall> for ClosedDuringAhmV2 {
-	fn contains(c: &RuntimeCall) -> bool {
-		if !ahm_v2_ongoing() {
-			return false;
-		}
-		match c {
-			RuntimeCall::Proxy(
-				pallet_proxy::Call::proxy { .. } | pallet_proxy::Call::proxy_announced { .. },
-			) => false,
-			RuntimeCall::Proxy(..) => true,
-			_ => false,
-		}
-	}
-}
+type CallsDisabledDuringMigration = frame_support::traits::Nothing;
 
 /// Implements [`pallet_broker::BlockToRelayHeightConversion`] for the migration to relay chain
 /// block numbers for the broker pallet.
@@ -268,7 +242,7 @@ impl pallet_broker::migration::v4::BlockToRelayHeightConversion<Runtime>
 // Configure FRAME pallets to include in runtime.
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig as frame_system::DefaultConfig)]
 impl frame_system::Config for Runtime {
-	type BaseCallFilter = EverythingBut<(IsFilteredBrokerCall, ClosedDuringAhmV2)>;
+	type BaseCallFilter = EverythingBut<(IsFilteredBrokerCall, CallsDisabledDuringMigration)>;
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;
 	/// The nonce type for storing how many extrinsics an account has signed.
