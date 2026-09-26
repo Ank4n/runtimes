@@ -383,6 +383,10 @@ impl<T: Config> AccountsMigrator<T> {
 				holds: BoundedVec::defensive_truncate_from(holds),
 			})
 		};
+		// TODO(ahm-v2): Asset Hub's own relay sovereign (`para` + 1000) lands here on `sibl` +
+		// 1000, which nothing controls on Asset Hub. Teleport its free part to
+		// `SweepBeneficiary` instead (added by the sweep stage). Polkadot: 62.4 DOT,
+		// Kusama: 11.2 KSM.
 		let ah = (!ah_free.is_zero()).then_some((dest, ah_free));
 
 		Ok(Some(Withdrawal { ct, ah }))

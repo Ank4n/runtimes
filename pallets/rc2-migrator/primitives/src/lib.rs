@@ -57,9 +57,8 @@ where
 /// leaves the Relay Chain goes through here, so that a balance and the records that refer to it
 /// land on the same account.
 pub fn translate_destination(who: &AccountId32) -> AccountId32 {
-	// TODO(ahm-v2): a system para's sovereign (e.g. `para` + 1005 for Coretime) translates to
-	// `sibl` + its own id, which the destination chain cannot control when it is that para itself.
-	// Decide whether such accounts are excluded or routed elsewhere.
+	// TODO(ahm-v2): a system para's sovereign translates to `sibl` + its own id, which that para
+	// cannot control on its own chain. The accounts stage reroutes it; see `withdraw_account`.
 	match ParaId::try_from_account(who) {
 		Some(para_id) => sibling_account(para_id.into()),
 		None => who.clone(),
