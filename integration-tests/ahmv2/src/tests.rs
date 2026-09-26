@@ -20,10 +20,16 @@
 //! worker; on the default single-thread runtime, `tokio::join!`-ed loads would run one after the
 //! other.
 
-use crate::mock::*;
+use crate::{
+	checks::{
+		ah_checking_paid, AccountsChecker, AhMigrationCheck, CtMigrationCheck, RcMigrationCheck,
+		SanityChecks,
+	},
+	mock::*,
+};
 use codec::Encode;
-use cumulus_primitives_core::UpwardMessage;
-use frame_support::assert_ok;
+use cumulus_primitives_core::{AggregateMessageOrigin, InboundDownwardMessage, UpwardMessage};
+use frame_support::{assert_ok, traits::QueueFootprintQuery};
 use network::constants::{system_parachain, time::MINUTES};
 use pallet_message_queue::Event::{Processed, ProcessingFailed};
 use pallet_rc2_migrator::MigrationStage as RcStage;
@@ -197,21 +203,50 @@ fn run_handshake(rc: &mut TestExternalities, ct: &mut TestExternalities) -> Vec<
 	ump
 }
 
-/// The migration's stage machine, driven end to end over live relay-chain and Coretime state.
+type RcChecks = (SanityChecks, AccountsChecker);
+type CtChecks = (SanityChecks, AccountsChecker);
+type AhChecks = (SanityChecks, AccountsChecker);
+
+/// Deliver `dmp` to parachain `P` and run one of its blocks.
+fn deliver<P: Para>(ext: &mut TestExternalities, dmp: Vec<InboundDownwardMessage>) {
+	ext.execute_with(|| {
+		enqueue_dmp::<P>(dmp);
+		next_block_para::<P>();
+	});
+}
+
+/// Run blocks on parachain `P` until its downward queue has nothing left to process. Pages that
+/// only hold overweight messages stay, but are not processed again.
+fn drain_dmp<P: Para>(ext: &mut TestExternalities) {
+	ext.execute_with(|| {
+		for _ in 0..100 {
+			let queue = pallet_message_queue::Pallet::<P::Runtime>::footprint(
+				AggregateMessageOrigin::Parent,
+			);
+			if queue.ready_pages == 0 {
+				return;
+			}
+			next_block_para::<P>();
+		}
+		panic!("{}'s downward queue did not drain", P::CHAIN.name());
+	});
+}
+
+/// The migration, driven end to end over live Relay Chain, Coretime and Asset Hub state, with the
+/// checks of every stage run before and after.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_migration_runs_to_completion() {
-	let (mut rc, mut ct) = tokio::join!(load(Chain::Relay), load(CoretimePara::CHAIN));
+	let (mut rc, mut ct, mut ah) =
+		tokio::join!(load(Chain::Relay), load(CoretimePara::CHAIN), load(AssetHubPara::CHAIN));
 
-	let rc_issuance_before =
-		rc.execute_with(pallet_balances::Pallet::<network::relay::Runtime>::total_issuance);
-	let ct_issuance_before =
-		ct.execute_with(pallet_balances::Pallet::<network::ct::Runtime>::total_issuance);
+	let rc_pre = rc.execute_with(<RcChecks as RcMigrationCheck>::pre_check);
+	let ct_pre = ct.execute_with(|| <CtChecks as CtMigrationCheck>::pre_check(rc_pre.clone()));
+	let ah_pre = ah.execute_with(|| <AhChecks as AhMigrationCheck>::pre_check(rc_pre.clone()));
 
 	let ump = run_handshake(&mut rc, &mut ct);
 
-	// The answer admits the machine to the warm-up, then through every data stage and the
-	// verification window to the finish.
-	let dmp = rc.execute_with(|| {
+	// The answer admits the machine to the warm-up, and the warm-up to the data stages.
+	let max_blocks = rc.execute_with(|| {
 		enqueue_ump(CoretimePara::PARA_ID.into(), ump);
 		next_block_rc();
 
@@ -225,51 +260,63 @@ async fn the_migration_runs_to_completion() {
 		next_block_rc();
 		assert_eq!(rc_stage(), RcStage::AccountsInit, "the warm-up did not open the data stages");
 
-		// The data stages walk one block each and carry nothing yet, so the only message sent so
-		// far is the start signal already taken above.
-		let mut blocks = 0;
-		let end_at = loop {
-			if let RcStage::CoolOff { end_at } = rc_stage() {
-				break end_at;
-			}
-			assert!(
-				// 15 data stages that is not doing anything currently, so 30 blocks is enough
-				blocks < 30,
-				"the data stages did not reach the cool-off: {:?}",
-				rc_stage()
-			);
+		// One block per data stage, plus one per batch of accounts.
+		let accounts = frame_system::Account::<network::relay::Runtime>::iter().count() as u32;
+		accounts / pallet_rc2_migrator::accounts::MAX_ACCOUNTS_PER_BLOCK + 30
+	});
+
+	// The data stages run until the verification window opens, each block's messages delivered as
+	// they are sent.
+	let mut blocks = 0;
+	let cool_off_end = loop {
+		let (ct_dmp, ah_dmp, stage) = rc.execute_with(|| {
 			next_block_rc();
-			blocks += 1;
-		};
-		assert!(
-			take_dmp(CoretimePara::PARA_ID.into()).is_empty(),
-			"a data stage sent something before being filled in"
-		);
-		set_block_number_rc(end_at - 1);
+			(
+				take_dmp(CoretimePara::PARA_ID.into()),
+				take_dmp(AssetHubPara::PARA_ID.into()),
+				rc_stage(),
+			)
+		});
+		deliver::<CoretimePara>(&mut ct, ct_dmp);
+		deliver::<AssetHubPara>(&mut ah, ah_dmp);
+		if let RcStage::CoolOff { end_at } = stage {
+			break end_at;
+		}
+		blocks += 1;
+		assert!(blocks < max_blocks, "the data stages did not reach the cool-off: {stage:?}");
+	};
+	drain_dmp::<CoretimePara>(&mut ct);
+	drain_dmp::<AssetHubPara>(&mut ah);
+
+	// The verification window elapses and the finish signal reaches the Coretime chain.
+	let dmp = rc.execute_with(|| {
+		set_block_number_rc(cool_off_end - 1);
 		next_block_rc();
 		assert_eq!(rc_stage(), RcStage::MigrationDone);
 		take_dmp(CoretimePara::PARA_ID.into())
 	});
 	assert!(!dmp.is_empty(), "the relay chain queued no finish signal");
+	deliver::<CoretimePara>(&mut ct, dmp);
 
+	rc.execute_with(|| <RcChecks as RcMigrationCheck>::post_check(rc_pre.clone()));
+	ct.execute_with(|| <CtChecks as CtMigrationCheck>::post_check(rc_pre.clone(), ct_pre));
+	ah.execute_with(|| <AhChecks as AhMigrationCheck>::post_check(rc_pre, ah_pre.clone()));
+
+	// Every unit the Relay Chain burned arrived on the chain its ledger says it went to.
+	let ledger =
+		rc.execute_with(pallet_rc2_migrator::RcMigratedBalance::<network::relay::Runtime>::get);
 	ct.execute_with(|| {
-		enqueue_dmp::<CoretimePara>(dmp);
-		next_block_para::<CoretimePara>();
-		assert_eq!(ct_stage(), pallet_ct_migrator::MigrationStage::MigrationDone);
-
-		// Nothing was migrated, so nothing was minted here.
 		assert_eq!(
-			pallet_balances::Pallet::<network::ct::Runtime>::total_issuance(),
-			ct_issuance_before,
-			"a migration with no data stages must not change Coretime issuance"
+			pallet_ct_migrator::CtMintedTotal::<network::ct::Runtime>::get(),
+			ledger.ct_reserved + ledger.ct_free,
+			"Coretime minted a different amount than the Relay Chain sent"
 		);
 	});
-
-	rc.execute_with(|| {
+	ah.execute_with(|| {
 		assert_eq!(
-			pallet_balances::Pallet::<network::relay::Runtime>::total_issuance(),
-			rc_issuance_before,
-			"a migration with no data stages must not change relay-chain issuance"
+			ah_checking_paid(&ah_pre.1),
+			ledger.ah_free,
+			"Asset Hub received a different amount than the Relay Chain teleported"
 		);
 	});
 }
@@ -363,4 +410,17 @@ fn rc_stage() -> pallet_rc2_migrator::MigrationStageOf<network::relay::Runtime> 
 
 fn ct_stage() -> pallet_ct_migrator::MigrationStage {
 	pallet_ct_migrator::CtMigrationStage::<network::ct::Runtime>::get()
+}
+
+/// The relay chain's copy of Asset Hub's existential deposit, which decides where sub-ED dust goes,
+/// matches Asset Hub's own.
+#[test]
+fn the_relay_chain_knows_asset_hubs_existential_deposit() {
+	use frame_support::traits::Get;
+	assert_eq!(
+		<<network::relay::Runtime as pallet_rc2_migrator::Config>::AhExistentialDeposit as Get<
+			u128,
+		>>::get(),
+		<<network::ah::Runtime as pallet_balances::Config>::ExistentialDeposit as Get<u128>>::get(),
+	);
 }

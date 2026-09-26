@@ -33,7 +33,10 @@
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use polkadot_parachain_primitives::primitives::{Id as ParaId, Sibling};
 use scale_info::TypeInfo;
-use sp_runtime::{traits::AccountIdConversion, AccountId32};
+use sp_runtime::{
+	traits::{AccountIdConversion, ConstU32},
+	AccountId32, BoundedVec,
+};
 
 /// Sovereign account of `para_id` as seen from a sibling parachain (`sibl` + para id).
 ///
@@ -54,10 +57,41 @@ where
 /// leaves the Relay Chain goes through here, so that a balance and the records that refer to it
 /// land on the same account.
 pub fn translate_destination(who: &AccountId32) -> AccountId32 {
+	// TODO(ahm-v2): a system para's sovereign translates to `sibl` + its own id, which that para
+	// cannot control on its own chain. The accounts stage reroutes it; see `withdraw_account`.
 	match ParaId::try_from_account(who) {
 		Some(para_id) => sibling_account(para_id.into()),
 		None => who.clone(),
 	}
+}
+
+/// Account balance payload in portable format.
+///
+/// The relay chain withdraws an account into this shape and the receiving chain integrates it
+/// through its regular fungible APIs, so refcounts and events are indistinguishable from locally
+/// created state.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableAccount<AccountId, Balance> {
+	/// The account address on the receiving chain; see [`translate_destination`].
+	pub who: AccountId,
+	/// Balance that stays liquid on the receiving chain.
+	pub free: Balance,
+	/// Balance that was not liquid on the relay chain; re-established as holds on the receiving
+	/// chain, at most one per [`PortableHoldReason`].
+	pub holds: BoundedVec<PortableHold<Balance>, ConstU32<4>>,
+}
+
+/// One non-liquid part of a migrated account's balance.
+#[derive(
+	Encode, Decode, DecodeWithMemTracking, Clone, PartialEq, Eq, Debug, TypeInfo, MaxEncodedLen,
+)]
+pub struct PortableHold<Balance> {
+	/// Why the balance is held on the receiving chain.
+	pub reason: PortableHoldReason,
+	/// The held amount.
+	pub amount: Balance,
 }
 
 /// Relay Chain reserve, classified for the receiving chain.

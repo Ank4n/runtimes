@@ -662,11 +662,11 @@ fn the_machine_runs_from_pending_to_done() {
 		assert_stage(Stage::WarmUp { end_at: warm_up_end });
 
 		// WHEN the warm-up elapses. THEN the data stages run, one block each, and nothing is sent
-		// because none of them carries data yet.
+		// because this chain holds no accounts and the later stages carry no data yet.
 		run_blocks(WARM_UP);
 		assert_stage(Stage::AccountsInit);
 		run_blocks(data_stage_blocks());
-		assert_eq!(sent().len(), 1, "no data stage may send before it is filled in");
+		assert_eq!(sent().len(), 1, "a chain without data sends no data");
 
 		// THEN the verification window opens.
 		let end_at = System::block_number() + COOL_OFF;
