@@ -26,9 +26,15 @@ use polkadot_runtime::{
 };
 use polkadot_runtime_common::{crowdloan, paras_registrar};
 use polkadot_runtime_constants::{
-	currency::UNITS, proxy::ProxyType, system_parachain::ASSET_HUB_ID,
+	currency::UNITS,
+	proxy::ProxyType,
+	system_parachain::{ASSET_HUB_ID, BRIDGE_HUB_ID, BROKER_ID},
 };
-use runtime_parachains::{hrmp, on_demand};
+use runtime_parachains::{
+	hrmp,
+	inclusion::{AggregateMessageOrigin, UmpQueueId},
+	on_demand,
+};
 use sp_io::TestExternalities;
 use xcm::latest::prelude::*;
 use xcm_executor::XcmExecutor;
@@ -183,10 +189,25 @@ fn a_paused_migration_keeps_the_filter_closed() {
 	});
 }
 
-/// The filter is a list, not a mode: a call it does not name is unaffected at every stage.
+/// Replaying an inbound message would run XCM from a chain the barrier now refuses.
 #[test]
-fn calls_the_migration_does_not_name_are_untouched() {
-	assert_never_closes(RuntimeCall::System(frame_system::Call::remark { remark: vec![1, 2, 3] }));
+fn replaying_inbound_messages_closes_when_the_migration_starts() {
+	assert_closes_at_migration_start(RuntimeCall::MessageQueue(
+		pallet_message_queue::Call::execute_overweight {
+			message_origin: AggregateMessageOrigin::Ump(UmpQueueId::Para(2000.into())),
+			page: 0,
+			index: 0,
+			weight_limit: Weight::zero(),
+		},
+	));
+}
+
+/// Calls the migration leaves open are unaffected at every stage.
+#[test]
+fn calls_the_migration_leaves_open_are_untouched() {
+	let remark = RuntimeCall::System(frame_system::Call::remark { remark: vec![1, 2, 3] });
+	assert_never_closes(remark.clone());
+	assert_never_closes(RuntimeCall::Utility(pallet_utility::Call::batch { calls: vec![remark] }));
 }
 
 /// The executor's teleport trust, which a call filter cannot cover: an inbound
@@ -234,5 +255,67 @@ fn teleports_are_refused_once_the_migration_starts() {
 			XcmError::UntrustedTeleportLocation,
 			"teleport must be refused as untrusted at {stage:?}"
 		);
+	}
+}
+
+/// Execute `message` as if it arrived from `origin`, returning the error it stopped with.
+fn execute_from(
+	stage: &Stage,
+	origin: Location,
+	message: Xcm<RuntimeCall>,
+) -> Result<(), XcmError> {
+	TestExternalities::default().execute_with(|| {
+		RcMigrationStage::<Runtime>::put(stage.clone());
+		let weight = Weight::from_parts(10_000_000_000, 1_000_000);
+		XcmExecutor::<XcmConfig>::prepare_and_execute(
+			origin,
+			message,
+			&mut [0u8; 32],
+			weight,
+			weight,
+		)
+		.ensure_complete()
+		.map_err(|e| e.error)
+	})
+}
+
+/// A message a system chain may send for free.
+fn unpaid() -> Xcm<RuntimeCall> {
+	Xcm(vec![UnpaidExecution { weight_limit: Unlimited, check_origin: None }, ClearOrigin])
+}
+
+/// A message any chain may send if it pays: it would move its sovereign's balance to Alice.
+fn paid() -> Xcm<RuntimeCall> {
+	Xcm(vec![
+		WithdrawAsset((Here, UNITS).into()),
+		BuyExecution { fees: (Here, UNITS).into(), weight_limit: Unlimited },
+		DepositAsset {
+			assets: AllCounted(1).into(),
+			beneficiary: Location::new(0, [AccountId32 { network: None, id: ALICE.into() }]),
+		},
+	])
+}
+
+/// The barrier's gate, which a call filter cannot cover: a message from another chain runs XCM
+/// instructions here without dispatching anything.
+#[test]
+fn only_coretime_and_asset_hub_reach_this_chain_once_the_migration_starts() {
+	let para = || Location::new(0, [Parachain(2000)]);
+	let system = |id| Location::new(0, [Parachain(id)]);
+
+	for stage in open_stages() {
+		// The barrier admits it; it fails later only because the sovereign holds nothing.
+		assert_ne!(execute_from(&stage, para(), paid()), Err(XcmError::Barrier), "at {stage:?}");
+		assert_eq!(execute_from(&stage, system(BRIDGE_HUB_ID), unpaid()), Ok(()), "at {stage:?}");
+	}
+	for stage in closed_stages() {
+		assert_eq!(execute_from(&stage, para(), paid()), Err(XcmError::Barrier), "at {stage:?}");
+		assert_eq!(
+			execute_from(&stage, system(BRIDGE_HUB_ID), unpaid()),
+			Err(XcmError::Barrier),
+			"at {stage:?}"
+		);
+		assert_eq!(execute_from(&stage, system(BROKER_ID), unpaid()), Ok(()), "at {stage:?}");
+		assert_eq!(execute_from(&stage, system(ASSET_HUB_ID), unpaid()), Ok(()), "at {stage:?}");
 	}
 }
