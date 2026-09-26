@@ -39,10 +39,9 @@ parameter_types! {
 	pub const AhParaId: u32 = ASSET_HUB_ID;
 	/// Working buffer of free balance that follows a migrated deposit to the Coretime chain.
 	pub const CtFreeBuffer: Balance = UNITS;
-	/// Asset Hub's existential deposit; mirrors
-	/// `system_parachains_constants::kusama::currency::SYSTEM_PARA_EXISTENTIAL_DEPOSIT`
-	/// (= relay ED / 10) without pulling that crate into the relay runtime.
-	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 10;
+	/// Asset Hub's existential deposit, `SYSTEM_PARA_EXISTENTIAL_DEPOSIT / 10` there (= relay ED /
+	/// 100), without pulling the system-parachain constants into the relay runtime.
+	pub const AhExistentialDeposit: Balance = EXISTENTIAL_DEPOSIT / 100;
 }
 
 impl pallet_rc2_migrator::Config for Runtime {

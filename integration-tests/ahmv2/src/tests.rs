@@ -411,3 +411,16 @@ fn rc_stage() -> pallet_rc2_migrator::MigrationStageOf<network::relay::Runtime> 
 fn ct_stage() -> pallet_ct_migrator::MigrationStage {
 	pallet_ct_migrator::CtMigrationStage::<network::ct::Runtime>::get()
 }
+
+/// The relay chain's copy of Asset Hub's existential deposit, which decides where sub-ED dust goes,
+/// matches Asset Hub's own.
+#[test]
+fn the_relay_chain_knows_asset_hubs_existential_deposit() {
+	use frame_support::traits::Get;
+	assert_eq!(
+		<<network::relay::Runtime as pallet_rc2_migrator::Config>::AhExistentialDeposit as Get<
+			u128,
+		>>::get(),
+		<<network::ah::Runtime as pallet_balances::Config>::ExistentialDeposit as Get<u128>>::get(),
+	);
+}
