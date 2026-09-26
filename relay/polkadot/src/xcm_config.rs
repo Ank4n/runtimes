@@ -17,13 +17,13 @@
 //! XCM configuration for Polkadot.
 
 use super::{
-	parachains_origin, AccountId, AllPalletsWithSystem, Balances, Dmp, FellowshipAdmin,
-	GeneralAdmin, ParaId, Runtime, RuntimeCall, RuntimeEvent, RuntimeOrigin, StakingAdmin,
-	TransactionByteFee, Treasurer, Treasury, WeightToFee, XcmPallet,
+	ahm_v2_started, parachains_origin, AccountId, AllPalletsWithSystem, Balances, Dmp,
+	FellowshipAdmin, GeneralAdmin, ParaId, Runtime, RuntimeCall, RuntimeEvent, RuntimeOrigin,
+	StakingAdmin, TransactionByteFee, Treasurer, Treasury, WeightToFee, XcmPallet,
 };
 use frame_support::{
 	parameter_types,
-	traits::{Contains, Disabled, Equals, Everything, Nothing},
+	traits::{Contains, ContainsPair, Disabled, Equals, Everything, Nothing, ProcessMessageError},
 };
 use frame_system::EnsureRoot;
 use pallet_xcm::XcmPassthrough;
@@ -40,13 +40,14 @@ use xcm::latest::{prelude::*, BodyId};
 use xcm_builder::{
 	AccountId32Aliases, AliasChildLocation, AllowExplicitUnpaidExecutionFrom,
 	AllowKnownQueryResponses, AllowSubscriptionsFrom, AllowTopLevelPaidExecutionFrom, Case,
-	ChildParachainAsNative, ChildParachainConvertsVia, DescribeAllTerminal, DescribeFamily,
-	FrameTransactionalProcessor, FungibleAdapter, HashedDescription, IsChildSystemParachain,
-	IsConcrete, LocationAsSuperuser, MintLocation, OriginToPluralityVoice, SendXcmFeeToAccount,
-	SignedAccountId32AsNative, SignedToAccountId32, SovereignSignedViaLocation, TakeWeightCredit,
-	TrailingSetTopicAsId, UsingComponents, WeightInfoBounds, WithComputedOrigin, WithUniqueTopic,
-	XcmFeeManagerFromComponents,
+	ChildParachainAsNative, ChildParachainConvertsVia, DenyThenTry, DescribeAllTerminal,
+	DescribeFamily, FrameTransactionalProcessor, FungibleAdapter, HashedDescription,
+	IsChildSystemParachain, IsConcrete, LocationAsSuperuser, MintLocation, OriginToPluralityVoice,
+	SendXcmFeeToAccount, SignedAccountId32AsNative, SignedToAccountId32,
+	SovereignSignedViaLocation, TakeWeightCredit, TrailingSetTopicAsId, UsingComponents,
+	WeightInfoBounds, WithComputedOrigin, WithUniqueTopic, XcmFeeManagerFromComponents,
 };
+use xcm_executor::traits::{DenyExecution, Properties};
 
 parameter_types! {
 	/// The location of the DOT token, from the context of this chain. Since this token is native to this
@@ -166,6 +167,16 @@ pub type TrustedTeleporters = (
 	Case<DotForBulletin>,
 );
 
+/// [`TrustedTeleporters`] until the AHM v2 migration starts, nothing after.
+///
+/// The chain runs `NoTeleportTracking`, so an accepted inbound teleport mints.
+pub struct TrustedTeleportersBeforeMigration;
+impl ContainsPair<Asset, Location> for TrustedTeleportersBeforeMigration {
+	fn contains(asset: &Asset, origin: &Location) -> bool {
+		TrustedTeleporters::contains(asset, origin) && !ahm_v2_started()
+	}
+}
+
 pub type Fellows = IsFellowshipVoice<CollectivesLocation>;
 
 pub struct OnlyParachains;
@@ -190,28 +201,57 @@ impl Contains<Location> for AssetHubPlurality {
 }
 
 /// The barriers one of which must be passed for an XCM message to be executed.
-pub type Barrier = TrailingSetTopicAsId<(
-	// Weight that is paid for may be consumed.
-	TakeWeightCredit,
-	// Expected responses are OK.
-	AllowKnownQueryResponses<XcmPallet>,
-	WithComputedOrigin<
+/// Refuses every inbound message from the AHM v2 migration start on, except those from the
+/// Coretime chain and Asset Hub. Asset Hub carries this chain's governance. A message from any
+/// other chain could move value into an account the migration has already drained.
+pub struct DenyDuringMigration;
+impl DenyExecution for DenyDuringMigration {
+	fn deny_execution<RuntimeCall>(
+		origin: &Location,
+		_instructions: &mut [Instruction<RuntimeCall>],
+		_max_weight: Weight,
+		_properties: &mut Properties,
+	) -> Result<(), ProcessMessageError> {
+		if !ahm_v2_started() {
+			return Ok(());
+		}
+		match origin.unpack() {
+			(0, []) => Ok(()),
+			(0, [Parachain(id), ..]) if *id == BROKER_ID || *id == ASSET_HUB_ID => Ok(()),
+			_ => Err(ProcessMessageError::Unsupported),
+		}
+	}
+}
+
+pub type Barrier = TrailingSetTopicAsId<
+	DenyThenTry<
+		DenyDuringMigration,
 		(
-			// If the message is one that immediately attempts to pay for execution, then allow it.
-			AllowTopLevelPaidExecutionFrom<Everything>,
-			// Subscriptions for version tracking are OK.
-			AllowSubscriptionsFrom<OnlyParachains>,
-			// Messages from system parachains or the Fellows plurality need not pay for execution.
-			AllowExplicitUnpaidExecutionFrom<(
-				IsChildSystemParachain<ParaId>,
-				Fellows,
-				AssetHubPlurality,
-			)>,
+			// Weight that is paid for may be consumed.
+			TakeWeightCredit,
+			// Expected responses are OK.
+			AllowKnownQueryResponses<XcmPallet>,
+			WithComputedOrigin<
+				(
+					// If the message is one that immediately attempts to pay for execution, then
+					// allow it.
+					AllowTopLevelPaidExecutionFrom<Everything>,
+					// Subscriptions for version tracking are OK.
+					AllowSubscriptionsFrom<OnlyParachains>,
+					// Messages from system parachains or the Fellows plurality need not pay for
+					// execution.
+					AllowExplicitUnpaidExecutionFrom<(
+						IsChildSystemParachain<ParaId>,
+						Fellows,
+						AssetHubPlurality,
+					)>,
+				),
+				UniversalLocation,
+				ConstU32<8>,
+			>,
 		),
-		UniversalLocation,
-		ConstU32<8>,
 	>,
-)>;
+>;
 
 /// Locations that will not be charged fees in the executor, neither for execution nor delivery.
 /// We only waive fees for system functions, which these locations represent.
@@ -226,7 +266,7 @@ impl xcm_executor::Config for XcmConfig {
 	type OriginConverter = LocalOriginConverter;
 	// Polkadot Relay recognises no chains which act as reserves.
 	type IsReserve = ();
-	type IsTeleporter = TrustedTeleporters;
+	type IsTeleporter = TrustedTeleportersBeforeMigration;
 	type UniversalLocation = UniversalLocation;
 	type Barrier = Barrier;
 	type Weigher = WeightInfoBounds<
