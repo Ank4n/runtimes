@@ -613,7 +613,8 @@ pub mod pallet {
 				// block after the one whose timestamp passed `start`.
 				// TODO(ahm-v2): lock down here, which is two things. Filter the calls whose
 				// state is about to move, and refuse inbound XCM from anyone but the Coretime
-				// chain.
+				// chain, so that nothing a para sends changes the state between here and the
+				// data stages.
 				// TODO(ahm-v2): give the Coretime chain's queue priority.
 				MigrationStage::Scheduled { start } if T::TimeProvider::now() >= start => {
 					if Self::send_to_ct(CtMigratorCall::StartMigration).is_ok() {

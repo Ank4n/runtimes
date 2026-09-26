@@ -17,7 +17,6 @@
 
 use super::*;
 use crate::mock::*;
-use frame_support::assert_ok;
 use migrator_types::PortableHoldReason;
 
 #[test]
@@ -80,16 +79,6 @@ fn sub_ed_free_keeps_the_ed_and_holds_the_rest() {
 		assert_eq!(frame_system::Pallet::<Test>::providers(&bob), 1);
 		assert_eq!(frame_system::Pallet::<Test>::consumers(&bob), 1);
 		assert_eq!(CtMintedTotal::<Test>::get(), 42);
-		assert_eq!(total_issuance(), 42);
-
-		// AND WHEN a later stage releases the migrated reserve, the record is honoured up to what
-		// is held and the 8 that stayed free is reported as a shortfall.
-		assert_ok!(
-			CtMigrator::release_migrated_deposit(HoldReason::RegistrarDeposit, &bob, 40),
-			(32, 8)
-		);
-		assert_eq!(free(&bob), 42);
-		assert_eq!(held(HoldReason::RegistrarDeposit, &bob), 0);
 		assert_eq!(total_issuance(), 42);
 	});
 }

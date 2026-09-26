@@ -30,8 +30,8 @@ use alloc::vec::Vec;
 use frame_support::{
 	defensive_assert,
 	traits::{
-		fungible::{Inspect, InspectHold, Mutate, MutateHold},
-		tokens::{Fortitude, Precision, Preservation},
+		fungible::{Inspect, Mutate, MutateHold},
+		tokens::{Fortitude, Preservation},
 	},
 };
 use migrator_types::PortableAccount;
@@ -74,8 +74,7 @@ impl<T: Config> Pallet<T> {
 	///
 	/// Holds are best effort: the existential deposit stays free, and whatever part of a hold
 	/// the free balance cannot cover stays free with it. The owning pallet takes its deposit at
-	/// this chain's rates out of the free balance later, so a short hold surfaces only as a
-	/// shortfall on release.
+	/// this chain's rates out of the free balance later.
 	fn do_receive_account(account: &PortableAccountOf<T>) -> Result<BalanceOf<T>, DispatchError> {
 		let who = &account.who;
 		let held: BalanceOf<T> = account
@@ -102,21 +101,5 @@ impl<T: Config> Pallet<T> {
 		}
 
 		Ok(minted)
-	}
-
-	/// Release `min(wanted, actually-held)` of `who`'s migrated hold under `reason` to free
-	/// balance, returning `(released, shortfall)`.
-	pub fn release_migrated_deposit(
-		reason: HoldReason,
-		who: &T::AccountId,
-		wanted: BalanceOf<T>,
-	) -> Result<(BalanceOf<T>, BalanceOf<T>), DispatchError> {
-		let rc_reason: T::RuntimeHoldReason = reason.into();
-		let held = <T as Config>::Currency::balance_on_hold(&rc_reason, who);
-		let release = wanted.min(held);
-		if !release.is_zero() {
-			<T as Config>::Currency::release(&rc_reason, who, release, Precision::Exact)?;
-		}
-		Ok((release, wanted.saturating_sub(held)))
 	}
 }

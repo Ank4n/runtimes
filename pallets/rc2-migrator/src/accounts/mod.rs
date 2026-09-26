@@ -156,6 +156,10 @@ impl<T: Config> AccountsMigrator<T> {
 		// the sender sovereigns' request deposits are Coretime-bound like channel deposits. A
 		// confirmed request's recipient deposit is reserved but recorded nowhere until the
 		// session boundary turns the request into a channel; in that window it is unattributed.
+		// TODO(ahm-v2): close that window. From the migration start the lockdown refuses XCM from
+		// every chain but the Coretime chain, so no request is confirmed after it; the warm-up
+		// must also span a session boundary, so the ones confirmed before it are channels by the
+		// time this runs.
 		for (id, request) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<T>::iter() {
 			add(id.sender.into_account_truncating(), request.sender_deposit, |e| &mut e.hrmp);
 			records += 1;
