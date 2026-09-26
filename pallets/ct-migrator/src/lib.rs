@@ -224,9 +224,6 @@ pub mod pallet {
 		pub fn start_migration(origin: OriginFor<T>) -> DispatchResult {
 			Self::ensure_admin_or_manager(origin)?;
 
-			// TODO(ahm-v2): lock this chain down before answering, until the migration ends:
-			// filter the calls whose state is about to move, and refuse inbound XCM from anyone
-			// but the relay chain.
 			// TODO(ahm-v2): give the relay chain's queue priority while the migration runs.
 			match CtMigrationStage::<T>::get() {
 				// try send xcm before updating stage.

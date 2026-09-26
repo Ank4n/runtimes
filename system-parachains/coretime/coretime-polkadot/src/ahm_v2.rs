@@ -33,9 +33,12 @@ impl pallet_ct_migrator::Config for Runtime {
 
 #[cfg(test)]
 mod tests {
-	use crate::{Runtime, RuntimeCall};
+	use crate::{AccountId, ProxyType, Runtime, RuntimeCall};
 	use codec::Encode;
+	use frame_support::traits::Contains;
+	use pallet_ct_migrator::{CtMigrationStage, MigrationStage};
 	use pallet_rc2_migrator::{CtMigratorCall, CtRuntimeCall};
+	use parachains_runtimes_test_utils::ExtBuilder;
 
 	/// Ensure the pallet + call index aligns.
 	#[test]
@@ -49,5 +52,41 @@ mod tests {
 			CtRuntimeCall::CtMigrator(CtMigratorCall::EndLockdown).encode(),
 			RuntimeCall::CtMigrator(pallet_ct_migrator::Call::<Runtime>::end_lockdown {}).encode(),
 		);
+	}
+
+	fn allowed_at(stage: MigrationStage, call: &RuntimeCall) -> bool {
+		ExtBuilder::<Runtime>::default().build().execute_with(|| {
+			CtMigrationStage::<Runtime>::put(stage);
+			<Runtime as frame_system::Config>::BaseCallFilter::contains(call)
+		})
+	}
+
+	/// Proxy definitions arrive from the relay chain while the migration runs, so the proxy map is
+	/// closed until the relay chain ends the lockdown. Using a proxy is not.
+	#[test]
+	fn proxy_changes_close_while_the_migration_runs() {
+		let alice = AccountId::new([1u8; 32]);
+		let add_proxy = RuntimeCall::Proxy(pallet_proxy::Call::add_proxy {
+			delegate: alice.clone().into(),
+			proxy_type: ProxyType::Any,
+			delay: 0,
+		});
+		let use_proxy = RuntimeCall::Proxy(pallet_proxy::Call::proxy {
+			real: alice.into(),
+			force_proxy_type: None,
+			call: Box::new(RuntimeCall::System(frame_system::Call::remark { remark: vec![] })),
+		});
+
+		assert!(allowed_at(MigrationStage::Pending, &add_proxy));
+		assert!(!allowed_at(MigrationStage::DataMigrationOngoing, &add_proxy));
+		assert!(allowed_at(MigrationStage::MigrationDone, &add_proxy));
+
+		for stage in [
+			MigrationStage::Pending,
+			MigrationStage::DataMigrationOngoing,
+			MigrationStage::MigrationDone,
+		] {
+			assert!(allowed_at(stage.clone(), &use_proxy), "using a proxy must work at {stage:?}");
+		}
 	}
 }

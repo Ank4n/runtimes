@@ -201,11 +201,11 @@ impl Contains<Location> for AssetHubPlurality {
 }
 
 /// The barriers one of which must be passed for an XCM message to be executed.
-/// Refuses every inbound message from the AHM v2 migration start on, except those from the
-/// Coretime chain and Asset Hub. Asset Hub carries this chain's governance. A message from any
-/// other chain could move value into an account the migration has already drained.
-pub struct DenyDuringMigration;
-impl DenyExecution for DenyDuringMigration {
+/// Refuses every inbound message from the AHM v2 migration start on, and after it ends, except
+/// those from the Coretime chain and Asset Hub. Asset Hub carries this chain's governance. A
+/// message from any other chain could move value into an account the migration has drained.
+pub struct DenyOnceMigrationStarts;
+impl DenyExecution for DenyOnceMigrationStarts {
 	fn deny_execution<RuntimeCall>(
 		origin: &Location,
 		_instructions: &mut [Instruction<RuntimeCall>],
@@ -225,7 +225,7 @@ impl DenyExecution for DenyDuringMigration {
 
 pub type Barrier = TrailingSetTopicAsId<
 	DenyThenTry<
-		DenyDuringMigration,
+		DenyOnceMigrationStarts,
 		(
 			// Weight that is paid for may be consumed.
 			TakeWeightCredit,

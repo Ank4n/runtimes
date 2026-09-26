@@ -208,8 +208,11 @@ fn ahm_v2_started() -> bool {
 	false
 }
 
-/// Whether `call` stays enabled once the AHM v2 migration has started. Closed means closed for
-/// good: nothing reopens at the end of the migration.
+/// Whether `call` stays enabled once the AHM v2 migration has started.
+///
+/// Before the start every call is as `PostAhmFilter` has it. From the first block of the migration
+/// a closed call stays closed, through `MigrationDone` and after: this chain holds nothing left to
+/// act on.
 ///
 /// Everything that could change balances, reserves or holds while the data stages drain them is
 /// closed: one taken while they run can leave value behind on this chain. Registrar and HRMP calls
