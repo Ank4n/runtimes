@@ -511,6 +511,20 @@ pub fn open_request(sender: u32, recipient: u32, deposit: u128) {
 	parachains_hrmp::HrmpOpenChannelRequestCount::<Test>::mutate(ParaId::from(sender), |c| *c += 1);
 }
 
+/// Accept a pending open-channel request the way the relay chain does: the recipient's deposit, at
+/// the active config's `hrmp_recipient_deposit`, is reserved on its sovereign and recorded nowhere
+/// until the next session.
+pub fn accept_request(sender: u32, recipient: u32) {
+	let deposit = configuration::ActiveConfig::<Test>::get().hrmp_recipient_deposit;
+	let sov = child_sov(recipient);
+	fund(&sov, free(&sov) + deposit + ED);
+	reserve(&sov, deposit);
+	let id = HrmpChannelId { sender: sender.into(), recipient: recipient.into() };
+	parachains_hrmp::HrmpOpenChannelRequests::<Test>::mutate(&id, |request| {
+		request.as_mut().expect("request is pending").confirmed = true;
+	});
+}
+
 /// Grant a proxy through the real pallet path; reserves the deposit at this chain's rates.
 /// Calling the dispatchable directly does not bump the delegator's nonce, so a never-signed
 /// delegator stays at nonce 0 — exactly how pures and multisigs look on chain.

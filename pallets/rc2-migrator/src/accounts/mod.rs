@@ -35,7 +35,9 @@ use frame_support::{
 	BoundedVec, PalletId,
 };
 use migrator_types::{PortableAccount, PortableHold, PortableHoldReason, PortableProxyType};
+use polkadot_parachain_primitives::primitives::IsSystem;
 use polkadot_runtime_common::paras_registrar;
+use runtime_parachains::configuration;
 use scale_info::TypeInfo;
 use sp_runtime::{
 	traits::{AccountIdConversion, Zero},
@@ -153,15 +155,16 @@ impl<T: Config> AccountsMigrator<T> {
 			records += 1;
 		}
 		// Pending open-channel requests migrate to the Coretime chain with their deposits, so
-		// the sender sovereigns' request deposits are Coretime-bound like channel deposits. A
-		// confirmed request's recipient deposit is reserved but recorded nowhere until the
-		// session boundary turns the request into a channel; in that window it is unattributed.
-		// TODO(ahm-v2): close that window. From the migration start the lockdown refuses XCM from
-		// every chain but the Coretime chain, so no request is confirmed after it; the warm-up
-		// must also span a session boundary, so the ones confirmed before it are channels by the
-		// time this runs.
+		// their deposits are Coretime-bound like channel deposits. A confirmed request's
+		// recipient deposit is reserved at acceptance but only recorded when the next session
+		// turns the request into a channel, so it is taken at the active config's value, which is
+		// what that session records (zero when either side is a system chain).
+		let recipient_deposit = configuration::ActiveConfig::<T>::get().hrmp_recipient_deposit;
 		for (id, request) in runtime_parachains::hrmp::HrmpOpenChannelRequests::<T>::iter() {
 			add(id.sender.into_account_truncating(), request.sender_deposit, |e| &mut e.hrmp);
+			if request.confirmed && !id.sender.is_system() && !id.recipient.is_system() {
+				add(id.recipient.into_account_truncating(), recipient_deposit, |e| &mut e.hrmp);
+			}
 			records += 1;
 		}
 		for (who, (defs, deposit)) in pallet_proxy::Proxies::<T>::iter() {

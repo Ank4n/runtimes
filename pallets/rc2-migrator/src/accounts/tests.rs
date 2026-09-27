@@ -68,6 +68,13 @@ fn build_expected_reserves_indexes_every_deposit_source() {
 		register_para(2000, &alice); // 300 recorded + reserved
 		open_channel(2000, 2001, 70, 30);
 		open_request(2000, 2002, 25);
+		// Accepted, so the recipient's deposit is reserved but not yet recorded anywhere.
+		configuration::ActiveConfig::<Test>::mutate(|c| c.hrmp_recipient_deposit = 15);
+		open_request(2003, 2004, 25);
+		accept_request(2003, 2004);
+		// Accepted by a system chain: a channel with a system chain owes no deposit on either side.
+		open_request(2005, 1000, 0);
+		accept_request(2005, 1000);
 		fund(&bob, 500);
 		add_proxy(&bob, &delegate, ProxyType::Any); // 40 base + 4 factor = 44 reserved
 		fund(&carol, 500);
@@ -97,18 +104,29 @@ fn build_expected_reserves_indexes_every_deposit_source() {
 		// THEN every source is classified: registrar + HRMP (+ requests) are Coretime-bound,
 		// portable proxy deposits travel under their own reason, everything whose purpose ends
 		// with this chain is refunded.
-		assert_eq!(records, 8, "para + channel + request + 3 proxies + announcement + multisig");
+		assert_eq!(
+			records, 10,
+			"para + channel + 3 requests + 3 proxies + announcement + multisig"
+		);
 		assert_eq!(
 			ExpectedReserves::<Test>::get(&alice),
 			ExpectedReserve { registrar: 300, ..Default::default() }
 		);
 		assert_eq!(ExpectedReserves::<Test>::get(child_sov(2000)).hrmp, 70 + 25);
 		assert_eq!(ExpectedReserves::<Test>::get(child_sov(2001)).hrmp, 30);
+		assert_eq!(ExpectedReserves::<Test>::get(child_sov(2003)).hrmp, 25);
+		assert_eq!(ExpectedReserves::<Test>::get(child_sov(2004)).hrmp, 15);
+		assert!(!ExpectedReserves::<Test>::contains_key(child_sov(2005)));
+		assert!(!ExpectedReserves::<Test>::contains_key(child_sov(1000)));
 		assert_eq!(ExpectedReserves::<Test>::get(&bob).proxy, 44);
 		assert_eq!(ExpectedReserves::<Test>::get(&frank).proxy, 44);
 		assert_eq!(ExpectedReserves::<Test>::get(&carol).refund, 44);
 		assert_eq!(ExpectedReserves::<Test>::get(&dave).refund, 40);
 		assert_eq!(ExpectedReserves::<Test>::get(&eve).refund, 31);
+
+		// AND the accepted request's recipient deposit travels as an HRMP hold, not unattributed.
+		let w = withdraw(&child_sov(2004)).expect("migrates");
+		assert_eq!(ct_holds(&w), vec![(PortableHoldReason::HrmpDeposit, 15)]);
 	});
 }
 

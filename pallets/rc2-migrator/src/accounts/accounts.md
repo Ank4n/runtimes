@@ -40,13 +40,13 @@ Every deposit on the Relay Chain is an unnamed reserve, so an account's reserve 
 | ------ | ------- | ------------ |
 | `paras_registrar::Paras` | manager | `RegistrarDeposit` hold on the Coretime chain |
 | `hrmp::HrmpChannels` | sender and recipient sovereigns | `HrmpDeposit` hold on the Coretime chain |
-| `hrmp::HrmpOpenChannelRequests` | sender sovereign | `HrmpDeposit` hold on the Coretime chain |
+| `hrmp::HrmpOpenChannelRequests` | sender sovereign, and the recipient sovereign once accepted | `HrmpDeposit` hold on the Coretime chain |
 | `pallet_proxy::Proxies`, at least one portable permission | delegator | `ProxyDeposit` hold on the Coretime chain |
 | `pallet_proxy::Proxies`, no portable permission | delegator | free balance on Asset Hub |
 | `pallet_proxy::Announcements` | announcer | free balance on Asset Hub |
 | `pallet_multisig::Multisigs` | depositor | free balance on Asset Hub |
 
-The live reserve is consumed in the table's order, so when it covers less than the records, the deposits that continue are made whole first. Reserve beyond every record travels as an `UnattributedReserve` hold on the Coretime chain and is reported with `UnattributedReserve`. A confirmed HRMP open request's recipient deposit is not recorded until the next session boundary, so in that window it is unattributed.
+The live reserve is consumed in the table's order, so when it covers less than the records, the deposits that continue are made whole first. Reserve beyond every record travels as an `UnattributedReserve` hold on the Coretime chain and is reported with `UnattributedReserve`. An accepted HRMP open request's recipient deposit is only recorded when the next session turns the request into a channel, so it is indexed at the active configuration's `hrmp_recipient_deposit`, which is what that session records.
 
 ## XCM
 
