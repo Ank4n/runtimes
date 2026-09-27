@@ -45,8 +45,11 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod accounts;
+
 pub use pallet::*;
 
+use accounts::PortableAccountOf;
 use alloc::{vec, vec::Vec};
 use frame_support::{
 	pallet_prelude::*,
@@ -182,6 +185,17 @@ pub mod pallet {
 	#[pallet::storage]
 	pub type Manager<T: Config> = StorageValue<_, T::AccountId, OptionQuery>;
 
+	/// Accounts that failed to integrate, parked verbatim for recovery after the migration. Each
+	/// entry is balance the relay chain burned and this chain never minted.
+	#[pallet::storage]
+	pub type FailedAccounts<T: Config> =
+		StorageMap<_, Twox64Concat, T::AccountId, PortableAccountOf<T>, OptionQuery>;
+
+	/// Total balance minted on this chain by the accounts stage. Reconciled against the relay
+	/// chain's burned total once the migration ends.
+	#[pallet::storage]
+	pub type CtMintedTotal<T: Config> = StorageValue<_, BalanceOf<T>, ValueQuery>;
+
 	#[pallet::error]
 	pub enum Error<T> {
 		/// The migration has already finished on this chain.
@@ -209,6 +223,8 @@ pub mod pallet {
 			/// The new manager account id.
 			new: Option<T::AccountId>,
 		},
+		/// A batch of migrated accounts was processed.
+		AccountsReceived { count_good: u32, count_bad: u32 },
 	}
 
 	#[pallet::call]
@@ -290,6 +306,24 @@ pub mod pallet {
 			Self::deposit_event(Event::ManagerSet { old, new });
 			Ok(())
 		}
+
+		/// Receive a batch of accounts migrated from the Relay Chain.
+		///
+		/// Mints each account and places its holds; see [`Pallet::do_receive_accounts`].
+		// TODO(ahm-v2): proper benchmark
+		#[pallet::call_index(4)]
+		#[pallet::weight(
+			T::DbWeight::get().reads_writes(4, 4).saturating_mul(accounts.len() as u64)
+		)]
+		pub fn receive_accounts(
+			origin: OriginFor<T>,
+			accounts: Vec<PortableAccountOf<T>>,
+		) -> DispatchResult {
+			ensure_root(origin)?;
+
+			Self::do_receive_accounts(accounts);
+			Ok(())
+		}
 	}
 
 	impl<T: Config> Pallet<T> {
@@ -356,7 +390,6 @@ impl From<PortableHoldReason> for HoldReason {
 	}
 }
 
-// TODO(ahm-v2): the helper below has no caller and no test until the accounts stage lands.
 impl<T: Config> Pallet<T> {
 	/// Run `integrate` over every item in its own storage transaction. A failing item is rolled
 	/// back and handed to `park`; the other items are unaffected. Returns `(count_good,
