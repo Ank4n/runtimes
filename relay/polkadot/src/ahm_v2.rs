@@ -80,8 +80,8 @@ impl DenyExecution for DenyOnceMigrationStarts {
 	}
 }
 
-/// CT assigns cores and answers the migrator. AH governance dispatches here as Root / admin body, and its staking
-/// sends the validator set and session keys.
+/// CT assigns cores and answers the migrator. AH governance dispatches here as Root / admin body,
+/// and its staking sends the validator set and session keys.
 fn only_from_self_coretime_or_asset_hub(origin: &Location) -> Result<(), ProcessMessageError> {
 	match origin.unpack() {
 		(0, []) => Ok(()),
@@ -129,20 +129,43 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 	const OFF: bool = false;
 
 	match call {
+	    // all ON calls during migration
 		// Applies a runtime upgrade governance already authorized.
 		System(frame_system::Call::apply_authorized_upgrade { .. }) => (ON, ON),
+		Babe(pallet_babe::Call::report_equivocation_unsigned { .. }) => (ON, ON),
+		// Only the `set` inherent.
+		Timestamp(..) => (ON, ON),
+		Grandpa(pallet_grandpa::Call::report_equivocation_unsigned { .. }) => (ON, ON),
+		// Asset Hub or the admin origin only. Era rotation should continue.
+		StakingAhClient(..) => (ON, ON),
+		// Asset Hub's StakingAdmin reaches it over XCM, not as Root.
+		Parameters(..) => (ON, ON),
+		// Only the `enter` inherent.
+		ParaInherent(..) => (ON, ON),
+		Paras(
+			parachains_paras::Call::include_pvf_check_statement { .. } |
+			parachains_paras::Call::apply_authorized_force_set_current_code { .. },
+		) => (ON, ON),
+		ParasSlashing(parachains_slashing::Call::report_dispute_lost_unsigned { .. }) => (ON, ON),
+		// The Coretime chain only.
+		Coretime(..) => (ON, ON),
+		Beefy(
+			pallet_beefy::Call::report_double_voting_unsigned { .. } |
+			pallet_beefy::Call::report_fork_voting_unsigned { .. } |
+			pallet_beefy::Call::report_future_block_voting_unsigned { .. },
+		) => (ON, ON),
+		// Checks its own origins; drives the migration.
+		Rc2Migrator(..) => (ON, ON),
+
+		// all OFF calls during migration
 		System(..) => (OFF, OFF),
 		Scheduler(..) => (OFF, OFF),
 		Preimage(..) => (OFF, OFF),
-		Babe(pallet_babe::Call::report_equivocation_unsigned { .. }) => (ON, ON),
 		Babe(..) => (OFF, OFF),
-		// Only the `set` inherent.
-		Timestamp(..) => (ON, ON),
 		Indices(..) => (OFF, OFF),
 		Balances(..) => (OFF, OFF),
 		Staking(..) => (OFF, OFF),
 		Session(..) => (OFF, OFF),
-		Grandpa(pallet_grandpa::Call::report_equivocation_unsigned { .. }) => (ON, ON),
 		Grandpa(..) => (OFF, OFF),
 		Treasury(..) => (OFF, OFF),
 		ConvictionVoting(..) => (OFF, OFF),
@@ -159,29 +182,14 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		VoterList(..) => (OFF, OFF),
 		NominationPools(..) => (OFF, OFF),
 		FastUnstake(..) => (OFF, OFF),
-		// Asset Hub or the admin origin only. Era rotation should continue.
-		StakingAhClient(..) => (ON, ON),
-		// Asset Hub's StakingAdmin reaches it over XCM, not as Root.
-		Parameters(..) => (ON, ON),
-		// Root only.
-		Configuration(..) => (OFF, OFF),
 		ParasShared(..) => (OFF, OFF),
 		ParaInclusion(..) => (OFF, OFF),
-		// Only the `enter` inherent.
-		ParaInherent(..) => (ON, ON),
-		Paras(
-			parachains_paras::Call::include_pvf_check_statement { .. } |
-			parachains_paras::Call::apply_authorized_force_set_current_code { .. },
-		) => (ON, ON),
 		Paras(..) => (OFF, OFF),
 		// Root only.
-		Initializer(..) => (OFF, OFF),
+		Configuration(..) | Initializer(..) | ParasDisputes(..) => (OFF, OFF),
 		// TODO(ahm-v2): HRMP stays on this chain, with its deposits held on the Coretime chain.
 		// Decide what opens after the migration.
 		Hrmp(..) => (OFF, OFF),
-		// Root only.
-		ParasDisputes(..) => (OFF, OFF),
-		ParasSlashing(parachains_slashing::Call::report_dispute_lost_unsigned { .. }) => (ON, ON),
 		ParasSlashing(..) => (OFF, OFF),
 		OnDemand(..) => (OFF, OFF),
 		// TODO(ahm-v2): the registrar moves to the Coretime chain. Paras reach it through
@@ -191,19 +199,10 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		Slots(..) => (OFF, OFF),
 		Auctions(..) => (OFF, OFF),
 		Crowdloan(..) => (OFF, OFF),
-		// The Coretime chain only.
-		Coretime(..) => (ON, ON),
 		XcmPallet(..) => (OFF, OFF),
 		MessageQueue(..) => (OFF, OFF),
 		AssetRate(..) => (OFF, OFF),
-		Beefy(
-			pallet_beefy::Call::report_double_voting_unsigned { .. } |
-			pallet_beefy::Call::report_fork_voting_unsigned { .. } |
-			pallet_beefy::Call::report_future_block_voting_unsigned { .. },
-		) => (ON, ON),
 		Beefy(..) => (OFF, OFF),
-		// Checks its own origins; drives the migration.
-		Rc2Migrator(..) => (ON, ON),
 	}
 }
 
