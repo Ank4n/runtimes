@@ -20,8 +20,11 @@
 //! Compiled only with the `ahm-v2` feature, which released runtimes do not enable. The
 //! integration tests turn it on to drive the real runtime.
 
-use crate::{xcm_config::XcmRouter, AccountId, Balances, Runtime, RuntimeEvent, RuntimeHoldReason};
-use frame_support::traits::Everything;
+use crate::{
+	xcm_config::XcmRouter, AccountId, Balances, Runtime, RuntimeCall, RuntimeEvent,
+	RuntimeHoldReason,
+};
+use frame_support::traits::{Contains, Everything};
 use frame_system::EnsureRoot;
 
 impl pallet_ct_migrator::Config for Runtime {
@@ -30,16 +33,69 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
+	// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` stay closed before and during the migration,
+	// and open after it.
 	type PreMigrationCalls = Everything;
-	type IntraMigrationCalls = Everything;
+	type IntraMigrationCalls = CallsEnabledDuringMigration;
 	type PostMigrationCalls = Everything;
+}
+
+/// Contains all calls that are enabled during the migration.
+///
+/// Proxy definitions arrive from the relay chain and are merged into `pallet_proxy`, so every
+/// proxy call that changes the proxy map or an announcement is disabled. Using a proxy stays
+/// enabled.
+///
+/// Announcements are not migrated: the relay chain releases their deposits and sends them to
+/// Asset Hub as free balance.
+pub struct CallsEnabledDuringMigration;
+impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
+	fn contains(call: &RuntimeCall) -> bool {
+		use RuntimeCall::*;
+		const ON: bool = true;
+		const OFF: bool = false;
+
+		let enabled = match call {
+		    // all ON calls during migration
+			System(..) => ON,
+			ParachainSystem(..) => ON,
+			Timestamp(..) => ON,
+			ParachainInfo(..) => ON,
+			Balances(..) => ON,
+			CollatorSelection(..) => ON,
+			Session(..) => ON,
+			XcmpQueue(..) => ON,
+			PolkadotXcm(..) => ON,
+			CumulusXcm(..) => ON,
+			MessageQueue(..) => ON,
+			Utility(..) => ON,
+			Multisig(..) => ON,
+			Proxy(
+				pallet_proxy::Call::proxy { .. } | pallet_proxy::Call::proxy_announced { .. },
+			) => ON,
+			Broker(..) => ON,
+			CtMigrator(..) => ON,
+
+			// all OFF calls during migration
+			Proxy(..) => OFF,
+			// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` should be OFF when pallets are wired.
+
+		};
+		if !enabled {
+			log::warn!("Call bounced by the filter during the migration: {call:?}");
+		}
+		enabled
+	}
 }
 
 #[cfg(test)]
 mod tests {
-	use crate::{Runtime, RuntimeCall};
+	use crate::{AccountId, ProxyType, Runtime, RuntimeCall};
 	use codec::Encode;
+	use frame_support::traits::Contains;
+	use pallet_ct_migrator::{CtMigrationStage, MigrationStage};
 	use pallet_rc2_migrator::{CtMigratorCall, CtRuntimeCall};
+	use parachains_runtimes_test_utils::ExtBuilder;
 
 	/// Ensure the pallet + call index aligns.
 	#[test]
@@ -53,5 +109,76 @@ mod tests {
 			CtRuntimeCall::CtMigrator(CtMigratorCall::EndLockdown).encode(),
 			RuntimeCall::CtMigrator(pallet_ct_migrator::Call::<Runtime>::end_lockdown {}).encode(),
 		);
+	}
+
+	fn allowed_at(stage: &MigrationStage, call: &RuntimeCall) -> bool {
+		ExtBuilder::<Runtime>::default().build().execute_with(|| {
+			CtMigrationStage::<Runtime>::put(stage.clone());
+			<Runtime as frame_system::Config>::BaseCallFilter::contains(call)
+		})
+	}
+
+	#[test]
+	fn proxy_changes_are_refused_while_the_migration_runs() {
+		let alice = AccountId::new([1; 32]); // delegate
+		let remark = RuntimeCall::System(frame_system::Call::remark { remark: vec![1] });
+		let changes = [
+			RuntimeCall::Proxy(pallet_proxy::Call::add_proxy {
+				delegate: alice.clone().into(),
+				proxy_type: ProxyType::Any,
+				delay: 0,
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::remove_proxies {}),
+			RuntimeCall::Proxy(pallet_proxy::Call::create_pure {
+				proxy_type: ProxyType::Any,
+				delay: 0,
+				index: 0,
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::announce {
+				real: alice.clone().into(),
+				call_hash: Default::default(),
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::poke_deposit {}),
+		];
+		let uses = [
+			RuntimeCall::Proxy(pallet_proxy::Call::proxy {
+				real: alice.clone().into(),
+				force_proxy_type: None,
+				call: Box::new(remark.clone()),
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::proxy_announced {
+				delegate: alice.clone().into(),
+				real: alice.into(),
+				force_proxy_type: None,
+				call: Box::new(remark.clone()),
+			}),
+			remark,
+		];
+
+		// GIVEN the migration has not started or is done. THEN proxy changes pass.
+		for stage in [MigrationStage::Pending, MigrationStage::MigrationDone] {
+			for call in &changes {
+				assert!(allowed_at(&stage, call), "{call:?} refused at {stage:?}");
+			}
+		}
+
+		// GIVEN the migration is running. THEN proxy changes are refused.
+		for call in &changes {
+			assert!(
+				!allowed_at(&MigrationStage::DataMigrationOngoing, call),
+				"{call:?} allowed while the migration runs"
+			);
+		}
+
+		// THEN using a proxy, and any other call, passes at every stage.
+		for stage in [
+			MigrationStage::Pending,
+			MigrationStage::DataMigrationOngoing,
+			MigrationStage::MigrationDone,
+		] {
+			for call in &uses {
+				assert!(allowed_at(&stage, call), "{call:?} refused at {stage:?}");
+			}
+		}
 	}
 }
