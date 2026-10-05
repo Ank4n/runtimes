@@ -1,0 +1,387 @@
+// Copyright (C) Polkadot Fellows.
+// This file is part of Polkadot.
+
+// Polkadot is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// Polkadot is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+
+// You should have received a copy of the GNU General Public License
+// along with Polkadot. If not, see <http://www.gnu.org/licenses/>.
+
+//! Snapshot test for the AHM v2 lockdown: the call filters, XCM barrier and teleport trust on
+//! both chains, checked at every stage of a real run.
+
+use crate::mock::*;
+use core::{cell::RefCell, mem::discriminant};
+use cumulus_primitives_core::ParaId;
+use frame_support::{
+	assert_ok, dispatch::PostDispatchInfo, hypothetically, traits::fungible::Mutate,
+};
+use network::constants::{currency::UNITS, system_parachain, time::MINUTES};
+use pallet_ct_migrator::MigrationStage as CtStage;
+use pallet_rc2_migrator::MigrationStage as RcStage;
+use sp_io::TestExternalities;
+use sp_runtime::{
+	traits::{AccountIdConversion, Dispatchable},
+	AccountId32, DispatchError,
+};
+use std::collections::HashSet;
+use xcm::latest::prelude::*;
+
+/// The windows the walk schedules with.
+const WARM_UP: u32 = 10;
+const COOL_OFF: u32 = 10;
+
+/// A para that is not a system chain.
+const OUTSIDER_PARA: u32 = 4242;
+
+/// Accounts the lockdown probes use. None of them exists on either snapshot.
+const ALICE: AccountId32 = AccountId32::new([0xa1; 32]); // signs every call
+const BOB: AccountId32 = AccountId32::new([0xb0; 32]); // receives; the proxied account on Coretime
+const CAROL: AccountId32 = AccountId32::new([0xca; 32]); // receives through the proxy
+
+/// The lockdown at every stage of a real run, through both chains' real call filters and XCM
+/// configuration.
+///
+/// From the relay chain's start signal on: a signed transfer is filtered, the manager still drives
+/// the migrator, only the Coretime chain and Asset Hub get past the barrier, and a teleport from
+/// Asset Hub mints nothing. None of that reopens at the end. On the Coretime chain, adding a proxy
+/// is refused exactly while its migration runs, and an existing proxy works throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_lockdown_holds_at_every_stage() {
+	let (mut rc, mut ct) = tokio::join!(load(Chain::Relay), load(CoretimePara::CHAIN));
+
+	// GIVEN no backlog from the snapshot, which would be processed alongside the probes' messages
+	// and move the issuance they measure.
+	rc.execute_with(drain_all_inbound_queues);
+
+	// Each chain's stages the probes ran at, by variant, so the end of the test can check that none
+	// was skipped.
+	let rc_stages = RefCell::new(HashSet::new());
+	let ct_stages = RefCell::new(HashSet::new());
+
+	// WHEN the migration runs from `Pending` to `MigrationDone`. THEN every probe holds at every
+	// stage it stops at.
+	walk_migration(
+		&mut rc,
+		&mut ct,
+		|| {
+			rc_stages.borrow_mut().insert(discriminant(&rc_stage()));
+			probe_rc_lockdown();
+		},
+		|| {
+			ct_stages.borrow_mut().insert(discriminant(&ct_stage()));
+			probe_ct_lockdown();
+		},
+	);
+
+	// Every variant of the relay chain's `MigrationStage` was probed, and all three of Coretime's.
+	assert_eq!(rc_stages.borrow().len(), 21);
+	assert_eq!(ct_stages.borrow().len(), 3);
+}
+
+/// Walk both chains from `Pending` to `MigrationDone` over their real queues. `probe_rc` runs
+/// inside the relay chain at every stage the walk passes, `probe_ct` inside the Coretime chain at
+/// each of its stages. Each probe runs in a storage layer that is rolled back, so it can change
+/// state without moving the walk.
+fn walk_migration(
+	rc: &mut TestExternalities,
+	ct: &mut TestExternalities,
+	probe_rc: impl Fn(),
+	probe_ct: impl Fn(),
+) {
+	let probe_rc = || hypothetically!(probe_rc());
+	let probe_ct = || hypothetically!(probe_ct());
+
+	// The relay chain schedules the start and sends its start signal.
+	let dmp = rc.execute_with(|| {
+		assert_eq!(rc_stage(), RcStage::Pending);
+		probe_rc();
+
+		// The block whose hooks first see a clock at or past `start` is the third from here,
+		// since hooks run before the timestamp inherent.
+		let start = now_ms_rc() + 2 * RC_BLOCK_TIME_MS;
+		assert_ok!(pallet_rc2_migrator::Pallet::<network::relay::Runtime>::schedule_migration(
+			network::relay::RuntimeOrigin::root(),
+			start,
+			WARM_UP,
+			COOL_OFF,
+		));
+		next_block_rc();
+		next_block_rc();
+		assert_eq!(rc_stage(), RcStage::Scheduled { start });
+		probe_rc();
+
+		next_block_rc();
+		assert_eq!(rc_stage(), RcStage::WaitingForCt);
+		probe_rc();
+		take_dmp(CoretimePara::PARA_ID.into())
+	});
+
+	// The Coretime chain opens and answers.
+	let ump = ct.execute_with(|| {
+		assert_eq!(ct_stage(), CtStage::Pending);
+		probe_ct();
+		enqueue_dmp::<CoretimePara>(dmp);
+		next_block_para::<CoretimePara>();
+		assert_eq!(ct_stage(), CtStage::DataMigrationOngoing);
+		probe_ct();
+		take_ump::<CoretimePara>()
+	});
+
+	// The relay chain warms up, walks every data stage and the cool-off, and sends its finish
+	// signal.
+	let dmp = rc.execute_with(|| {
+		enqueue_ump(CoretimePara::PARA_ID.into(), ump);
+		next_block_rc();
+		let RcStage::WarmUp { end_at } = rc_stage() else {
+			panic!("readiness did not admit the machine to the warm-up: {:?}", rc_stage())
+		};
+		probe_rc();
+
+		set_block_number_rc(end_at - 1);
+		next_block_rc();
+		assert_eq!(rc_stage(), RcStage::AccountsInit);
+
+		// One block per data stage; 30 is room to spare over the 15 there are.
+		let mut blocks = 0;
+		let end_at = loop {
+			probe_rc();
+			if let RcStage::CoolOff { end_at } = rc_stage() {
+				break end_at;
+			}
+			assert!(blocks < 30, "the data stages did not reach the cool-off: {:?}", rc_stage());
+			next_block_rc();
+			blocks += 1;
+		};
+
+		set_block_number_rc(end_at - 1);
+		next_block_rc();
+		assert_eq!(rc_stage(), RcStage::MigrationDone);
+		probe_rc();
+		take_dmp(CoretimePara::PARA_ID.into())
+	});
+
+	// The Coretime chain ends its lockdown.
+	ct.execute_with(|| {
+		enqueue_dmp::<CoretimePara>(dmp);
+		next_block_para::<CoretimePara>();
+		assert_eq!(ct_stage(), CtStage::MigrationDone);
+		probe_ct();
+	});
+}
+
+/// The relay chain's lockdown at its current stage: open before the start, closed from the start
+/// on, including after `MigrationDone`.
+fn probe_rc_lockdown() {
+	type Rc = network::relay::Runtime;
+	let stage = rc_stage();
+	let started = stage.has_started();
+	let filtered: DispatchError = frame_system::Error::<Rc>::CallFiltered.into();
+
+	// A signed transfer.
+	hypothetically!({
+		assert_ok!(pallet_balances::Pallet::<Rc>::mint_into(&ALICE, 100 * UNITS));
+		let transfer =
+			network::relay::RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
+				dest: BOB.into(),
+				value: 10 * UNITS,
+			});
+		assert_eq!(
+			dispatch_signed(&ALICE, transfer),
+			if started { Err(filtered) } else { Ok(()) },
+			"a signed transfer at {stage:?}"
+		);
+		assert_eq!(
+			pallet_balances::Pallet::<Rc>::free_balance(&BOB),
+			if started { 0 } else { 10 * UNITS },
+			"the transfer's recipient at {stage:?}"
+		);
+	});
+
+	// The manager drives the migration with signed calls, which the filter lets through.
+	hypothetically!({
+		assert_ok!(pallet_rc2_migrator::Pallet::<Rc>::set_manager(
+			network::relay::RuntimeOrigin::root(),
+			Some(ALICE),
+		));
+		let pause =
+			network::relay::RuntimeCall::Rc2Migrator(pallet_rc2_migrator::Call::pause_migration {});
+		assert_eq!(
+			dispatch_signed(&ALICE, pause),
+			if stage.is_ongoing() {
+				Ok(())
+			} else {
+				Err(pallet_rc2_migrator::Error::<Rc>::NotRunning.into())
+			},
+			"the manager pausing at {stage:?}"
+		);
+	});
+
+	// Unpaid messages from system chains: from the start, only Coretime and Asset Hub get in.
+	for (para, admitted_once_started) in [
+		(system_parachain::BROKER_ID, true),
+		(system_parachain::ASSET_HUB_ID, true),
+		(system_parachain::BRIDGE_HUB_ID, false),
+	] {
+		assert_eq!(
+			hypothetically!(deliver_ump(para, unpaid_noop())),
+			if started && !admitted_once_started { Delivery::Refused } else { Delivery::Executed },
+			"an unpaid message from para {para} at {stage:?}"
+		);
+	}
+
+	// An ordinary para paying from its sovereign account here.
+	hypothetically!({
+		let sovereign: AccountId32 = ParaId::from(OUTSIDER_PARA).into_account_truncating();
+		assert_ok!(pallet_balances::Pallet::<Rc>::mint_into(&sovereign, 100 * UNITS));
+		assert_eq!(
+			deliver_ump(OUTSIDER_PARA, paid_transfer_to(&BOB)),
+			if started { Delivery::Refused } else { Delivery::Executed },
+			"a paid message from para {OUTSIDER_PARA} at {stage:?}"
+		);
+	});
+
+	// A teleport from Asset Hub mints here until the start, and nothing from then on.
+	hypothetically!({
+		let issuance = pallet_balances::Pallet::<Rc>::total_issuance();
+		let landed = if started { 0 } else { 10 * UNITS };
+		assert_eq!(
+			deliver_ump(system_parachain::ASSET_HUB_ID, teleport_to(&BOB, 10 * UNITS)),
+			if started {
+				Delivery::Failed(XcmError::UntrustedTeleportLocation)
+			} else {
+				Delivery::Executed
+			},
+			"a teleport from Asset Hub at {stage:?}"
+		);
+		assert_eq!(pallet_balances::Pallet::<Rc>::free_balance(&BOB), landed, "at {stage:?}");
+		assert_eq!(
+			pallet_balances::Pallet::<Rc>::total_issuance(),
+			issuance + landed,
+			"issuance after a teleport at {stage:?}"
+		);
+	});
+}
+
+/// The Coretime chain's lockdown at its current stage: proxy changes closed only while the
+/// migration runs.
+fn probe_ct_lockdown() {
+	type Ct = network::ct::Runtime;
+	let stage = ct_stage();
+	let filtered: DispatchError = frame_system::Error::<Ct>::CallFiltered.into();
+
+	// Adding a proxy.
+	hypothetically!({
+		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&ALICE, 100 * UNITS));
+		let add = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::add_proxy {
+			delegate: BOB.into(),
+			proxy_type: network::ct::ProxyType::Any,
+			delay: 0,
+		});
+		assert_eq!(
+			dispatch_signed(&ALICE, add),
+			if stage.is_ongoing() { Err(filtered) } else { Ok(()) },
+			"adding a proxy at {stage:?}"
+		);
+	});
+
+	// Using an existing proxy, here to make a transfer.
+	hypothetically!({
+		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&BOB, 100 * UNITS));
+		assert_ok!(pallet_proxy::Pallet::<Ct>::add_proxy_delegate(
+			&BOB,
+			ALICE,
+			network::ct::ProxyType::Any,
+			0,
+		));
+		let transfer =
+			network::ct::RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
+				dest: CAROL.into(),
+				value: 10 * UNITS,
+			});
+		let proxy = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::proxy {
+			real: BOB.into(),
+			force_proxy_type: None,
+			call: Box::new(transfer),
+		});
+		assert_eq!(dispatch_signed(&ALICE, proxy), Ok(()), "using a proxy at {stage:?}");
+		// `proxy` succeeds even when the inner call fails, so check what the inner call did.
+		assert_eq!(
+			pallet_balances::Pallet::<Ct>::free_balance(&CAROL),
+			10 * UNITS,
+			"the proxied transfer at {stage:?}"
+		);
+	});
+
+	// TODO(ahm-v2): probe `RegistrarPara` and `HrmpPara` once they are in the runtime: refused
+	// until `MigrationDone`, open from then on.
+}
+
+/// Dispatch `call` from `who`, through the runtime's call filter.
+fn dispatch_signed<C>(who: &AccountId32, call: C) -> Result<(), DispatchError>
+where
+	C: Dispatchable<PostInfo = PostDispatchInfo>,
+	C::RuntimeOrigin: From<frame_system::RawOrigin<AccountId32>>,
+{
+	call.dispatch(frame_system::RawOrigin::Signed(who.clone()).into())
+		.map(|_| ())
+		.map_err(|e| e.error)
+}
+
+/// Run relay-chain blocks until no inbound queue holds an unprocessed message.
+fn drain_all_inbound_queues() {
+	for _ in 0..5 * MINUTES {
+		if pallet_message_queue::ServiceHead::<network::relay::Runtime>::get().is_none() {
+			return;
+		}
+		next_block_rc_unchecked();
+	}
+	panic!("the relay chain's inbound queues did not drain");
+}
+
+/// A message that asks for free execution and does nothing else, so whether it runs is the
+/// barrier's verdict alone.
+fn unpaid_noop() -> Xcm<()> {
+	Xcm(vec![UnpaidExecution { weight_limit: Unlimited, check_origin: None }, ClearOrigin])
+}
+
+/// A message that pays for itself from the sender's account here and deposits the rest with `to`.
+fn paid_transfer_to(to: &AccountId32) -> Xcm<()> {
+	Xcm(vec![
+		// Take 10 units out of the sender's account here.
+		WithdrawAsset((Here, 10 * UNITS).into()),
+		// Pay for this message's execution out of it, at most 1 unit.
+		BuyExecution { fees: (Here, UNITS).into(), weight_limit: Unlimited },
+		// Put the rest in `to`'s account. Withdrawing 10 keeps the rest above the existential
+		// deposit, so the deposit cannot fail for that reason.
+		DepositAsset { assets: AllCounted(1).into(), beneficiary: account(to) },
+	])
+}
+
+/// A teleport of `amount` to `to`, unpaid as system chains send it.
+fn teleport_to(to: &AccountId32, amount: u128) -> Xcm<()> {
+	Xcm(vec![
+		UnpaidExecution { weight_limit: Unlimited, check_origin: None },
+		ReceiveTeleportedAsset((Here, amount).into()),
+		DepositAsset { assets: AllCounted(1).into(), beneficiary: account(to) },
+	])
+}
+
+fn account(who: &AccountId32) -> Location {
+	Junction::AccountId32 { network: None, id: who.clone().into() }.into()
+}
+
+fn rc_stage() -> pallet_rc2_migrator::MigrationStageOf<network::relay::Runtime> {
+	pallet_rc2_migrator::RcMigrationStage::<network::relay::Runtime>::get()
+}
+
+fn ct_stage() -> CtStage {
+	pallet_ct_migrator::CtMigrationStage::<network::ct::Runtime>::get()
+}

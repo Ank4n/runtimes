@@ -398,9 +398,16 @@ pub enum Delivery {
 /// Send `message` up from `para` and service the relay chain's message queue until it reports on
 /// that message. Only the queue runs, not the migrator, so the stage stays where it was.
 pub fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
-	let encoded = VersionedXcm::from(message).encode();
-	// Without a `SetTopic`, the message queue reports a message under the hash of its bytes.
-	let id = H256(blake2_256(&encoded));
+	deliver_encoded_ump(para, VersionedXcm::from(message).encode())
+}
+
+/// [`deliver_ump`] for a message already encoded, such as one taken from a parachain's queue.
+pub fn deliver_encoded_ump(para: u32, encoded: UpwardMessage) -> Delivery {
+	// The message queue reports a message under the hash of its bytes, unless the barrier admits it
+	// and it ends in a `SetTopic`: then under that topic (`TrailingSetTopicAsId`).
+	let hash = blake2_256(&encoded);
+	let topic = trailing_topic(&encoded).unwrap_or(hash);
+	let is_this = |id: &[u8; 32]| *id == hash || *id == topic;
 	enqueue_ump(para.into(), vec![encoded]);
 
 	for _ in 0..10 {
@@ -414,7 +421,7 @@ pub fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
 		let success = events.iter().find_map(|record| match record.event {
 			network::relay::RuntimeEvent::MessageQueue(
 				pallet_message_queue::Event::Processed { id: got, success, .. },
-			) if got == id => Some(success),
+			) if is_this(&got.0) => Some(success),
 			_ => None,
 		});
 		// The executor reports a failed instruction with its error. A barrier refusal is reported
@@ -424,7 +431,7 @@ pub fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
 				error,
 				message_id,
 				..
-			}) if *message_id == id.0 => Some(*error),
+			}) if is_this(message_id) => Some(*error),
 			_ => None,
 		});
 		match (success, failure) {
@@ -436,6 +443,16 @@ pub fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
 		}
 	}
 	panic!("the relay chain never processed the message from para {para}");
+}
+
+/// The topic an encoded XCM ends with, if its last instruction is a `SetTopic`.
+fn trailing_topic(encoded: &[u8]) -> Option<[u8; 32]> {
+	let versioned = VersionedXcm::<()>::decode(&mut &encoded[..]).ok()?;
+	let xcm: Xcm<()> = versioned.try_into().ok()?;
+	match xcm.0.last() {
+		Some(Instruction::SetTopic(topic)) => Some(*topic),
+		_ => None,
+	}
 }
 
 /// Decode a forwarded XCM and, for every `Transact` in it, check that the receiving runtime can
