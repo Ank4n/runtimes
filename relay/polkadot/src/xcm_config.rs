@@ -213,16 +213,13 @@ pub type AllowBarriers = (
 	>,
 );
 
-/// [`AllowBarriers`], behind the AHM v2 migration's inbound lockdown.
-pub type Barrier = TrailingSetTopicAsId<WithAhmV2Lockdown<AllowBarriers>>;
-
-/// `Allow`, behind the AHM v2 migration's inbound lockdown.
-#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
-type WithAhmV2Lockdown<Allow> =
-	xcm_builder::DenyThenTry<crate::ahm_v2::DenyOnceMigrationStarts, Allow>;
-/// `Allow` as is, without the AHM v2 migrator.
 #[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
-type WithAhmV2Lockdown<Allow> = Allow;
+pub type Barrier = TrailingSetTopicAsId<AllowBarriers>;
+/// [`AllowBarriers`], behind the AHM v2 migration's inbound lockdown.
+#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
+pub type Barrier = TrailingSetTopicAsId<
+	xcm_builder::DenyThenTry<crate::ahm_v2::DenyOnceMigrationStarts, AllowBarriers>,
+>;
 
 /// Locations that will not be charged fees in the executor, neither for execution nor delivery.
 /// We only waive fees for system functions, which these locations represent.
@@ -237,6 +234,7 @@ impl xcm_executor::Config for XcmConfig {
 	type OriginConverter = LocalOriginConverter;
 	// Polkadot Relay recognises no chains which act as reserves.
 	type IsReserve = ();
+	// Teleports to and from this chain are refused once the AHM v2 migration starts.
 	#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
 	type IsTeleporter = crate::ahm_v2::TrustedTeleportersBeforeMigration;
 	#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]

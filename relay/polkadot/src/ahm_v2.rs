@@ -129,7 +129,7 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 	const OFF: bool = false;
 
 	match call {
-	    // all ON calls during migration
+		// all ON calls during migration
 		// Applies a runtime upgrade governance already authorized.
 		System(frame_system::Call::apply_authorized_upgrade { .. }) => (ON, ON),
 		Babe(pallet_babe::Call::report_equivocation_unsigned { .. }) => (ON, ON),
