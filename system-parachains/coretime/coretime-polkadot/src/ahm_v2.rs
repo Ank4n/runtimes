@@ -27,8 +27,6 @@ use crate::{
 use frame_support::traits::{Contains, Everything};
 use frame_system::EnsureRoot;
 
-const LOG_TARGET: &str = "runtime::ahm-v2";
-
 impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = XcmRouter;
@@ -44,11 +42,7 @@ impl pallet_ct_migrator::Config for Runtime {
 pub struct CallsEnabledBeforeMigration;
 impl Contains<RuntimeCall> for CallsEnabledBeforeMigration {
 	fn contains(call: &RuntimeCall) -> bool {
-		let (before, _during) = call_allowed_status(call);
-		if !before {
-			log::warn!(target: LOG_TARGET, "Call bounced by the filter before the migration: {call:?}");
-		}
-		before
+		call_allowed_status(call).0
 	}
 }
 
@@ -56,11 +50,7 @@ impl Contains<RuntimeCall> for CallsEnabledBeforeMigration {
 pub struct CallsEnabledDuringMigration;
 impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 	fn contains(call: &RuntimeCall) -> bool {
-		let (_before, during) = call_allowed_status(call);
-		if !during {
-			log::warn!(target: LOG_TARGET, "Call bounced by the filter during the migration: {call:?}");
-		}
-		during
+		call_allowed_status(call).1
 	}
 }
 
@@ -104,11 +94,11 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 
 #[cfg(test)]
 mod tests {
-	use crate::{AccountId, ProxyType, Runtime, RuntimeCall};
+	use crate::{AccountId, IsFilteredBrokerCall, ProxyType, Runtime, RuntimeCall};
 	use codec::Encode;
-	use frame_support::traits::Contains;
+	use frame_support::traits::{Contains, EverythingBut};
 	use pallet_ct_migrator::{CtMigrationStage, MigrationStage};
-	use pallet_rc2_migrator::{CtMigratorCall, CtRuntimeCall};
+	use pallet_rc2_migrator::{test_utils::every_call, CtMigratorCall, CtRuntimeCall};
 	use parachains_runtimes_test_utils::ExtBuilder;
 
 	/// Ensure the pallet + call index aligns.
@@ -125,11 +115,16 @@ mod tests {
 		);
 	}
 
-	fn allowed_at(stage: &MigrationStage, call: &RuntimeCall) -> bool {
+	/// Run `f` with the migration at `stage`.
+	fn at<R>(stage: &MigrationStage, f: impl FnOnce() -> R) -> R {
 		ExtBuilder::<Runtime>::default().build().execute_with(|| {
-			CtMigrationStage::<Runtime>::put(stage.clone());
-			<Runtime as frame_system::Config>::BaseCallFilter::contains(call)
+			CtMigrationStage::<Runtime>::put(stage);
+			f()
 		})
+	}
+
+	fn allowed_at(stage: &MigrationStage, call: &RuntimeCall) -> bool {
+		at(stage, || <Runtime as frame_system::Config>::BaseCallFilter::contains(call))
 	}
 
 	#[test]
@@ -193,6 +188,41 @@ mod tests {
 			for call in &uses {
 				assert!(allowed_at(&stage, call), "{call:?} refused at {stage:?}");
 			}
+		}
+	}
+
+	/// The `pallet_proxy` calls that use a proxy. Every other one changes the proxy map or an
+	/// announcement.
+	const PROXY_USES: &[&str] = &["proxy", "proxy_announced"];
+
+	#[test]
+	fn every_call_passes_except_proxy_changes_while_the_migration_runs() {
+		let calls = every_call::<RuntimeCall>();
+		for name in PROXY_USES {
+			assert!(
+				calls.iter().any(|(p, n, _)| *p == "Proxy" && n == name),
+				"Proxy::{name} is not a call of this runtime"
+			);
+		}
+
+		for stage in [
+			MigrationStage::Pending,
+			MigrationStage::DataMigrationOngoing,
+			MigrationStage::MigrationDone,
+		] {
+			at(&stage, || {
+				for (pallet, name, call) in &calls {
+					// The broker filter applies at every stage; the lockdown only adds to it.
+					let proxy_change = *pallet == "Proxy" && !PROXY_USES.contains(name);
+					let expected = EverythingBut::<IsFilteredBrokerCall>::contains(call) &&
+						!(stage.is_ongoing() && proxy_change);
+					assert_eq!(
+						<Runtime as frame_system::Config>::BaseCallFilter::contains(call),
+						expected,
+						"{pallet}::{name} at {stage:?}"
+					);
+				}
+			});
 		}
 	}
 }

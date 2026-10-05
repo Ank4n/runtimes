@@ -35,8 +35,11 @@ extern crate alloc;
 
 #[cfg(test)]
 mod mock;
+#[cfg(feature = "std")]
+pub mod test_utils;
 #[cfg(test)]
 mod tests;
+pub mod xcm_config;
 
 pub use pallet::*;
 
@@ -685,12 +688,16 @@ pub mod pallet {
 impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T> {
 	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
 		let stage = RcMigrationStage::<T>::get();
-		if stage.is_finished() {
+		let allowed = if stage.is_finished() {
 			T::PostMigrationCalls::contains(call)
 		} else if stage.is_ongoing() {
 			T::IntraMigrationCalls::contains(call)
 		} else {
 			T::PreMigrationCalls::contains(call)
+		};
+		if !allowed {
+			log::debug!(target: LOG_TARGET, "Call filtered at {stage:?}: {call:?}");
 		}
+		allowed
 	}
 }

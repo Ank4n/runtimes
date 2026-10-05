@@ -15,11 +15,14 @@
 // along with Polkadot. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{
-	mock::*, CtMigratorCall, CtRuntimeCall, Error, Event, Manager, MigrationStage, Paused,
-	RcMigrationStage,
+	mock::*, xcm_config::FalseOnceStarted, CtMigratorCall, CtRuntimeCall, Error, Event, Manager,
+	MigrationStage, Paused, RcMigrationStage,
 };
 use codec::Encode;
-use frame_support::{assert_noop, assert_ok, traits::Contains};
+use frame_support::{
+	assert_noop, assert_ok,
+	traits::{Contains, ContainsPair, Everything},
+};
 use sp_runtime::DispatchError::BadOrigin;
 use xcm::prelude::*;
 
@@ -57,29 +60,16 @@ fn data_stages() -> Vec<Stage> {
 
 /// Every stage, in the order the machine walks them.
 fn all_stages() -> Vec<Stage> {
-	vec![
+	[
 		Stage::Pending,
 		Stage::Scheduled { start: 10 },
 		Stage::WaitingForCt,
 		Stage::WarmUp { end_at: 10 },
-		Stage::AccountsInit,
-		Stage::AccountsOngoing { last_key: None },
-		Stage::AccountsDone,
-		Stage::ProxyInit,
-		Stage::ProxyOngoing { last_key: None },
-		Stage::ProxyDone,
-		Stage::RegistrarInit,
-		Stage::RegistrarOngoing { last_key: None },
-		Stage::RegistrarDone,
-		Stage::HrmpInit,
-		Stage::HrmpOngoing { last_key: None },
-		Stage::HrmpDone,
-		Stage::Sweep,
-		Stage::SweepDust { last_key: None },
-		Stage::TiCorrection,
-		Stage::CoolOff { end_at: 10 },
-		Stage::MigrationDone,
 	]
+	.into_iter()
+	.chain(data_stages())
+	.chain([Stage::CoolOff { end_at: 10 }, Stage::MigrationDone])
+	.collect()
 }
 
 /// Blocks from the end of the warm-up to the opening of the cool-off: one per data stage.
@@ -864,6 +854,25 @@ fn each_stage_allows_only_its_own_call_set() {
 					"call set {tag} at {stage:?}"
 				);
 			}
+		}
+	});
+}
+
+#[test]
+fn teleport_trust_ends_when_the_migration_starts() {
+	new_test_ext().execute_with(|| {
+		let asset: Asset = (Here, 1u128).into();
+		let origin = Location::new(0, [Parachain(CT_PARA_ID)]);
+		for stage in all_stages() {
+			// GIVEN the machine at `stage`.
+			set_stage(stage.clone());
+
+			// THEN the inner filter's answer stands until the start, and nothing is trusted after.
+			assert_eq!(
+				FalseOnceStarted::<Test, Everything>::contains(&asset, &origin),
+				!stage.has_started(),
+				"at {stage:?}"
+			);
 		}
 	});
 }

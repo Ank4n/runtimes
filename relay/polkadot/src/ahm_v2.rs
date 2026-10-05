@@ -22,21 +22,19 @@
 
 use crate::{
 	parachains_paras, parachains_slashing,
-	xcm_config::{CoretimeLocation, TrustedTeleporters, XcmRouter},
+	xcm_config::{CoretimeLocation, XcmRouter},
 	AccountId, BrokerId, Runtime, RuntimeCall, RuntimeEvent, Timestamp,
 };
 use frame_support::{
-	traits::{Contains, ContainsPair, Equals, Everything, ProcessMessageError},
+	traits::{Contains, Equals, Everything, ProcessMessageError},
 	weights::Weight,
 };
 use frame_system::EnsureRoot;
 use pallet_rc2_migrator::RcMigrationStage;
 use pallet_xcm::EnsureXcm;
 use polkadot_runtime_constants::system_parachain::{ASSET_HUB_ID, BROKER_ID};
-use xcm::latest::{Asset, Instruction, Junction::Parachain, Location};
+use xcm::latest::{Instruction, Junction::Parachain, Location};
 use xcm_executor::traits::{DenyExecution, Properties};
-
-const LOG_TARGET: &str = "runtime::ahm-v2";
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -48,15 +46,6 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type PreMigrationCalls = Everything;
 	type IntraMigrationCalls = CallsEnabledDuringMigration;
 	type PostMigrationCalls = CallsEnabledAfterMigration;
-}
-
-/// [`TrustedTeleporters`] until the migration starts, nothing after.
-pub struct TrustedTeleportersBeforeMigration;
-impl ContainsPair<Asset, Location> for TrustedTeleportersBeforeMigration {
-	fn contains(asset: &Asset, origin: &Location) -> bool {
-		!RcMigrationStage::<Runtime>::get().has_started() &&
-			TrustedTeleporters::contains(asset, origin)
-	}
 }
 
 /// Refuses every inbound message once the migration starts, except from this chain, the Coretime
@@ -96,11 +85,7 @@ fn only_from_self_coretime_or_asset_hub(origin: &Location) -> Result<(), Process
 pub struct CallsEnabledDuringMigration;
 impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 	fn contains(call: &RuntimeCall) -> bool {
-		let (during, _after) = call_allowed_status(call);
-		if !during {
-			log::warn!(target: LOG_TARGET, "Call bounced by the filter during the migration: {call:?}");
-		}
-		during
+		call_allowed_status(call).0
 	}
 }
 
@@ -108,11 +93,7 @@ impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 pub struct CallsEnabledAfterMigration;
 impl Contains<RuntimeCall> for CallsEnabledAfterMigration {
 	fn contains(call: &RuntimeCall) -> bool {
-		let (_during, after) = call_allowed_status(call);
-		if !after {
-			log::warn!(target: LOG_TARGET, "Call bounced by the filter after the migration: {call:?}");
-		}
-		after
+		call_allowed_status(call).1
 	}
 }
 
@@ -211,13 +192,13 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
 	use crate::{
-		parachains_paras, xcm_config::SovereignAccountOf, AccountId, Balances, Header, Runtime,
-		RuntimeCall, RuntimeOrigin,
+		parachains_paras, xcm_config::SovereignAccountOf, AccountId, Balances, Header,
+		PostAhmFilter, Runtime, RuntimeCall, RuntimeOrigin,
 	};
 	use codec::Encode;
 	use frame_support::traits::{fungible::Mutate, Contains};
 	use pallet_ct_migrator::{Rc2MigratorCall, Rc2RuntimeCall};
-	use pallet_rc2_migrator::{MigrationStageOf, RcMigrationStage};
+	use pallet_rc2_migrator::{test_utils::every_call, MigrationStageOf, RcMigrationStage};
 	use polkadot_runtime_constants::{
 		currency::UNITS,
 		system_parachain::{ASSET_HUB_ID, BRIDGE_HUB_ID, BROKER_ID},
@@ -237,11 +218,19 @@ mod tests {
 
 	type Stage = MigrationStageOf<Runtime>;
 
-	fn allowed_at(stage: &Stage, call: &RuntimeCall) -> bool {
+	/// Any account.
+	const ALICE: AccountId = AccountId::new([1; 32]);
+
+	/// Run `f` with the migration at `stage`.
+	fn at<R>(stage: &Stage, f: impl FnOnce() -> R) -> R {
 		sp_io::TestExternalities::default().execute_with(|| {
-			RcMigrationStage::<Runtime>::put(stage.clone());
-			<Runtime as frame_system::Config>::BaseCallFilter::contains(call)
+			RcMigrationStage::<Runtime>::put(stage);
+			f()
 		})
+	}
+
+	fn allowed_at(stage: &Stage, call: &RuntimeCall) -> bool {
+		at(stage, || <Runtime as frame_system::Config>::BaseCallFilter::contains(call))
 	}
 
 	fn stages_before_start() -> Vec<Stage> {
@@ -281,17 +270,16 @@ mod tests {
 
 	#[test]
 	fn signed_calls_are_refused_once_the_migration_starts() {
-		let alice = AccountId::new([1; 32]); // any signed account
 		let remark = RuntimeCall::System(frame_system::Call::remark { remark: vec![1] });
 		let calls = [
 			RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
-				dest: alice.clone().into(),
+				dest: ALICE.into(),
 				value: 1,
 			}),
 			remark.clone(),
 			RuntimeCall::Utility(pallet_utility::Call::batch { calls: vec![remark.clone()] }),
 			RuntimeCall::Proxy(pallet_proxy::Call::proxy {
-				real: alice.into(),
+				real: ALICE.into(),
 				force_proxy_type: None,
 				call: Box::new(remark),
 			}),
@@ -345,22 +333,102 @@ mod tests {
 		}
 	}
 
+	/// Every call the lockdown leaves enabled: inherents, unsigned validator reports, applying code
+	/// governance already authorized, calls only the Coretime chain or Asset Hub can make, and the
+	/// migrator's own.
+	const ENABLED: &[(&str, &[&str])] = &[
+		("System", &["apply_authorized_upgrade"]),
+		("Babe", &["report_equivocation_unsigned"]),
+		("Timestamp", &["set"]),
+		("Grandpa", &["report_equivocation_unsigned"]),
+		(
+			"StakingAhClient",
+			&[
+				"validator_set",
+				"set_mode",
+				"force_on_migration_end",
+				"set_keys_from_ah",
+				"purge_keys_from_ah",
+			],
+		),
+		("Parameters", &["set_parameter"]),
+		("ParaInherent", &["enter"]),
+		("Paras", &["include_pvf_check_statement", "apply_authorized_force_set_current_code"]),
+		("ParasSlashing", &["report_dispute_lost_unsigned"]),
+		(
+			"Coretime",
+			// CLAUDE: similar to other comment, we don't need request revenue and credit_account, right?
+			// I guess no harm in keeping, but in any case we should leave a comment.
+			&["request_core_count", "request_revenue_at", "credit_account", "assign_core"],
+		),
+		(
+			"Beefy",
+			&[
+				"report_double_voting_unsigned",
+				"report_fork_voting_unsigned",
+				"report_future_block_voting_unsigned",
+			],
+		),
+		(
+			"Rc2Migrator",
+			&[
+				"schedule_migration",
+				"cancel_migration",
+				"ct_ready",
+				"pause_migration",
+				"resume_migration",
+				"force_set_stage",
+				"set_manager",
+			],
+		),
+	];
+
+	#[test]
+	fn every_call_but_the_listed_ones_is_refused_once_the_migration_starts() {
+		let calls = every_call::<RuntimeCall>();
+		let listed = |pallet: &str, name: &str| {
+			ENABLED.iter().any(|(p, names)| *p == pallet && names.contains(&name))
+		};
+
+		// Every listed call is a call of this runtime.
+		for (pallet, names) in ENABLED {
+			for name in *names {
+				assert!(
+					calls.iter().any(|(p, n, _)| p == pallet && n == name),
+					"{pallet}::{name} is not a call of this runtime"
+				);
+			}
+		}
+
+		// GIVEN the migration has not started. THEN the lockdown changes nothing.
+		// GIVEN the migration has started. THEN only a listed call passes, also after it is done.
+		for stage in stages_before_start().into_iter().chain(stages_from_start()) {
+			at(&stage, || {
+				for (pallet, name, call) in &calls {
+					let expected = if stage.has_started() {
+						listed(pallet, name)
+					} else {
+						PostAhmFilter::contains(call)
+					};
+					assert_eq!(
+						<Runtime as frame_system::Config>::BaseCallFilter::contains(call),
+						expected,
+						"{pallet}::{name} at {stage:?}"
+					);
+				}
+			});
+		}
+	}
+
 	#[test]
 	fn root_skips_the_filter() {
-		let alice = AccountId::new([1; 32]); // any signed account
 		let remark = RuntimeCall::System(frame_system::Call::remark { remark: vec![1] });
 
 		for stage in stages_from_start() {
-			sp_io::TestExternalities::default().execute_with(|| {
-				// GIVEN the migration at `stage`.
-				RcMigrationStage::<Runtime>::put(stage.clone());
-
+			at(&stage, || {
 				// THEN a signed account's remark is filtered, and Root's is not.
 				assert_eq!(
-					remark
-						.clone()
-						.dispatch(RuntimeOrigin::signed(alice.clone()))
-						.map_err(|e| e.error),
+					remark.clone().dispatch(RuntimeOrigin::signed(ALICE)).map_err(|e| e.error),
 					Err(frame_system::Error::<Runtime>::CallFiltered.into()),
 					"at {stage:?}"
 				);
@@ -370,14 +438,12 @@ mod tests {
 	}
 
 	fn teleport_from_asset_hub(stage: &Stage) -> Outcome {
-		sp_io::TestExternalities::default().execute_with(|| {
-			RcMigrationStage::<Runtime>::put(stage.clone());
-			let alice = AccountId::new([1; 32]); // beneficiary
+		at(stage, || {
 			let message = Xcm::<RuntimeCall>(vec![
 				ReceiveTeleportedAsset((Here, 10 * UNITS).into()),
 				DepositAsset {
 					assets: AllCounted(1).into(),
-					beneficiary: AccountId32 { network: None, id: alice.into() }.into(),
+					beneficiary: AccountId32 { network: None, id: ALICE.into() }.into(),
 				},
 			]);
 			// No weight limit, and the weight counts as paid so the barrier admits a message that
@@ -417,8 +483,7 @@ mod tests {
 		origin: Location,
 		message: Xcm<RuntimeCall>,
 	) -> Result<(), XcmError> {
-		sp_io::TestExternalities::default().execute_with(|| {
-			RcMigrationStage::<Runtime>::put(stage.clone());
+		at(stage, || {
 			let account = SovereignAccountOf::convert_location(&origin).expect("origin converts");
 			<Balances as Mutate<AccountId>>::mint_into(&account, 100 * UNITS).unwrap();
 			XcmExecutor::<crate::xcm_config::XcmConfig>::prepare_and_execute(
@@ -438,13 +503,12 @@ mod tests {
 	}
 
 	fn paid() -> Xcm<RuntimeCall> {
-		let alice = AccountId::new([1; 32]); // beneficiary
 		Xcm(vec![
 			WithdrawAsset((Here, 10 * UNITS).into()),
 			BuyExecution { fees: (Here, UNITS).into(), weight_limit: Unlimited },
 			DepositAsset {
 				assets: AllCounted(1).into(),
-				beneficiary: AccountId32 { network: None, id: alice.into() }.into(),
+				beneficiary: AccountId32 { network: None, id: ALICE.into() }.into(),
 			},
 		])
 	}
