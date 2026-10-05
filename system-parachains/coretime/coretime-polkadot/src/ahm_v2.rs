@@ -33,11 +33,19 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
-	// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` stay closed before and during the migration,
-	// and open after it.
-	type PreMigrationCalls = Everything;
+	type PreMigrationCalls = CallsEnabledBeforeMigration;
 	type IntraMigrationCalls = CallsEnabledDuringMigration;
 	type PostMigrationCalls = Everything;
+}
+
+/// Contains all calls that are enabled before the migration starts.
+pub struct CallsEnabledBeforeMigration;
+impl Contains<RuntimeCall> for CallsEnabledBeforeMigration {
+	fn contains(_call: &RuntimeCall) -> bool {
+		// TODO(ahm-v2): disable `RegistrarPara` and `HrmpPara` here. They stay closed during the
+		// migration too, and open once it is done.
+		true
+	}
 }
 
 /// Contains all calls that are enabled during the migration.
@@ -56,7 +64,7 @@ impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 		const OFF: bool = false;
 
 		let enabled = match call {
-		    // all ON calls during migration
+			// all ON calls during migration
 			System(..) => ON,
 			ParachainSystem(..) => ON,
 			Timestamp(..) => ON,
@@ -79,7 +87,6 @@ impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 			// all OFF calls during migration
 			Proxy(..) => OFF,
 			// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` should be OFF when pallets are wired.
-
 		};
 		if !enabled {
 			log::warn!("Call bounced by the filter during the migration: {call:?}");
