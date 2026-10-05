@@ -41,57 +41,62 @@ impl pallet_ct_migrator::Config for Runtime {
 /// Contains all calls that are enabled before the migration starts.
 pub struct CallsEnabledBeforeMigration;
 impl Contains<RuntimeCall> for CallsEnabledBeforeMigration {
-	fn contains(_call: &RuntimeCall) -> bool {
-		// TODO(ahm-v2): disable `RegistrarPara` and `HrmpPara` here. They stay closed during the
-		// migration too, and open once it is done.
-		true
+	fn contains(call: &RuntimeCall) -> bool {
+		let (before, _during) = call_allowed_status(call);
+		if !before {
+			log::warn!("Call bounced by the filter before the migration: {call:?}");
+		}
+		before
 	}
 }
 
 /// Contains all calls that are enabled during the migration.
-///
-/// Proxy definitions arrive from the relay chain and are merged into `pallet_proxy`, so every
-/// proxy call that changes the proxy map or an announcement is disabled. Using a proxy stays
-/// enabled.
-///
-/// Announcements are not migrated: the relay chain releases their deposits and sends them to
-/// Asset Hub as free balance.
 pub struct CallsEnabledDuringMigration;
 impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 	fn contains(call: &RuntimeCall) -> bool {
-		use RuntimeCall::*;
-		const ON: bool = true;
-		const OFF: bool = false;
-
-		let enabled = match call {
-			// all ON calls during migration
-			System(..) => ON,
-			ParachainSystem(..) => ON,
-			Timestamp(..) => ON,
-			ParachainInfo(..) => ON,
-			Balances(..) => ON,
-			CollatorSelection(..) => ON,
-			Session(..) => ON,
-			XcmpQueue(..) => ON,
-			PolkadotXcm(..) => ON,
-			CumulusXcm(..) => ON,
-			MessageQueue(..) => ON,
-			Utility(..) => ON,
-			Multisig(..) => ON,
-			Proxy(
-				pallet_proxy::Call::proxy { .. } | pallet_proxy::Call::proxy_announced { .. },
-			) => ON,
-			Broker(..) => ON,
-			CtMigrator(..) => ON,
-
-			// all OFF calls during migration
-			Proxy(..) => OFF,
-			// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` should be OFF when pallets are wired.
-		};
-		if !enabled {
+		let (_before, during) = call_allowed_status(call);
+		if !during {
 			log::warn!("Call bounced by the filter during the migration: {call:?}");
 		}
-		enabled
+		during
+	}
+}
+
+/// Return whether a call is enabled before and during the migration. Every call is enabled after
+/// it.
+///
+/// During is from the relay chain's start signal until it ends the lockdown.
+///
+/// Proxy definitions arrive from the relay chain and are merged into `pallet_proxy`, so during the
+/// migration every proxy call that changes the proxy map or an announcement is disabled. Using a
+/// proxy stays enabled. Announcements are not migrated: the relay chain releases their deposits
+/// and sends them to Asset Hub as free balance.
+pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
+	use RuntimeCall::*;
+	const ON: bool = true;
+	const OFF: bool = false;
+
+	match call {
+		System(..) => (ON, ON),
+		ParachainSystem(..) => (ON, ON),
+		Timestamp(..) => (ON, ON),
+		ParachainInfo(..) => (ON, ON),
+		Balances(..) => (ON, ON),
+		CollatorSelection(..) => (ON, ON),
+		Session(..) => (ON, ON),
+		XcmpQueue(..) => (ON, ON),
+		PolkadotXcm(..) => (ON, ON),
+		CumulusXcm(..) => (ON, ON),
+		MessageQueue(..) => (ON, ON),
+		Utility(..) => (ON, ON),
+		Multisig(..) => (ON, ON),
+		Proxy(pallet_proxy::Call::proxy { .. } | pallet_proxy::Call::proxy_announced { .. }) =>
+			(ON, ON),
+		Broker(..) => (ON, ON),
+		CtMigrator(..) => (ON, ON),
+
+		// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` join as `(OFF, OFF)`.
+		Proxy(..) => (ON, OFF),
 	}
 }
 
