@@ -618,6 +618,9 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::Sweep => {
+					// TODO(ahm-v2): pay the on-demand revenue still held here out to the Coretime
+					// chain (`coretime::Pallet::notify_revenue` up to this block). The Coretime
+					// chain cannot request it once the migration starts.
 					Self::transition(MigrationStage::SweepDust { last_key: None });
 					T::DbWeight::get().reads_writes(1, 1)
 				},

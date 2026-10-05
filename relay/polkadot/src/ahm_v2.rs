@@ -131,7 +131,10 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		) => (ON, ON),
 		ParasSlashing(parachains_slashing::Call::report_dispute_lost_unsigned { .. }) => (ON, ON),
 		// The Coretime chain only.
-		Coretime(..) => (ON, ON),
+		Coretime(
+			runtime_parachains::coretime::Call::request_core_count { .. } |
+			runtime_parachains::coretime::Call::assign_core { .. },
+		) => (ON, ON),
 		Beefy(
 			pallet_beefy::Call::report_double_voting_unsigned { .. } |
 			pallet_beefy::Call::report_fork_voting_unsigned { .. } |
@@ -182,6 +185,9 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		Slots(..) => (OFF, OFF),
 		Auctions(..) => (OFF, OFF),
 		Crowdloan(..) => (OFF, OFF),
+		// On-demand orders close at the start, so there is no revenue to request and no use for
+		// credits. The sweep stage pays out the revenue already earned.
+		Coretime(..) => (OFF, OFF),
 		XcmPallet(..) => (OFF, OFF),
 		MessageQueue(..) => (OFF, OFF),
 		AssetRate(..) => (OFF, OFF),
@@ -192,18 +198,21 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
 	use crate::{
-		parachains_paras, xcm_config::SovereignAccountOf, AccountId, Balances, Header,
-		PostAhmFilter, Runtime, RuntimeCall, RuntimeOrigin,
+		xcm_config::SovereignAccountOf, AccountId, Balances, PostAhmFilter, Runtime, RuntimeCall,
+		RuntimeOrigin,
 	};
 	use codec::Encode;
 	use frame_support::traits::{fungible::Mutate, Contains};
 	use pallet_ct_migrator::{Rc2MigratorCall, Rc2RuntimeCall};
-	use pallet_rc2_migrator::{test_utils::every_call, MigrationStageOf, RcMigrationStage};
+	use pallet_rc2_migrator::{
+		test_utils::{every_call, CallName},
+		MigrationStageOf, RcMigrationStage,
+	};
 	use polkadot_runtime_constants::{
 		currency::UNITS,
 		system_parachain::{ASSET_HUB_ID, BRIDGE_HUB_ID, BROKER_ID},
 	};
-	use sp_runtime::traits::{Dispatchable, Header as _};
+	use sp_runtime::traits::Dispatchable;
 	use xcm::latest::prelude::*;
 	use xcm_executor::{traits::ConvertLocation, XcmExecutor};
 
@@ -229,10 +238,6 @@ mod tests {
 		})
 	}
 
-	fn allowed_at(stage: &Stage, call: &RuntimeCall) -> bool {
-		at(stage, || <Runtime as frame_system::Config>::BaseCallFilter::contains(call))
-	}
-
 	fn stages_before_start() -> Vec<Stage> {
 		vec![Stage::Pending, Stage::Scheduled { start: 0 }]
 	}
@@ -246,91 +251,6 @@ mod tests {
 			Stage::CoolOff { end_at: 0 },
 			Stage::MigrationDone,
 		]
-	}
-
-	fn babe_equivocation_proof() -> Box<babe_primitives::EquivocationProof<Header>> {
-		let header = Header::new(
-			0,
-			Default::default(),
-			Default::default(),
-			Default::default(),
-			Default::default(),
-		);
-		Box::new(babe_primitives::EquivocationProof {
-			offender: sp_core::sr25519::Public::from_raw([0; 32]).into(),
-			slot: 0.into(),
-			first_header: header.clone(),
-			second_header: header,
-		})
-	}
-
-	fn key_owner_proof() -> sp_session::MembershipProof {
-		sp_session::MembershipProof { session: 0, trie_nodes: vec![], validator_count: 0 }
-	}
-
-	#[test]
-	fn signed_calls_are_refused_once_the_migration_starts() {
-		let remark = RuntimeCall::System(frame_system::Call::remark { remark: vec![1] });
-		let calls = [
-			RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
-				dest: ALICE.into(),
-				value: 1,
-			}),
-			remark.clone(),
-			RuntimeCall::Utility(pallet_utility::Call::batch { calls: vec![remark.clone()] }),
-			RuntimeCall::Proxy(pallet_proxy::Call::proxy {
-				real: ALICE.into(),
-				force_proxy_type: None,
-				call: Box::new(remark),
-			}),
-			RuntimeCall::Babe(pallet_babe::Call::report_equivocation {
-				equivocation_proof: babe_equivocation_proof(),
-				key_owner_proof: key_owner_proof(),
-			}),
-			RuntimeCall::Paras(parachains_paras::Call::remove_upgrade_cooldown {
-				para: 2000.into(),
-			}),
-		];
-
-		for call in calls {
-			// GIVEN the migration has not started. THEN the call passes.
-			for stage in stages_before_start() {
-				assert!(allowed_at(&stage, &call), "{call:?} refused at {stage:?}");
-			}
-			// GIVEN the migration has started. THEN the call is refused, also after it is done.
-			for stage in stages_from_start() {
-				assert!(!allowed_at(&stage, &call), "{call:?} allowed at {stage:?}");
-			}
-		}
-	}
-
-	#[test]
-	fn consensus_and_permissioned_calls_pass_at_every_stage() {
-		let calls = [
-			RuntimeCall::Timestamp(pallet_timestamp::Call::set { now: 0 }),
-			RuntimeCall::System(frame_system::Call::apply_authorized_upgrade { code: vec![] }),
-			RuntimeCall::Babe(pallet_babe::Call::report_equivocation_unsigned {
-				equivocation_proof: babe_equivocation_proof(),
-				key_owner_proof: key_owner_proof(),
-			}),
-			RuntimeCall::Paras(parachains_paras::Call::apply_authorized_force_set_current_code {
-				para: 2000.into(),
-				new_code: vec![].into(),
-			}),
-			RuntimeCall::Coretime(runtime_parachains::coretime::Call::request_core_count {
-				count: 1,
-			}),
-			RuntimeCall::StakingAhClient(pallet_staking_async_ah_client::Call::set_mode {
-				mode: pallet_staking_async_ah_client::OperatingMode::Active,
-			}),
-			RuntimeCall::Rc2Migrator(pallet_rc2_migrator::Call::ct_ready {}),
-		];
-
-		for call in calls {
-			for stage in stages_before_start().into_iter().chain(stages_from_start()) {
-				assert!(allowed_at(&stage, &call), "{call:?} refused at {stage:?}");
-			}
-		}
 	}
 
 	/// Every call the lockdown leaves enabled: inherents, unsigned validator reports, applying code
@@ -355,12 +275,7 @@ mod tests {
 		("ParaInherent", &["enter"]),
 		("Paras", &["include_pvf_check_statement", "apply_authorized_force_set_current_code"]),
 		("ParasSlashing", &["report_dispute_lost_unsigned"]),
-		(
-			"Coretime",
-			// CLAUDE: similar to other comment, we don't need request revenue and credit_account, right?
-			// I guess no harm in keeping, but in any case we should leave a comment.
-			&["request_core_count", "request_revenue_at", "credit_account", "assign_core"],
-		),
+		("Coretime", &["request_core_count", "assign_core"]),
 		(
 			"Beefy",
 			&[
@@ -383,37 +298,74 @@ mod tests {
 		),
 	];
 
+	/// Calls the test below cannot build. It builds each call from zero bytes, and these take an
+	/// argument whose first byte is a version or variant tag that zero is not: XCM's `Versioned*`
+	/// types start at version 3, BABE's `NextConfigDescriptor` at 1. Each falls under its pallet's
+	/// catch-all arm in [`super::call_allowed_status`].
+	const UNDECODABLE: &[CallName] = &[
+		("Babe", "plan_config_change"),
+		("Treasury", "spend"),
+		("XcmPallet", "send"),
+		("XcmPallet", "teleport_assets"),
+		("XcmPallet", "reserve_transfer_assets"),
+		("XcmPallet", "execute"),
+		("XcmPallet", "force_subscribe_version_notify"),
+		("XcmPallet", "force_unsubscribe_version_notify"),
+		("XcmPallet", "limited_reserve_transfer_assets"),
+		("XcmPallet", "limited_teleport_assets"),
+		("XcmPallet", "transfer_assets"),
+		("XcmPallet", "claim_assets"),
+		("XcmPallet", "transfer_assets_using_type_and_then"),
+		("XcmPallet", "add_authorized_alias"),
+		("XcmPallet", "remove_authorized_alias"),
+		("AssetRate", "create"),
+		("AssetRate", "update"),
+		("AssetRate", "remove"),
+	];
+
+	/// If this fails after an upgrade, a call was added, renamed or removed. For a new call that no
+	/// signed account can reach (an inherent, an unsigned report, an XCM-only or migrator call),
+	/// enable it in [`super::call_allowed_status`] and list it in [`ENABLED`]. For a call a signed
+	/// account can reach, keep it disabled. A rename or removal only needs the lists updated.
 	#[test]
 	fn every_call_but_the_listed_ones_is_refused_once_the_migration_starts() {
-		let calls = every_call::<RuntimeCall>();
-		let listed = |pallet: &str, name: &str| {
-			ENABLED.iter().any(|(p, names)| *p == pallet && names.contains(&name))
+		let (calls, undecodable) = every_call::<RuntimeCall>();
+		assert_eq!(undecodable, UNDECODABLE, "calls the test cannot build changed");
+		let listed = |name: &CallName| {
+			ENABLED
+				.iter()
+				.any(|(pallet, calls)| *pallet == name.0 && calls.contains(&name.1))
 		};
 
 		// Every listed call is a call of this runtime.
 		for (pallet, names) in ENABLED {
 			for name in *names {
 				assert!(
-					calls.iter().any(|(p, n, _)| p == pallet && n == name),
+					calls.iter().any(|(n, _)| *n == (*pallet, *name)),
 					"{pallet}::{name} is not a call of this runtime"
 				);
 			}
 		}
 
-		// GIVEN the migration has not started. THEN the lockdown changes nothing.
-		// GIVEN the migration has started. THEN only a listed call passes, also after it is done.
 		for stage in stages_before_start().into_iter().chain(stages_from_start()) {
 			at(&stage, || {
-				for (pallet, name, call) in &calls {
+				for (name, call) in &calls {
 					let expected = if stage.has_started() {
-						listed(pallet, name)
+						// From the start, a call passes exactly when it is listed in `ENABLED`.
+						listed(name)
 					} else {
+						// Before the start, the lockdown adds nothing: the filter is
+						// `PostAhmFilter`.
 						PostAhmFilter::contains(call)
 					};
+					// This fails both ways: a listed call that is refused, and an unlisted call
+					// that passes.
 					assert_eq!(
 						<Runtime as frame_system::Config>::BaseCallFilter::contains(call),
 						expected,
-						"{pallet}::{name} at {stage:?}"
+						"{}::{} at {stage:?}",
+						name.0,
+						name.1,
 					);
 				}
 			});

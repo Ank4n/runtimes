@@ -20,13 +20,16 @@ use alloc::{vec, vec::Vec};
 use codec::Decode;
 use scale_info::{TypeDef, TypeInfo};
 
-/// Every call of a runtime by pallet and call name, decoded from zero bytes. A call whose
-/// arguments do not decode from zeros is left out.
-pub fn every_call<Call: TypeInfo + Decode>() -> Vec<(&'static str, &'static str, Call)> {
+/// A call of a runtime, by pallet and call name.
+pub type CallName = (&'static str, &'static str);
+
+/// Every call of a runtime, decoded from zero bytes, and the names of those whose arguments do not
+/// decode from zeros.
+pub fn every_call<Call: TypeInfo + Decode>() -> (Vec<(CallName, Call)>, Vec<CallName>) {
 	let TypeDef::Variant(pallets) = Call::type_info().type_def else {
 		panic!("the runtime call is an enum")
 	};
-	let mut calls = vec![];
+	let (mut calls, mut skipped) = (vec![], vec![]);
 	for pallet in pallets.variants {
 		let TypeDef::Variant(variants) = pallet.fields[0].ty.type_info().type_def else {
 			panic!("a pallet's calls are an enum")
@@ -35,10 +38,11 @@ pub fn every_call<Call: TypeInfo + Decode>() -> Vec<(&'static str, &'static str,
 			let mut bytes = [0u8; 1026];
 			bytes[0] = pallet.index;
 			bytes[1] = variant.index;
-			if let Ok(call) = Call::decode(&mut &bytes[..]) {
-				calls.push((pallet.name, variant.name, call));
+			match Call::decode(&mut &bytes[..]) {
+				Ok(call) => calls.push(((pallet.name, variant.name), call)),
+				Err(_) => skipped.push((pallet.name, variant.name)),
 			}
 		}
 	}
-	calls
+	(calls, skipped)
 }
