@@ -26,6 +26,7 @@ use frame_support::{
 use network::constants::{currency::UNITS, system_parachain, time::MINUTES};
 use pallet_ct_migrator::MigrationStage as CtStage;
 use pallet_rc2_migrator::MigrationStage as RcStage;
+use sp_core::H256;
 use sp_io::TestExternalities;
 use sp_runtime::{
 	traits::{AccountIdConversion, Dispatchable},
@@ -270,8 +271,8 @@ fn probe_rc_lockdown() {
 	});
 }
 
-/// The Coretime chain's lockdown at its current stage: proxy changes closed only while the
-/// migration runs.
+/// The Coretime chain's lockdown at its current stage: changes to the proxy map closed only while
+/// the migration runs, announcements open throughout.
 fn probe_ct_lockdown() {
 	type Ct = network::ct::Runtime;
 	let stage = ct_stage();
@@ -317,6 +318,37 @@ fn probe_ct_lockdown() {
 			pallet_balances::Pallet::<Ct>::free_balance(&CAROL),
 			10 * UNITS,
 			"the proxied transfer at {stage:?}"
+		);
+	});
+
+	// Announcing through a time-delayed proxy, and the owner cancelling it.
+	hypothetically!({
+		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&ALICE, 100 * UNITS));
+		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&BOB, 100 * UNITS));
+		assert_ok!(pallet_proxy::Pallet::<Ct>::add_proxy_delegate(
+			&BOB,
+			ALICE,
+			network::ct::ProxyType::Any,
+			10,
+		));
+		let call_hash = H256::repeat_byte(1);
+		let announce = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::announce {
+			real: BOB.into(),
+			call_hash,
+		});
+		assert_eq!(dispatch_signed(&ALICE, announce), Ok(()), "announcing at {stage:?}");
+		assert_eq!(pallet_proxy::Announcements::<Ct>::get(&ALICE).0.len(), 1);
+
+		let reject = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::reject_announcement {
+			delegate: ALICE.into(),
+			call_hash,
+		});
+		assert_eq!(dispatch_signed(&BOB, reject), Ok(()), "rejecting at {stage:?}");
+		assert!(pallet_proxy::Announcements::<Ct>::get(&ALICE).0.is_empty(), "at {stage:?}");
+		assert_eq!(
+			pallet_balances::Pallet::<Ct>::reserved_balance(&ALICE),
+			0,
+			"the announcement deposit is released at {stage:?}"
 		);
 	});
 

@@ -60,9 +60,9 @@ impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 /// During is from the relay chain's start signal until it ends the lockdown.
 ///
 /// Proxy definitions arrive from the relay chain and are merged into `pallet_proxy`, so during the
-/// migration every proxy call that changes the proxy map or an announcement is disabled. Using a
-/// proxy stays enabled. Announcements are not migrated: the relay chain releases their deposits
-/// and sends them to Asset Hub as free balance.
+/// migration every proxy call that changes the proxy map, or the deposits recorded in it, is
+/// disabled. Using a proxy and handling announcements stay enabled. Announcements are not
+/// migrated: the relay chain releases their deposits and sends them to Asset Hub as free balance.
 pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 	use RuntimeCall::*;
 	const ON: bool = true;
@@ -82,8 +82,14 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		MessageQueue(..) => (ON, ON),
 		Utility(..) => (ON, ON),
 		Multisig(..) => (ON, ON),
-		Proxy(pallet_proxy::Call::proxy { .. } | pallet_proxy::Call::proxy_announced { .. }) =>
-			(ON, ON),
+		// Leave the proxy map untouched.
+		Proxy(
+			pallet_proxy::Call::proxy { .. } |
+			pallet_proxy::Call::proxy_announced { .. } |
+			pallet_proxy::Call::announce { .. } |
+			pallet_proxy::Call::remove_announcement { .. } |
+			pallet_proxy::Call::reject_announcement { .. },
+		) => (ON, ON),
 		Broker(..) => (ON, ON),
 		CtMigrator(..) => (ON, ON),
 
@@ -132,15 +138,23 @@ mod tests {
 				proxy_type: ProxyType::Any,
 				delay: 0,
 			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::remove_proxy {
+				delegate: alice.clone().into(),
+				proxy_type: ProxyType::Any,
+				delay: 0,
+			}),
 			RuntimeCall::Proxy(pallet_proxy::Call::remove_proxies {}),
 			RuntimeCall::Proxy(pallet_proxy::Call::create_pure {
 				proxy_type: ProxyType::Any,
 				delay: 0,
 				index: 0,
 			}),
-			RuntimeCall::Proxy(pallet_proxy::Call::announce {
-				real: alice.clone().into(),
-				call_hash: Default::default(),
+			RuntimeCall::Proxy(pallet_proxy::Call::kill_pure {
+				spawner: alice.clone().into(),
+				proxy_type: ProxyType::Any,
+				index: 0,
+				height: 0,
+				ext_index: 0,
 			}),
 			RuntimeCall::Proxy(pallet_proxy::Call::poke_deposit {}),
 		];
@@ -152,9 +166,21 @@ mod tests {
 			}),
 			RuntimeCall::Proxy(pallet_proxy::Call::proxy_announced {
 				delegate: alice.clone().into(),
-				real: alice.into(),
+				real: alice.clone().into(),
 				force_proxy_type: None,
 				call: Box::new(remark.clone()),
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::announce {
+				real: alice.clone().into(),
+				call_hash: Default::default(),
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::remove_announcement {
+				real: alice.clone().into(),
+				call_hash: Default::default(),
+			}),
+			RuntimeCall::Proxy(pallet_proxy::Call::reject_announcement {
+				delegate: alice.clone().into(),
+				call_hash: Default::default(),
 			}),
 			remark,
 		];
@@ -168,7 +194,7 @@ mod tests {
 			for call in &changes {
 				assert_eq!(allowed_at(&stage, call), !stage.is_ongoing(), "{call:?} at {stage:?}");
 			}
-			// THEN using a proxy, and any other call, passes at every stage.
+			// THEN using a proxy, handling announcements, and any other call, pass at every stage.
 			for call in &uses {
 				assert!(allowed_at(&stage, call), "{call:?} refused at {stage:?}");
 			}
