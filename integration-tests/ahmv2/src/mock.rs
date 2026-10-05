@@ -41,11 +41,11 @@ use runtime_parachains::{
 	dmp::{self, DownwardMessageQueues},
 };
 use sp_core::H256;
-use sp_io::TestExternalities;
+use sp_io::{hashing::blake2_256, TestExternalities};
 use sp_runtime::{traits::One, BoundedVec};
 use tokio::sync::OnceCell;
 use xcm::{
-	latest::prelude::{Instruction, Xcm},
+	latest::prelude::{Instruction, Xcm, XcmError},
 	VersionedXcm,
 };
 
@@ -292,10 +292,10 @@ fn next_block<T>(
 	frame_system::Pallet::<T>::reset_events();
 	let weight = hooks(now);
 
-	// A message the executor refused outright, such as one the barrier turned away, is discarded
-	// as `ProcessingFailed`; one whose XCM errored mid-execution is `Processed` with
-	// `success: false`. A `Transact` whose call fails is neither on its own -- the migrators
-	// follow every `Transact` with `ExpectTransactStatus` so that it becomes the latter.
+	// A message that does not decode is discarded as `ProcessingFailed`. One the barrier turned
+	// away, or whose XCM errored mid-execution, is `Processed` with `success: false`. A `Transact`
+	// whose call fails is neither on its own -- the migrators follow every `Transact` with
+	// `ExpectTransactStatus` so that it becomes the latter.
 	let rejected: Vec<_> = frame_system::Pallet::<T>::events()
 		.into_iter()
 		.filter_map(|record| match record.event.try_into() {
@@ -382,6 +382,60 @@ pub fn enqueue_ump(para: ParaId, msgs: Vec<UpwardMessage>) {
 			UmpOrigin::Ump(UmpQueue::Para(para)),
 		);
 	}
+}
+
+/// What became of one inbound message.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Delivery {
+	/// Admitted, and every instruction succeeded.
+	Executed,
+	/// Admitted, and an instruction failed with this error.
+	Failed(XcmError),
+	/// Turned away by the barrier before any instruction ran.
+	Refused,
+}
+
+/// Send `message` up from `para` and service the relay chain's message queue until it reports on
+/// that message. Only the queue runs, not the migrator, so the stage stays where it was.
+pub fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
+	let encoded = VersionedXcm::from(message).encode();
+	// Without a `SetTopic`, the message queue reports a message under the hash of its bytes.
+	let id = H256(blake2_256(&encoded));
+	enqueue_ump(para.into(), vec![encoded]);
+
+	for _ in 0..10 {
+		let now = frame_system::Pallet::<RelayRuntime>::block_number() + 1;
+		frame_system::Pallet::<RelayRuntime>::set_block_number(now);
+		frame_system::Pallet::<RelayRuntime>::reset_events();
+		<network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		<network::relay::MessageQueue as OnFinalize<_>>::on_finalize(now);
+
+		let events = frame_system::Pallet::<RelayRuntime>::events();
+		let success = events.iter().find_map(|record| match record.event {
+			network::relay::RuntimeEvent::MessageQueue(
+				pallet_message_queue::Event::Processed { id: got, success, .. },
+			) if got == id => Some(success),
+			_ => None,
+		});
+		// The executor reports a failed instruction with its error. A barrier refusal is reported
+		// only as an unsuccessful `Processed`.
+		let failure = events.iter().find_map(|record| match &record.event {
+			network::relay::RuntimeEvent::XcmPallet(pallet_xcm::Event::ProcessXcmError {
+				error,
+				message_id,
+				..
+			}) if *message_id == id.0 => Some(*error),
+			_ => None,
+		});
+		match (success, failure) {
+			(Some(true), None) => return Delivery::Executed,
+			(Some(false), Some(error)) => return Delivery::Failed(error),
+			(Some(false), None) => return Delivery::Refused,
+			(None, None) => (),
+			outcome => panic!("inconsistent report for the message from para {para}: {outcome:?}"),
+		}
+	}
+	panic!("the relay chain never processed the message from para {para}");
 }
 
 /// Decode a forwarded XCM and, for every `Transact` in it, check that the receiving runtime can
