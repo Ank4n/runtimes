@@ -218,7 +218,7 @@ pub type Barrier = TrailingSetTopicAsId<AllowBarriers>;
 /// [`AllowBarriers`], behind the AHM v2 migration's inbound lockdown.
 #[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
 pub type Barrier = TrailingSetTopicAsId<
-	xcm_builder::DenyThenTry<crate::ahm_v2::DenyOnceMigrationStarts, AllowBarriers>,
+	xcm_builder::DenyThenTry<crate::ahm_v2::lockdown::DenyOnceMigrationStarts, AllowBarriers>,
 >;
 
 /// Locations that will not be charged fees in the executor, neither for execution nor delivery.
