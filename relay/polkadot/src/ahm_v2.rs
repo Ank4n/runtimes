@@ -22,12 +22,14 @@
 
 use crate::{
 	parachains_paras, parachains_slashing,
-	xcm_config::{CoretimeLocation, XcmRouter},
+	xcm_config::{CoretimeLocation, TrustedTeleporters, XcmRouter},
 	AccountId, BrokerId, Runtime, RuntimeCall, RuntimeEvent, Timestamp,
 };
-use frame_support::traits::{Contains, Equals, Everything};
+use frame_support::traits::{Contains, ContainsPair, Equals, Everything};
 use frame_system::EnsureRoot;
+use pallet_rc2_migrator::RcMigrationStage;
 use pallet_xcm::EnsureXcm;
+use xcm::latest::{Asset, Location};
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -39,6 +41,18 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type PreMigrationCalls = Everything;
 	type IntraMigrationCalls = CallsEnabledDuringMigration;
 	type PostMigrationCalls = CallsEnabledAfterMigration;
+}
+
+/// [`TrustedTeleporters`] until the migration starts, nothing after.
+///
+/// This chain has no teleport checking account (`NoTeleportTracking`), so an accepted inbound
+/// teleport mints new balance here.
+pub struct TrustedTeleportersBeforeMigration;
+impl ContainsPair<Asset, Location> for TrustedTeleportersBeforeMigration {
+	fn contains(asset: &Asset, origin: &Location) -> bool {
+		!RcMigrationStage::<Runtime>::get().has_started() &&
+			TrustedTeleporters::contains(asset, origin)
+	}
 }
 
 /// Contains all calls that are enabled during the migration.
@@ -165,7 +179,10 @@ mod tests {
 	use frame_support::traits::Contains;
 	use pallet_ct_migrator::{Rc2MigratorCall, Rc2RuntimeCall};
 	use pallet_rc2_migrator::{MigrationStageOf, RcMigrationStage};
+	use polkadot_runtime_constants::{currency::UNITS, system_parachain::ASSET_HUB_ID};
 	use sp_runtime::traits::{Dispatchable, Header as _};
+	use xcm::latest::prelude::*;
+	use xcm_executor::XcmExecutor;
 
 	/// Ensure the pallet + call index aligns.
 	#[test]
@@ -307,6 +324,47 @@ mod tests {
 				);
 				assert!(remark.clone().dispatch(RuntimeOrigin::root()).is_ok(), "at {stage:?}");
 			});
+		}
+	}
+
+	fn teleport_from_asset_hub(stage: &Stage) -> Outcome {
+		sp_io::TestExternalities::default().execute_with(|| {
+			RcMigrationStage::<Runtime>::put(stage.clone());
+			let alice = AccountId::new([1; 32]); // beneficiary
+			let message = Xcm::<RuntimeCall>(vec![
+				ReceiveTeleportedAsset((Here, 10 * UNITS).into()),
+				DepositAsset {
+					assets: AllCounted(1).into(),
+					beneficiary: AccountId32 { network: None, id: alice.into() }.into(),
+				},
+			]);
+			// No weight limit, and the weight counts as paid so the barrier admits a message that
+			// does not buy execution.
+			XcmExecutor::<crate::xcm_config::XcmConfig>::prepare_and_execute(
+				Parachain(ASSET_HUB_ID),
+				message,
+				&mut [0u8; 32],
+				Weight::MAX,
+				Weight::MAX,
+			)
+		})
+	}
+
+	#[test]
+	fn inbound_teleports_are_refused_once_the_migration_starts() {
+		// GIVEN the migration has not started. THEN a teleport from Asset Hub lands.
+		for stage in stages_before_start() {
+			assert_eq!(teleport_from_asset_hub(&stage).ensure_complete(), Ok(()), "at {stage:?}");
+		}
+
+		// GIVEN the migration has started. THEN the same teleport is refused as untrusted, also
+		// after it is done.
+		for stage in stages_from_start() {
+			assert_eq!(
+				teleport_from_asset_hub(&stage).ensure_complete().map_err(|e| e.error),
+				Err(XcmError::UntrustedTeleportLocation),
+				"at {stage:?}"
+			);
 		}
 	}
 }

@@ -226,6 +226,9 @@ impl xcm_executor::Config for XcmConfig {
 	type OriginConverter = LocalOriginConverter;
 	// Polkadot Relay recognises no chains which act as reserves.
 	type IsReserve = ();
+	#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
+	type IsTeleporter = crate::ahm_v2::TrustedTeleportersBeforeMigration;
+	#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
 	type IsTeleporter = TrustedTeleporters;
 	type UniversalLocation = UniversalLocation;
 	type Barrier = Barrier;
