@@ -190,7 +190,7 @@ impl Contains<Location> for AssetHubPlurality {
 }
 
 /// The barriers one of which must be passed for an XCM message to be executed.
-pub type Barrier = TrailingSetTopicAsId<(
+pub type AllowBarriers = (
 	// Weight that is paid for may be consumed.
 	TakeWeightCredit,
 	// Expected responses are OK.
@@ -211,7 +211,18 @@ pub type Barrier = TrailingSetTopicAsId<(
 		UniversalLocation,
 		ConstU32<8>,
 	>,
-)>;
+);
+
+/// [`AllowBarriers`], behind the AHM v2 migration's inbound lockdown.
+pub type Barrier = TrailingSetTopicAsId<WithAhmV2Lockdown<AllowBarriers>>;
+
+/// `Allow`, behind the AHM v2 migration's inbound lockdown.
+#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
+type WithAhmV2Lockdown<Allow> =
+	xcm_builder::DenyThenTry<crate::ahm_v2::DenyOnceMigrationStarts, Allow>;
+/// `Allow` as is, without the AHM v2 migrator.
+#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
+type WithAhmV2Lockdown<Allow> = Allow;
 
 /// Locations that will not be charged fees in the executor, neither for execution nor delivery.
 /// We only waive fees for system functions, which these locations represent.

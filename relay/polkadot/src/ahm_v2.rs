@@ -25,11 +25,16 @@ use crate::{
 	xcm_config::{CoretimeLocation, TrustedTeleporters, XcmRouter},
 	AccountId, BrokerId, Runtime, RuntimeCall, RuntimeEvent, Timestamp,
 };
-use frame_support::traits::{Contains, ContainsPair, Equals, Everything};
+use frame_support::{
+	traits::{Contains, ContainsPair, Equals, Everything, ProcessMessageError},
+	weights::Weight,
+};
 use frame_system::EnsureRoot;
 use pallet_rc2_migrator::RcMigrationStage;
 use pallet_xcm::EnsureXcm;
-use xcm::latest::{Asset, Location};
+use polkadot_runtime_constants::system_parachain::{ASSET_HUB_ID, BROKER_ID};
+use xcm::latest::{Asset, Instruction, Junction::Parachain, Location};
+use xcm_executor::traits::{DenyExecution, Properties};
 
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
@@ -44,14 +49,44 @@ impl pallet_rc2_migrator::Config for Runtime {
 }
 
 /// [`TrustedTeleporters`] until the migration starts, nothing after.
-///
-/// This chain has no teleport checking account (`NoTeleportTracking`), so an accepted inbound
-/// teleport mints new balance here.
 pub struct TrustedTeleportersBeforeMigration;
 impl ContainsPair<Asset, Location> for TrustedTeleportersBeforeMigration {
 	fn contains(asset: &Asset, origin: &Location) -> bool {
 		!RcMigrationStage::<Runtime>::get().has_started() &&
 			TrustedTeleporters::contains(asset, origin)
+	}
+}
+
+/// Refuses every inbound message once the migration starts, except from this chain, the Coretime
+/// chain and Asset Hub.
+pub struct DenyOnceMigrationStarts;
+impl DenyExecution for DenyOnceMigrationStarts {
+	fn deny_execution<RuntimeCall>(
+		origin: &Location,
+		_instructions: &mut [Instruction<RuntimeCall>],
+		_max_weight: Weight,
+		_properties: &mut Properties,
+	) -> Result<(), ProcessMessageError> {
+		let stage = RcMigrationStage::<Runtime>::get();
+		if !stage.has_started() {
+			Ok(())
+		} else if stage.is_ongoing() {
+			only_from_self_coretime_or_asset_hub(origin)
+		} else {
+			// TODO(ahm-v2): paras reach `HrmpRelay` and `RegistrarRelay` over XCM after the
+			// migration; let that envelope through here.
+			only_from_self_coretime_or_asset_hub(origin)
+		}
+	}
+}
+
+/// CT assigns cores and answers the migrator. AH governance dispatches here as Root / admin body, and its staking
+/// sends the validator set and session keys.
+fn only_from_self_coretime_or_asset_hub(origin: &Location) -> Result<(), ProcessMessageError> {
+	match origin.unpack() {
+		(0, []) => Ok(()),
+		(0, [Parachain(id)]) if *id == BROKER_ID || *id == ASSET_HUB_ID => Ok(()),
+		_ => Err(ProcessMessageError::Unsupported),
 	}
 }
 
@@ -174,15 +209,21 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 
 #[cfg(test)]
 mod tests {
-	use crate::{parachains_paras, AccountId, Header, Runtime, RuntimeCall, RuntimeOrigin};
+	use crate::{
+		parachains_paras, xcm_config::SovereignAccountOf, AccountId, Balances, Header, Runtime,
+		RuntimeCall, RuntimeOrigin,
+	};
 	use codec::Encode;
-	use frame_support::traits::Contains;
+	use frame_support::traits::{fungible::Mutate, Contains};
 	use pallet_ct_migrator::{Rc2MigratorCall, Rc2RuntimeCall};
 	use pallet_rc2_migrator::{MigrationStageOf, RcMigrationStage};
-	use polkadot_runtime_constants::{currency::UNITS, system_parachain::ASSET_HUB_ID};
+	use polkadot_runtime_constants::{
+		currency::UNITS,
+		system_parachain::{ASSET_HUB_ID, BRIDGE_HUB_ID, BROKER_ID},
+	};
 	use sp_runtime::traits::{Dispatchable, Header as _};
 	use xcm::latest::prelude::*;
-	use xcm_executor::XcmExecutor;
+	use xcm_executor::{traits::ConvertLocation, XcmExecutor};
 
 	/// Ensure the pallet + call index aligns.
 	#[test]
@@ -365,6 +406,83 @@ mod tests {
 				Err(XcmError::UntrustedTeleportLocation),
 				"at {stage:?}"
 			);
+		}
+	}
+
+	/// Execute `message` from `origin`, with `origin`'s account on this chain funded so a paid
+	/// message can complete.
+	fn execute_from(
+		stage: &Stage,
+		origin: Location,
+		message: Xcm<RuntimeCall>,
+	) -> Result<(), XcmError> {
+		sp_io::TestExternalities::default().execute_with(|| {
+			RcMigrationStage::<Runtime>::put(stage.clone());
+			let account = SovereignAccountOf::convert_location(&origin).expect("origin converts");
+			<Balances as Mutate<AccountId>>::mint_into(&account, 100 * UNITS).unwrap();
+			XcmExecutor::<crate::xcm_config::XcmConfig>::prepare_and_execute(
+				origin,
+				message,
+				&mut [0u8; 32],
+				Weight::MAX,
+				Weight::zero(),
+			)
+			.ensure_complete()
+			.map_err(|e| e.error)
+		})
+	}
+
+	fn unpaid() -> Xcm<RuntimeCall> {
+		Xcm(vec![UnpaidExecution { weight_limit: Unlimited, check_origin: None }, ClearOrigin])
+	}
+
+	fn paid() -> Xcm<RuntimeCall> {
+		let alice = AccountId::new([1; 32]); // beneficiary
+		Xcm(vec![
+			WithdrawAsset((Here, 10 * UNITS).into()),
+			BuyExecution { fees: (Here, UNITS).into(), weight_limit: Unlimited },
+			DepositAsset {
+				assets: AllCounted(1).into(),
+				beneficiary: AccountId32 { network: None, id: alice.into() }.into(),
+			},
+		])
+	}
+
+	#[test]
+	fn only_coretime_and_asset_hub_reach_this_chain_once_the_migration_starts() {
+		let para = || Location::new(0, [Parachain(2000)]);
+		let system = |id| Location::new(0, [Parachain(id)]);
+
+		// GIVEN the migration has not started. THEN a para and any system chain get through.
+		for stage in stages_before_start() {
+			assert_eq!(execute_from(&stage, para(), paid()), Ok(()), "at {stage:?}");
+			assert_eq!(execute_from(&stage, system(BRIDGE_HUB_ID), paid()), Ok(()), "at {stage:?}");
+			assert_eq!(
+				execute_from(&stage, system(BRIDGE_HUB_ID), unpaid()),
+				Ok(()),
+				"at {stage:?}"
+			);
+		}
+
+		// GIVEN the migration has started. THEN a para and every other system chain are refused,
+		// paid or unpaid, also after it is done. The Coretime chain and Asset Hub get through.
+		for stage in stages_from_start() {
+			for message in [paid(), unpaid()] {
+				for origin in [para(), system(BRIDGE_HUB_ID)] {
+					assert_eq!(
+						execute_from(&stage, origin.clone(), message.clone()),
+						Err(XcmError::Barrier),
+						"{origin:?} at {stage:?}"
+					);
+				}
+				for origin in [system(BROKER_ID), system(ASSET_HUB_ID)] {
+					assert_eq!(
+						execute_from(&stage, origin.clone(), message.clone()),
+						Ok(()),
+						"{origin:?} at {stage:?}"
+					);
+				}
+			}
 		}
 	}
 }
