@@ -130,9 +130,11 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 			parachains_paras::Call::apply_authorized_force_set_current_code { .. },
 		) => (ON, ON),
 		ParasSlashing(parachains_slashing::Call::report_dispute_lost_unsigned { .. }) => (ON, ON),
-		// The Coretime chain only.
+		// The Coretime chain only. `request_revenue_at` lets it claim the on-demand revenue earned
+		// before the start.
 		Coretime(
 			runtime_parachains::coretime::Call::request_core_count { .. } |
+			runtime_parachains::coretime::Call::request_revenue_at { .. } |
 			runtime_parachains::coretime::Call::assign_core { .. },
 		) => (ON, ON),
 		Beefy(
@@ -185,8 +187,7 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		Slots(..) => (OFF, OFF),
 		Auctions(..) => (OFF, OFF),
 		Crowdloan(..) => (OFF, OFF),
-		// On-demand orders close at the start, so there is no revenue to request and no use for
-		// credits. The sweep stage pays out the revenue already earned.
+		// On-demand orders close at the start, so credits have no use.
 		Coretime(..) => (OFF, OFF),
 		XcmPallet(..) => (OFF, OFF),
 		MessageQueue(..) => (OFF, OFF),
@@ -256,46 +257,34 @@ mod tests {
 	/// Every call the lockdown leaves enabled: inherents, unsigned validator reports, applying code
 	/// governance already authorized, calls only the Coretime chain or Asset Hub can make, and the
 	/// migrator's own.
-	const ENABLED: &[(&str, &[&str])] = &[
-		("System", &["apply_authorized_upgrade"]),
-		("Babe", &["report_equivocation_unsigned"]),
-		("Timestamp", &["set"]),
-		("Grandpa", &["report_equivocation_unsigned"]),
-		(
-			"StakingAhClient",
-			&[
-				"validator_set",
-				"set_mode",
-				"force_on_migration_end",
-				"set_keys_from_ah",
-				"purge_keys_from_ah",
-			],
-		),
-		("Parameters", &["set_parameter"]),
-		("ParaInherent", &["enter"]),
-		("Paras", &["include_pvf_check_statement", "apply_authorized_force_set_current_code"]),
-		("ParasSlashing", &["report_dispute_lost_unsigned"]),
-		("Coretime", &["request_core_count", "assign_core"]),
-		(
-			"Beefy",
-			&[
-				"report_double_voting_unsigned",
-				"report_fork_voting_unsigned",
-				"report_future_block_voting_unsigned",
-			],
-		),
-		(
-			"Rc2Migrator",
-			&[
-				"schedule_migration",
-				"cancel_migration",
-				"ct_ready",
-				"pause_migration",
-				"resume_migration",
-				"force_set_stage",
-				"set_manager",
-			],
-		),
+	const ENABLED: &[CallName] = &[
+		("System", "apply_authorized_upgrade"),
+		("Babe", "report_equivocation_unsigned"),
+		("Timestamp", "set"),
+		("Grandpa", "report_equivocation_unsigned"),
+		("StakingAhClient", "validator_set"),
+		("StakingAhClient", "set_mode"),
+		("StakingAhClient", "force_on_migration_end"),
+		("StakingAhClient", "set_keys_from_ah"),
+		("StakingAhClient", "purge_keys_from_ah"),
+		("Parameters", "set_parameter"),
+		("ParaInherent", "enter"),
+		("Paras", "include_pvf_check_statement"),
+		("Paras", "apply_authorized_force_set_current_code"),
+		("ParasSlashing", "report_dispute_lost_unsigned"),
+		("Coretime", "request_core_count"),
+		("Coretime", "request_revenue_at"),
+		("Coretime", "assign_core"),
+		("Beefy", "report_double_voting_unsigned"),
+		("Beefy", "report_fork_voting_unsigned"),
+		("Beefy", "report_future_block_voting_unsigned"),
+		("Rc2Migrator", "schedule_migration"),
+		("Rc2Migrator", "cancel_migration"),
+		("Rc2Migrator", "ct_ready"),
+		("Rc2Migrator", "pause_migration"),
+		("Rc2Migrator", "resume_migration"),
+		("Rc2Migrator", "force_set_stage"),
+		("Rc2Migrator", "set_manager"),
 	];
 
 	/// Calls the test below cannot build. It builds each call from zero bytes, and these take an
@@ -331,20 +320,9 @@ mod tests {
 	fn every_call_but_the_listed_ones_is_refused_once_the_migration_starts() {
 		let (calls, undecodable) = every_call::<RuntimeCall>();
 		assert_eq!(undecodable, UNDECODABLE, "calls the test cannot build changed");
-		let listed = |name: &CallName| {
-			ENABLED
-				.iter()
-				.any(|(pallet, calls)| *pallet == name.0 && calls.contains(&name.1))
-		};
-
 		// Every listed call is a call of this runtime.
-		for (pallet, names) in ENABLED {
-			for name in *names {
-				assert!(
-					calls.iter().any(|(n, _)| *n == (*pallet, *name)),
-					"{pallet}::{name} is not a call of this runtime"
-				);
-			}
+		for name in ENABLED {
+			assert!(calls.iter().any(|(n, _)| n == name), "{name:?} is not a call of this runtime");
 		}
 
 		for stage in stages_before_start().into_iter().chain(stages_from_start()) {
@@ -352,7 +330,7 @@ mod tests {
 				for (name, call) in &calls {
 					let expected = if stage.has_started() {
 						// From the start, a call passes exactly when it is listed in `ENABLED`.
-						listed(name)
+						ENABLED.contains(name)
 					} else {
 						// Before the start, the lockdown adds nothing: the filter is
 						// `PostAhmFilter`.
@@ -389,39 +367,20 @@ mod tests {
 		}
 	}
 
-	fn teleport_from_asset_hub(stage: &Stage) -> Outcome {
-		at(stage, || {
-			let message = Xcm::<RuntimeCall>(vec![
-				ReceiveTeleportedAsset((Here, 10 * UNITS).into()),
-				DepositAsset {
-					assets: AllCounted(1).into(),
-					beneficiary: AccountId32 { network: None, id: ALICE.into() }.into(),
-				},
-			]);
-			// No weight limit, and the weight counts as paid so the barrier admits a message that
-			// does not buy execution.
-			XcmExecutor::<crate::xcm_config::XcmConfig>::prepare_and_execute(
-				Parachain(ASSET_HUB_ID),
-				message,
-				&mut [0u8; 32],
-				Weight::MAX,
-				Weight::MAX,
-			)
-		})
-	}
-
 	#[test]
 	fn inbound_teleports_are_refused_once_the_migration_starts() {
+		let asset_hub = Location::new(0, [Parachain(ASSET_HUB_ID)]);
+
 		// GIVEN the migration has not started. THEN a teleport from Asset Hub lands.
 		for stage in stages_before_start() {
-			assert_eq!(teleport_from_asset_hub(&stage).ensure_complete(), Ok(()), "at {stage:?}");
+			assert_eq!(execute_from(&stage, asset_hub.clone(), teleport()), Ok(()), "at {stage:?}");
 		}
 
 		// GIVEN the migration has started. THEN the same teleport is refused as untrusted, also
 		// after it is done.
 		for stage in stages_from_start() {
 			assert_eq!(
-				teleport_from_asset_hub(&stage).ensure_complete().map_err(|e| e.error),
+				execute_from(&stage, asset_hub.clone(), teleport()),
 				Err(XcmError::UntrustedTeleportLocation),
 				"at {stage:?}"
 			);
@@ -454,6 +413,17 @@ mod tests {
 		Xcm(vec![UnpaidExecution { weight_limit: Unlimited, check_origin: None }, ClearOrigin])
 	}
 
+	fn teleport() -> Xcm<RuntimeCall> {
+		Xcm(vec![
+			UnpaidExecution { weight_limit: Unlimited, check_origin: None },
+			ReceiveTeleportedAsset((Here, 10 * UNITS).into()),
+			DepositAsset {
+				assets: AllCounted(1).into(),
+				beneficiary: AccountId32 { network: None, id: ALICE.into() }.into(),
+			},
+		])
+	}
+
 	fn paid() -> Xcm<RuntimeCall> {
 		Xcm(vec![
 			WithdrawAsset((Here, 10 * UNITS).into()),
@@ -467,32 +437,35 @@ mod tests {
 
 	#[test]
 	fn only_coretime_and_asset_hub_reach_this_chain_once_the_migration_starts() {
-		let para = || Location::new(0, [Parachain(2000)]);
-		let system = |id| Location::new(0, [Parachain(id)]);
+		let para = |id| Location::new(0, [Parachain(id)]);
 
 		// GIVEN the migration has not started. THEN a para and any system chain get through.
 		for stage in stages_before_start() {
-			assert_eq!(execute_from(&stage, para(), paid()), Ok(()), "at {stage:?}");
-			assert_eq!(execute_from(&stage, system(BRIDGE_HUB_ID), paid()), Ok(()), "at {stage:?}");
-			assert_eq!(
-				execute_from(&stage, system(BRIDGE_HUB_ID), unpaid()),
-				Ok(()),
-				"at {stage:?}"
-			);
+			for (origin, message) in [
+				(para(2000), paid()),
+				(para(BRIDGE_HUB_ID), paid()),
+				(para(BRIDGE_HUB_ID), unpaid()),
+			] {
+				assert_eq!(
+					execute_from(&stage, origin.clone(), message),
+					Ok(()),
+					"{origin:?} at {stage:?}"
+				);
+			}
 		}
 
 		// GIVEN the migration has started. THEN a para and every other system chain are refused,
 		// paid or unpaid, also after it is done. The Coretime chain and Asset Hub get through.
 		for stage in stages_from_start() {
 			for message in [paid(), unpaid()] {
-				for origin in [para(), system(BRIDGE_HUB_ID)] {
+				for origin in [para(2000), para(BRIDGE_HUB_ID)] {
 					assert_eq!(
 						execute_from(&stage, origin.clone(), message.clone()),
 						Err(XcmError::Barrier),
 						"{origin:?} at {stage:?}"
 					);
 				}
-				for origin in [system(BROKER_ID), system(ASSET_HUB_ID)] {
+				for origin in [para(BROKER_ID), para(ASSET_HUB_ID)] {
 					assert_eq!(
 						execute_from(&stage, origin.clone(), message.clone()),
 						Ok(()),

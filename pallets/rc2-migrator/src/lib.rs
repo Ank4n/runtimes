@@ -47,7 +47,7 @@ use alloc::vec;
 use frame_support::{
 	pallet_prelude::*,
 	sp_runtime::traits::Saturating,
-	traits::{Contains, EnsureOrigin, Time},
+	traits::{Contains, EnsureOrigin, GetCallMetadata, Time},
 };
 use frame_system::pallet_prelude::*;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
@@ -376,7 +376,9 @@ pub mod pallet {
 		/// - `start`: The wall-clock time at which the migration will start.
 		/// - `warm_up`: Duration in blocks used to prepare for the migration. Calls are filtered
 		///   during this period. It is intended to give enough time for UMP and DMP queues to
-		///   empty. Counted from the transition to the warm-up stage.
+		///   empty, and must be longer than one Coretime timeslice: on-demand orders close at the
+		///   start, and the Coretime chain claims the revenue earned before it at its next
+		///   timeslice boundary. Counted from the transition to the warm-up stage.
 		/// - `cool_off`: Duration in blocks of the post migration cool-off period. Counted from the
 		///   transition to the cool-off stage.
 		///
@@ -618,9 +620,10 @@ pub mod pallet {
 					T::DbWeight::get().reads_writes(1, 1)
 				},
 				MigrationStage::Sweep => {
-					// TODO(ahm-v2): pay the on-demand revenue still held here out to the Coretime
-					// chain (`coretime::Pallet::notify_revenue` up to this block). The Coretime
-					// chain cannot request it once the migration starts.
+					// TODO(ahm-v2): sweep the on-demand pot to the Asset Hub beneficiary with the
+					// other pots, and emit an event for it, so governance can move it later. It
+					// holds revenue only if the Coretime chain has not claimed
+					// it yet.
 					Self::transition(MigrationStage::SweepDust { last_key: None });
 					T::DbWeight::get().reads_writes(1, 1)
 				},
@@ -688,7 +691,10 @@ pub mod pallet {
 
 /// The call filter for the current migration stage. Meant to be part of the runtime's
 /// `BaseCallFilter`.
-impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T> {
+impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
+where
+	<T as frame_system::Config>::RuntimeCall: GetCallMetadata,
+{
 	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
 		let stage = RcMigrationStage::<T>::get();
 		let allowed = if stage.is_finished() {
@@ -699,7 +705,13 @@ impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
 			T::PreMigrationCalls::contains(call)
 		};
 		if !allowed {
-			log::debug!(target: LOG_TARGET, "Call filtered at {stage:?}: {call:?}");
+			let call = call.get_call_metadata();
+			log::debug!(
+				target: LOG_TARGET,
+				"Call filtered at {stage:?}: {}::{}",
+				call.pallet_name,
+				call.function_name,
+			);
 		}
 		allowed
 	}

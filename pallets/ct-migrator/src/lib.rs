@@ -53,7 +53,7 @@ use frame_support::{
 	storage::with_storage_layer,
 	traits::{
 		fungible::{Inspect, Mutate, MutateHold},
-		Contains, EnsureOrigin,
+		Contains, EnsureOrigin, GetCallMetadata,
 	},
 };
 use frame_system::pallet_prelude::*;
@@ -352,7 +352,10 @@ pub mod pallet {
 
 /// The call filter for the current migration stage. Meant to be part of the runtime's
 /// `BaseCallFilter`.
-impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T> {
+impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
+where
+	<T as frame_system::Config>::RuntimeCall: GetCallMetadata,
+{
 	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
 		let stage = CtMigrationStage::<T>::get();
 		let allowed = if stage.is_finished() {
@@ -363,7 +366,13 @@ impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
 			T::PreMigrationCalls::contains(call)
 		};
 		if !allowed {
-			log::debug!(target: LOG_TARGET, "Call filtered at {stage:?}: {call:?}");
+			let call = call.get_call_metadata();
+			log::debug!(
+				target: LOG_TARGET,
+				"Call filtered at {stage:?}: {}::{}",
+				call.pallet_name,
+				call.function_name,
+			);
 		}
 		allowed
 	}

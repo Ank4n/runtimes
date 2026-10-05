@@ -115,21 +115,16 @@ mod tests {
 		);
 	}
 
-	/// Run `f` with the migration at `stage`.
-	fn at<R>(stage: &MigrationStage, f: impl FnOnce() -> R) -> R {
+	fn allowed_at(stage: &MigrationStage, call: &RuntimeCall) -> bool {
 		ExtBuilder::<Runtime>::default().build().execute_with(|| {
 			CtMigrationStage::<Runtime>::put(stage);
-			f()
+			<Runtime as frame_system::Config>::BaseCallFilter::contains(call)
 		})
-	}
-
-	fn allowed_at(stage: &MigrationStage, call: &RuntimeCall) -> bool {
-		at(stage, || <Runtime as frame_system::Config>::BaseCallFilter::contains(call))
 	}
 
 	#[test]
 	fn proxy_changes_are_refused_while_the_migration_runs() {
-		let alice = AccountId::new([1; 32]); // delegate
+		let alice = AccountId::new([1; 32]); // any account
 		let remark = RuntimeCall::System(frame_system::Call::remark { remark: vec![1] });
 		let changes = [
 			RuntimeCall::Proxy(pallet_proxy::Call::add_proxy {
@@ -164,27 +159,16 @@ mod tests {
 			remark,
 		];
 
-		// GIVEN the migration has not started or is done. THEN proxy changes pass.
-		for stage in [MigrationStage::Pending, MigrationStage::MigrationDone] {
-			for call in &changes {
-				assert!(allowed_at(&stage, call), "{call:?} refused at {stage:?}");
-			}
-		}
-
-		// GIVEN the migration is running. THEN proxy changes are refused.
-		for call in &changes {
-			assert!(
-				!allowed_at(&MigrationStage::DataMigrationOngoing, call),
-				"{call:?} allowed while the migration runs"
-			);
-		}
-
-		// THEN using a proxy, and any other call, passes at every stage.
 		for stage in [
 			MigrationStage::Pending,
 			MigrationStage::DataMigrationOngoing,
 			MigrationStage::MigrationDone,
 		] {
+			// THEN a proxy change is refused exactly while the migration runs.
+			for call in &changes {
+				assert_eq!(allowed_at(&stage, call), !stage.is_ongoing(), "{call:?} at {stage:?}");
+			}
+			// THEN using a proxy, and any other call, passes at every stage.
 			for call in &uses {
 				assert!(allowed_at(&stage, call), "{call:?} refused at {stage:?}");
 			}

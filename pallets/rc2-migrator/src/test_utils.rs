@@ -35,7 +35,8 @@ pub fn every_call<Call: TypeInfo + Decode>() -> (Vec<(CallName, Call)>, Vec<Call
 			panic!("a pallet's calls are an enum")
 		};
 		for variant in variants.variants {
-			let mut bytes = [0u8; 1026];
+			// The pallet and call indices, then zeros for the arguments.
+			let mut bytes = [0u8; 2 + 1024];
 			bytes[0] = pallet.index;
 			bytes[1] = variant.index;
 			match Call::decode(&mut &bytes[..]) {
