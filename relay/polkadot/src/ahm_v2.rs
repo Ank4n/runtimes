@@ -102,8 +102,9 @@ impl Contains<RuntimeCall> for CallsEnabledAfterMigration {
 /// During is from the start signal to the Coretime chain until the end of the cool-off. After is
 /// from `MigrationDone` on.
 ///
-/// Every call a signed account can make is disabled. Enabled are inherents, unsigned validator
-/// reports, calls the Coretime chain and Asset Hub send over XCM, and the migrator itself.
+/// Every call a signed account can make is disabled, except the message queue's service calls
+/// while the migration runs. Enabled are inherents, unsigned validator reports, calls the Coretime
+/// chain and Asset Hub send over XCM, and the migrator itself.
 ///
 /// Root skips this filter, so a call only Root can make is `OFF` here and still works.
 pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
@@ -144,6 +145,10 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		) => (ON, ON),
 		// Checks its own origins; drives the migration.
 		Rc2Migrator(..) => (ON, ON),
+
+		// Enabled during the migration only.
+		// `execute_overweight` lets the manager retry an overweight message.
+		MessageQueue(..) => (ON, OFF),
 
 		// Disabled during and after the migration.
 		System(..) => (OFF, OFF),
@@ -190,7 +195,6 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		// On-demand orders close at the start, so credits have no use.
 		Coretime(..) => (OFF, OFF),
 		XcmPallet(..) => (OFF, OFF),
-		MessageQueue(..) => (OFF, OFF),
 		AssetRate(..) => (OFF, OFF),
 		Beefy(..) => (OFF, OFF),
 	}
@@ -287,6 +291,11 @@ mod tests {
 		("Rc2Migrator", "set_manager"),
 	];
 
+	/// Calls the lockdown leaves enabled only while the migration runs: the message queue's
+	/// service calls.
+	const ENABLED_DURING: &[CallName] =
+		&[("MessageQueue", "reap_page"), ("MessageQueue", "execute_overweight")];
+
 	/// Calls the test below cannot build. It builds each call from zero bytes, and these take an
 	/// argument whose first byte is a version or variant tag that zero is not: XCM's `Versioned*`
 	/// types start at version 3, BABE's `NextConfigDescriptor` at 1. Each falls under its pallet's
@@ -314,22 +323,27 @@ mod tests {
 
 	/// If this fails after an upgrade, a call was added, renamed or removed. For a new call that no
 	/// signed account can reach (an inherent, an unsigned report, an XCM-only or migrator call),
-	/// enable it in [`super::call_allowed_status`] and list it in [`ENABLED`]. For a call a signed
-	/// account can reach, keep it disabled. A rename or removal only needs the lists updated.
+	/// enable it in [`super::call_allowed_status`] and list it in [`ENABLED`], or in
+	/// [`ENABLED_DURING`] if it closes at the end. For a call a signed account can reach, keep it
+	/// disabled.
 	#[test]
 	fn every_call_but_the_listed_ones_is_refused_once_the_migration_starts() {
 		let (calls, undecodable) = every_call::<RuntimeCall>();
 		assert_eq!(undecodable, UNDECODABLE, "calls the test cannot build changed");
 		// Every listed call is a call of this runtime.
-		for name in ENABLED {
+		for name in ENABLED.iter().chain(ENABLED_DURING) {
 			assert!(calls.iter().any(|(n, _)| n == name), "{name:?} is not a call of this runtime");
 		}
 
 		for stage in stages_before_start().into_iter().chain(stages_from_start()) {
 			at(&stage, || {
 				for (name, call) in &calls {
-					let expected = if stage.has_started() {
-						// From the start, a call passes exactly when it is listed in `ENABLED`.
+					let expected = if stage.is_ongoing() {
+						// While the migration runs, a call passes exactly when it is listed in
+						// `ENABLED` or `ENABLED_DURING`.
+						ENABLED.contains(name) || ENABLED_DURING.contains(name)
+					} else if stage.is_finished() {
+						// After it, exactly when it is listed in `ENABLED`.
 						ENABLED.contains(name)
 					} else {
 						// Before the start, the lockdown adds nothing: the filter is
