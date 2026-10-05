@@ -27,6 +27,8 @@ use crate::{
 use frame_support::traits::{Contains, Everything};
 use frame_system::EnsureRoot;
 
+const LOG_TARGET: &str = "runtime::ahm-v2";
+
 impl pallet_ct_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = XcmRouter;
@@ -44,7 +46,7 @@ impl Contains<RuntimeCall> for CallsEnabledBeforeMigration {
 	fn contains(call: &RuntimeCall) -> bool {
 		let (before, _during) = call_allowed_status(call);
 		if !before {
-			log::warn!("Call bounced by the filter before the migration: {call:?}");
+			log::warn!(target: LOG_TARGET, "Call bounced by the filter before the migration: {call:?}");
 		}
 		before
 	}
@@ -56,7 +58,7 @@ impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 	fn contains(call: &RuntimeCall) -> bool {
 		let (_before, during) = call_allowed_status(call);
 		if !during {
-			log::warn!("Call bounced by the filter during the migration: {call:?}");
+			log::warn!(target: LOG_TARGET, "Call bounced by the filter during the migration: {call:?}");
 		}
 		during
 	}

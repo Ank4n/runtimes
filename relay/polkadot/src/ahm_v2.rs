@@ -36,6 +36,8 @@ use polkadot_runtime_constants::system_parachain::{ASSET_HUB_ID, BROKER_ID};
 use xcm::latest::{Asset, Instruction, Junction::Parachain, Location};
 use xcm_executor::traits::{DenyExecution, Properties};
 
+const LOG_TARGET: &str = "runtime::ahm-v2";
+
 impl pallet_rc2_migrator::Config for Runtime {
 	type RuntimeEvent = RuntimeEvent;
 	type SendXcm = XcmRouter;
@@ -96,7 +98,7 @@ impl Contains<RuntimeCall> for CallsEnabledDuringMigration {
 	fn contains(call: &RuntimeCall) -> bool {
 		let (during, _after) = call_allowed_status(call);
 		if !during {
-			log::warn!("Call bounced by the filter during the migration: {call:?}");
+			log::warn!(target: LOG_TARGET, "Call bounced by the filter during the migration: {call:?}");
 		}
 		during
 	}
@@ -108,7 +110,7 @@ impl Contains<RuntimeCall> for CallsEnabledAfterMigration {
 	fn contains(call: &RuntimeCall) -> bool {
 		let (_during, after) = call_allowed_status(call);
 		if !after {
-			log::warn!("Call bounced by the filter after the migration: {call:?}");
+			log::warn!(target: LOG_TARGET, "Call bounced by the filter after the migration: {call:?}");
 		}
 		after
 	}
@@ -129,7 +131,7 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 	const OFF: bool = false;
 
 	match call {
-		// all ON calls during migration
+		// Enabled during and after the migration.
 		// Applies a runtime upgrade governance already authorized.
 		System(frame_system::Call::apply_authorized_upgrade { .. }) => (ON, ON),
 		Babe(pallet_babe::Call::report_equivocation_unsigned { .. }) => (ON, ON),
@@ -157,7 +159,7 @@ pub fn call_allowed_status(call: &RuntimeCall) -> (bool, bool) {
 		// Checks its own origins; drives the migration.
 		Rc2Migrator(..) => (ON, ON),
 
-		// all OFF calls during migration
+		// Disabled during and after the migration.
 		System(..) => (OFF, OFF),
 		Scheduler(..) => (OFF, OFF),
 		Preimage(..) => (OFF, OFF),
