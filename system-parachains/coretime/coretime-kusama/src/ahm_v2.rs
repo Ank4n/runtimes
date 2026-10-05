@@ -21,6 +21,7 @@
 //! integration tests turn it on to drive the real runtime.
 
 use crate::{xcm_config::XcmRouter, AccountId, Balances, Runtime, RuntimeEvent, RuntimeHoldReason};
+use frame_support::traits::Everything;
 use frame_system::EnsureRoot;
 
 impl pallet_ct_migrator::Config for Runtime {
@@ -29,6 +30,9 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type Currency = Balances;
 	type RuntimeHoldReason = RuntimeHoldReason;
+	type PreMigrationCalls = Everything;
+	type IntraMigrationCalls = Everything;
+	type PostMigrationCalls = Everything;
 }
 
 #[cfg(test)]

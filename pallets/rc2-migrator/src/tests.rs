@@ -19,7 +19,7 @@ use crate::{
 	RcMigrationStage,
 };
 use codec::Encode;
-use frame_support::{assert_noop, assert_ok};
+use frame_support::{assert_noop, assert_ok, traits::Contains};
 use sp_runtime::DispatchError::BadOrigin;
 use xcm::prelude::*;
 
@@ -52,6 +52,33 @@ fn data_stages() -> Vec<Stage> {
 		Stage::Sweep,
 		Stage::SweepDust { last_key: None },
 		Stage::TiCorrection,
+	]
+}
+
+/// Every stage, in the order the machine walks them.
+fn all_stages() -> Vec<Stage> {
+	vec![
+		Stage::Pending,
+		Stage::Scheduled { start: 10 },
+		Stage::WaitingForCt,
+		Stage::WarmUp { end_at: 10 },
+		Stage::AccountsInit,
+		Stage::AccountsOngoing { last_key: None },
+		Stage::AccountsDone,
+		Stage::ProxyInit,
+		Stage::ProxyOngoing { last_key: None },
+		Stage::ProxyDone,
+		Stage::RegistrarInit,
+		Stage::RegistrarOngoing { last_key: None },
+		Stage::RegistrarDone,
+		Stage::HrmpInit,
+		Stage::HrmpOngoing { last_key: None },
+		Stage::HrmpDone,
+		Stage::Sweep,
+		Stage::SweepDust { last_key: None },
+		Stage::TiCorrection,
+		Stage::CoolOff { end_at: 10 },
+		Stage::MigrationDone,
 	]
 }
 
@@ -791,34 +818,52 @@ fn the_stage_predicates_say_what_their_consumers_need() {
 		}
 	}
 
-	let cases = [
-		Stage::Pending,
-		Stage::Scheduled { start: 10 },
-		Stage::WaitingForCt,
-		Stage::WarmUp { end_at: 10 },
-		Stage::AccountsInit,
-		Stage::AccountsOngoing { last_key: None },
-		Stage::AccountsDone,
-		Stage::ProxyInit,
-		Stage::ProxyOngoing { last_key: None },
-		Stage::ProxyDone,
-		Stage::RegistrarInit,
-		Stage::RegistrarOngoing { last_key: None },
-		Stage::RegistrarDone,
-		Stage::HrmpInit,
-		Stage::HrmpOngoing { last_key: None },
-		Stage::HrmpDone,
-		Stage::Sweep,
-		Stage::SweepDust { last_key: None },
-		Stage::TiCorrection,
-		Stage::CoolOff { end_at: 10 },
-		Stage::MigrationDone,
-	];
-
-	for stage in cases {
+	for stage in all_stages() {
 		let (ongoing, started, finished) = expected(&stage);
 		assert_eq!(stage.is_ongoing(), ongoing, "is_ongoing for {stage:?}");
 		assert_eq!(stage.has_started(), started, "has_started for {stage:?}");
 		assert_eq!(stage.is_finished(), finished, "is_finished for {stage:?}");
 	}
+}
+
+#[test]
+fn each_stage_allows_only_its_own_call_set() {
+	new_test_ext().execute_with(|| {
+		for stage in all_stages() {
+			let allowed = match stage {
+				Stage::Pending | Stage::Scheduled { .. } => PRE_MIGRATION,
+				Stage::WaitingForCt |
+				Stage::WarmUp { .. } |
+				Stage::AccountsInit |
+				Stage::AccountsOngoing { .. } |
+				Stage::AccountsDone |
+				Stage::ProxyInit |
+				Stage::ProxyOngoing { .. } |
+				Stage::ProxyDone |
+				Stage::RegistrarInit |
+				Stage::RegistrarOngoing { .. } |
+				Stage::RegistrarDone |
+				Stage::HrmpInit |
+				Stage::HrmpOngoing { .. } |
+				Stage::HrmpDone |
+				Stage::Sweep |
+				Stage::SweepDust { .. } |
+				Stage::TiCorrection |
+				Stage::CoolOff { .. } => INTRA_MIGRATION,
+				Stage::MigrationDone => POST_MIGRATION,
+			};
+
+			// GIVEN the machine at `stage`.
+			set_stage(stage.clone());
+
+			// THEN only the remark of that stage's call set passes.
+			for tag in [PRE_MIGRATION, INTRA_MIGRATION, POST_MIGRATION] {
+				assert_eq!(
+					Rc2Migrator::contains(&tagged_remark(tag)),
+					tag == allowed,
+					"call set {tag} at {stage:?}"
+				);
+			}
+		}
+	});
 }

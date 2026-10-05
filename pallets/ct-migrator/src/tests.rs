@@ -19,7 +19,7 @@ use crate::{
 	Rc2RuntimeCall,
 };
 use codec::Encode;
-use frame_support::{assert_noop, assert_ok};
+use frame_support::{assert_noop, assert_ok, traits::Contains};
 use sp_runtime::DispatchError::BadOrigin;
 use xcm::prelude::*;
 
@@ -280,4 +280,27 @@ fn the_stage_predicates_say_what_their_consumers_need() {
 		assert_eq!(stage.is_ongoing(), ongoing, "is_ongoing for {stage:?}");
 		assert_eq!(stage.is_finished(), finished, "is_finished for {stage:?}");
 	}
+}
+
+#[test]
+fn each_stage_allows_only_its_own_call_set() {
+	new_test_ext().execute_with(|| {
+		for (stage, allowed) in [
+			(MigrationStage::Pending, PRE_MIGRATION),
+			(MigrationStage::DataMigrationOngoing, INTRA_MIGRATION),
+			(MigrationStage::MigrationDone, POST_MIGRATION),
+		] {
+			// GIVEN the chain at `stage`.
+			CtMigrationStage::<Test>::put(stage.clone());
+
+			// THEN only the remark of that stage's call set passes.
+			for tag in [PRE_MIGRATION, INTRA_MIGRATION, POST_MIGRATION] {
+				assert_eq!(
+					CtMigrator::contains(&tagged_remark(tag)),
+					tag == allowed,
+					"call set {tag} at {stage:?}"
+				);
+			}
+		}
+	});
 }

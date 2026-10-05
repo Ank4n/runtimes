@@ -53,7 +53,7 @@ use frame_support::{
 	storage::with_storage_layer,
 	traits::{
 		fungible::{Inspect, Mutate, MutateHold},
-		EnsureOrigin,
+		Contains, EnsureOrigin,
 	},
 };
 use frame_system::pallet_prelude::*;
@@ -146,6 +146,15 @@ pub mod pallet {
 
 		/// The overarching hold reason type.
 		type RuntimeHoldReason: From<HoldReason>;
+
+		/// Calls that are allowed before the migration starts.
+		type PreMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed during the migration.
+		type IntraMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed after the migration finished.
+		type PostMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
 	}
 
 	#[pallet::composite_enum]
@@ -340,6 +349,21 @@ pub mod pallet {
 				Error::<T>::XcmSendFailed
 			})?;
 			Ok(())
+		}
+	}
+}
+
+/// The call filter for the current migration stage. Meant to be part of the runtime's
+/// `BaseCallFilter`.
+impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T> {
+	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
+		let stage = CtMigrationStage::<T>::get();
+		if stage.is_finished() {
+			T::PostMigrationCalls::contains(call)
+		} else if stage.is_ongoing() {
+			T::IntraMigrationCalls::contains(call)
+		} else {
+			T::PreMigrationCalls::contains(call)
 		}
 	}
 }

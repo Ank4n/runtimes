@@ -247,6 +247,10 @@ impl pallet_broker::migration::v4::BlockToRelayHeightConversion<Runtime>
 // Configure FRAME pallets to include in runtime.
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig as frame_system::DefaultConfig)]
 impl frame_system::Config for Runtime {
+	#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
+	type BaseCallFilter =
+		frame_support::traits::InsideBoth<EverythingBut<IsFilteredBrokerCall>, CtMigrator>;
+	#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
 	type BaseCallFilter = EverythingBut<IsFilteredBrokerCall>;
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;

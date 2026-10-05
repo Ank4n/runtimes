@@ -44,7 +44,7 @@ use alloc::vec;
 use frame_support::{
 	pallet_prelude::*,
 	sp_runtime::traits::Saturating,
-	traits::{EnsureOrigin, Time},
+	traits::{Contains, EnsureOrigin, Time},
 };
 use frame_system::pallet_prelude::*;
 use polkadot_parachain_primitives::primitives::{HrmpChannelId, Id as ParaId};
@@ -248,6 +248,15 @@ pub mod pallet {
 
 		/// The origin that can perform permissioned operations like setting the migration stage.
 		type AdminOrigin: EnsureOrigin<<Self as frame_system::Config>::RuntimeOrigin>;
+
+		/// Calls that are allowed before the migration starts.
+		type PreMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed during the migration.
+		type IntraMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed after the migration finished.
+		type PostMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
 	}
 
 	#[pallet::pallet]
@@ -670,6 +679,21 @@ pub mod pallet {
 				Error::<T>::XcmSendFailed
 			})?;
 			Ok(())
+		}
+	}
+}
+
+/// The call filter for the current migration stage. Meant to be part of the runtime's
+/// `BaseCallFilter`.
+impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T> {
+	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
+		let stage = RcMigrationStage::<T>::get();
+		if stage.is_finished() {
+			T::PostMigrationCalls::contains(call)
+		} else if stage.is_ongoing() {
+			T::IntraMigrationCalls::contains(call)
+		} else {
+			T::PreMigrationCalls::contains(call)
 		}
 	}
 }
