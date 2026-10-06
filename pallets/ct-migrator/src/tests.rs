@@ -21,7 +21,10 @@
 //! loudly. The tests pin that contract with exact values.
 
 use crate::{mock::*, *};
-use frame_support::{assert_noop, assert_ok, hypothetically, traits::fungible::Mutate};
+use frame_support::{
+	assert_noop, assert_ok, hypothetically,
+	traits::{fungible::Mutate, Contains},
+};
 use hrmp_primitives::{DepositKey, DepositSide};
 use sp_runtime::{traits::BadOrigin, AccountId32};
 
@@ -704,5 +707,29 @@ fn the_relay_chains_queue_goes_first_on_a_duty_cycle_while_the_migration_runs() 
 		ForcedHeads::set(vec![]);
 		run_blocks(4);
 		assert_eq!(ForcedHeads::get(), vec![]);
+	});
+}
+
+#[test]
+fn each_stage_allows_only_its_own_call_set() {
+	new_test_ext().execute_with(|| {
+		for (stage, allowed) in [
+			(MigrationStage::Pending, PRE_MIGRATION),
+			(MigrationStage::DataMigrationOngoing, INTRA_MIGRATION),
+			(MigrationStage::CoolOff, INTRA_MIGRATION),
+			(MigrationStage::MigrationDone, POST_MIGRATION),
+		] {
+			// GIVEN the chain at `stage`.
+			CtMigrationStage::<Test>::put(stage.clone());
+
+			// THEN only the remark of that stage's call set passes.
+			for tag in [PRE_MIGRATION, INTRA_MIGRATION, POST_MIGRATION] {
+				assert_eq!(
+					<CtMigrator as Contains<RuntimeCall>>::contains(&tagged_remark(tag)),
+					tag == allowed,
+					"call set {tag} at {stage:?}"
+				);
+			}
+		}
 	});
 }

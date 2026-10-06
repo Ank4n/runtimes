@@ -23,7 +23,7 @@ use super::{
 };
 use frame_support::{
 	parameter_types,
-	traits::{Contains, ContainsPair, Disabled, Equals, Everything, Nothing},
+	traits::{Contains, Disabled, Equals, Everything, Nothing},
 };
 use frame_system::EnsureRoot;
 use pallet_xcm::XcmPassthrough;
@@ -49,7 +49,6 @@ use xcm_builder::{
 };
 
 use xcm_builder::DenyThenTry;
-use xcm_executor::traits::{DenyExecution, Properties};
 
 parameter_types! {
 	/// The location of the DOT token, from the context of this chain. Since this token is native to this
@@ -209,18 +208,6 @@ pub type TrustedTeleporters = (
 	Case<DotForBulletin>,
 );
 
-/// Teleport trust, withdrawn for good once the AHM v2 migration starts.
-///
-/// This chain's balances drain to Asset Hub and the Coretime chain and must not come back. This
-/// chain keeps no teleport checking account (`NoTeleportTracking`), so an inbound teleport it
-/// accepts mints fresh issuance.
-pub struct TrustedTeleportersBeforeMigration;
-impl ContainsPair<Asset, Location> for TrustedTeleportersBeforeMigration {
-	fn contains(asset: &Asset, origin: &Location) -> bool {
-		TrustedTeleporters::contains(asset, origin) && !crate::ahm_v2_started()
-	}
-}
-
 pub type Fellows = IsFellowshipVoice<CollectivesLocation>;
 
 pub struct OnlyParachains;
@@ -244,66 +231,37 @@ impl Contains<Location> for AssetHubPlurality {
 	}
 }
 
-/// Refuse everything an ordinary parachain sends while the migration runs.
-///
-/// The call filter cannot do this: upward messages arrive with candidates, not as extrinsics, and
-/// a queue that paras keep refilling never drains in the warm-up. System chains are unaffected --
-/// the migration itself and Asset Hub's staking traffic travel that way. Ordinary parachains are
-/// admitted again once the migration is done, which is when their control-plane calls start
-/// forwarding to the Coretime chain.
-pub struct DenyOrdinaryParachainsDuringMigration;
-impl DenyExecution for DenyOrdinaryParachainsDuringMigration {
-	fn deny_execution<RuntimeCall>(
-		origin: &Location,
-		_instructions: &mut [Instruction<RuntimeCall>],
-		_max_weight: frame_support::weights::Weight,
-		_properties: &mut Properties,
-	) -> Result<(), frame_support::traits::ProcessMessageError> {
-		let ordinary_parachain =
-			OnlyParachains::contains(origin) && !IsChildSystemParachain::<ParaId>::contains(origin);
-		if ordinary_parachain &&
-			pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_ongoing()
-		{
-			return Err(frame_support::traits::ProcessMessageError::Unsupported);
-		}
-		Ok(())
-	}
-}
-
 /// The barriers one of which must be passed for an XCM message to be executed.
-pub type Barrier = TrailingSetTopicAsId<
-	DenyThenTry<
-		DenyOrdinaryParachainsDuringMigration,
+pub type AllowBarriers = (
+	// Weight that is paid for may be consumed.
+	TakeWeightCredit,
+	// Expected responses are OK.
+	AllowKnownQueryResponses<XcmPallet>,
+	WithComputedOrigin<
 		(
-			// Weight that is paid for may be consumed.
-			TakeWeightCredit,
-			// Expected responses are OK.
-			AllowKnownQueryResponses<XcmPallet>,
-			WithComputedOrigin<
-				(
-					// If the message is one that immediately attempts to pay for execution, then
-					// allow it.
-					AllowTopLevelPaidExecutionFrom<Everything>,
-					// Subscriptions for version tracking are OK.
-					AllowSubscriptionsFrom<OnlyParachains>,
-					// Messages from system parachains or the Fellows plurality need not pay for
-					// execution.
-					AllowExplicitUnpaidExecutionFrom<(
-						IsChildSystemParachain<ParaId>,
-						Fellows,
-						AssetHubPlurality,
-					)>,
-					// A parachain's own control-plane request executes unpaid: post-migration its
-					// sovereign account here is empty by design, and the work is priced on the
-					// Coretime chain instead. Deliberately shape-checked and rate-limited —
-					// see `para_control`.
-					crate::para_control::AllowUnpaidParaControlFrom<OnlyParachains>,
-				),
-				UniversalLocation,
-				ConstU32<8>,
-			>,
+			// If the message is one that immediately attempts to pay for execution, then allow it.
+			AllowTopLevelPaidExecutionFrom<Everything>,
+			// Subscriptions for version tracking are OK.
+			AllowSubscriptionsFrom<OnlyParachains>,
+			// Messages from system parachains or the Fellows plurality need not pay for execution.
+			AllowExplicitUnpaidExecutionFrom<(
+				IsChildSystemParachain<ParaId>,
+				Fellows,
+				AssetHubPlurality,
+			)>,
+			// A parachain's own control-plane request executes unpaid: post-migration its
+			// sovereign account here is empty by design, and the work is priced on the Coretime
+			// chain instead. Deliberately shape-checked and rate-limited — see `para_control`.
+			crate::para_control::AllowUnpaidParaControlFrom<OnlyParachains>,
 		),
+		UniversalLocation,
+		ConstU32<8>,
 	>,
+);
+
+/// [`AllowBarriers`], behind the AHM v2 migration's inbound lockdown.
+pub type Barrier = TrailingSetTopicAsId<
+	DenyThenTry<crate::ahm_v2::lockdown::DenyOnceMigrationStarts, AllowBarriers>,
 >;
 
 /// Locations that will not be charged fees in the executor, neither for execution nor delivery.
@@ -319,7 +277,10 @@ impl xcm_executor::Config for XcmConfig {
 	type OriginConverter = LocalOriginConverter;
 	// Polkadot Relay recognises no chains which act as reserves.
 	type IsReserve = ();
-	type IsTeleporter = TrustedTeleportersBeforeMigration;
+	// This chain has no teleport checking account, so an accepted inbound teleport mints. Once the
+	// AHM v2 migration starts, no value may arrive here.
+	type IsTeleporter =
+		pallet_rc2_migrator::xcm_config::FalseOnceStarted<Runtime, TrustedTeleporters>;
 	type UniversalLocation = UniversalLocation;
 	type Barrier = Barrier;
 	type Weigher = WeightInfoBounds<

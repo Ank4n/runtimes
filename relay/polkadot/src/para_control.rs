@@ -205,7 +205,7 @@ impl ForwardToCoretime {
 	/// Keyed on the migration being *finished*, not merely started: Coretime's registry is empty
 	/// until the migration hands it over, so forwarding earlier would record state there for paras
 	/// it does not yet know about. The window in between is covered by the call filter, which
-	/// blocks these calls outright while the migration runs — see `PostAhmFilter`.
+	/// blocks these calls outright while the migration runs — see `ahm_v2::lockdown`.
 	fn remote() -> bool {
 		pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_finished()
 	}

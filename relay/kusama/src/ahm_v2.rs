@@ -17,6 +17,8 @@
 //! AHM v2 migration wiring: the relay-chain side of moving account, proxy, registrar and HRMP
 //! state to the Coretime chain.
 
+pub mod lockdown;
+
 use crate::{
 	xcm_config::{Broker, XcmRouter},
 	AccountId, Balance, Balances, BlockNumber, BrokerId, MessageQueue, OnDemandPalletId, Runtime,
@@ -110,6 +112,9 @@ impl pallet_rc2_migrator::Config for Runtime {
 	type UnprocessedMsgBuffer = MigrationUnprocessedMsgBuffer;
 	type NotifyQueryHandler = Runtime;
 	type ResponseOrigin = EnsureResponse<Equals<Broker>>;
+	type PreMigrationCalls = frame_support::traits::Everything;
+	type IntraMigrationCalls = lockdown::CallsEnabledDuringMigration;
+	type PostMigrationCalls = lockdown::CallsEnabledAfterMigration;
 }
 
 #[cfg(test)]

@@ -69,7 +69,7 @@ use frame_support::{
 	storage::with_storage_layer,
 	traits::{
 		fungible::{Inspect, Mutate, MutateHold},
-		EnsureOrigin,
+		Contains, EnsureOrigin, GetCallMetadata,
 	},
 	weights::WeightMeter,
 };
@@ -203,6 +203,15 @@ pub mod pallet {
 		/// `(priority_blocks, round_robin_blocks)` for the relay chain's downward queue while the
 		/// migration runs; see [`QueuePriority`]. Overridable through [`DmpQueuePriorityConfig`].
 		type DmpQueuePriorityPattern: Get<(BlockNumberFor<Self>, BlockNumberFor<Self>)>;
+
+		/// Calls that are allowed before the migration starts.
+		type PreMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed during the migration.
+		type IntraMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed after the migration finished.
+		type PostMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
 	}
 
 	#[pallet::composite_enum]
@@ -854,6 +863,34 @@ pub mod pallet {
 			}
 			Ok(())
 		}
+	}
+}
+
+/// The call filter for the current migration stage. Meant to be part of the runtime's
+/// `BaseCallFilter`.
+impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
+where
+	<T as frame_system::Config>::RuntimeCall: GetCallMetadata,
+{
+	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
+		let stage = CtMigrationStage::<T>::get();
+		let allowed = if stage.is_finished() {
+			T::PostMigrationCalls::contains(call)
+		} else if stage.is_ongoing() {
+			T::IntraMigrationCalls::contains(call)
+		} else {
+			T::PreMigrationCalls::contains(call)
+		};
+		if !allowed {
+			let call = call.get_call_metadata();
+			log::debug!(
+				target: LOG_TARGET,
+				"Call filtered at {stage:?}: {}::{}",
+				call.pallet_name,
+				call.function_name,
+			);
+		}
+		allowed
 	}
 }
 

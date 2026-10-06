@@ -196,37 +196,12 @@ parameter_types! {
 	pub const SS58Prefix: u8 = 0;
 }
 
-/// Whether the AHM v2 migration has started. What it closes stays closed afterwards.
-pub(crate) fn ahm_v2_started() -> bool {
-	pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started()
-}
-
 /// Pallets that are blocked for user calls after the AHM.
 pub struct PostAhmFilter;
 impl Contains<RuntimeCall> for PostAhmFilter {
 	fn contains(call: &RuntimeCall) -> bool {
 		use RuntimeCall::*;
 		match call {
-			// --- AHM v2 ---
-
-			// The ways a signed origin can move value or resize a reserve while the accounts stage
-			// is draining them. A reserve created after that stage has passed its owner is backed
-			// by no pallet record, and an unattributable reserve holds the whole account back on
-			// this chain.
-			Balances(..) | XcmPallet(..) | Multisig(..) | Preimage(..) | OnDemand(..) |
-			Crowdloan(..)
-				if ahm_v2_started() =>
-				false,
-
-			// Using a proxy stays open; anything that creates or resizes a proxy or announcement
-			// deposit does not. Named this way round so a call added to `pallet_proxy` is closed
-			// by default rather than open by omission.
-			Proxy(
-				pallet_proxy::Call::<Runtime>::proxy { .. } |
-				pallet_proxy::Call::<Runtime>::proxy_announced { .. },
-			) => true,
-			Proxy(..) if ahm_v2_started() => false,
-
 			Scheduler(..) |
 			Indices(..) |
 			Staking(..) |
@@ -262,58 +237,6 @@ impl Contains<RuntimeCall> for PostAhmFilter {
 
 			Coretime(coretime::Call::<Runtime>::request_revenue_at { .. }) => true,
 
-			// The parachain control plane, which must stay reachable. These calls do **not**
-			// arrive as Root and so do not bypass this filter: Coretime's requests convert to
-			// `parachains_origin::Origin::Parachain(BROKER_ID)`, and the two validation-code
-			// uploads are unsigned. Blocking them — by a broader rule added later, or by folding
-			// them in with the pallets below — severs every registrar and HRMP flow on both
-			// chains, and does it silently, because a filtered call inside XCM surfaces only as a
-			// `Transact` that did nothing.
-			//
-			// `relay_request` is the exception: it is how a parachain reaches this chain's HRMP for
-			// itself, and it is shut while the migration runs, for the same reason as the
-			// para-facing registrar calls below.
-			HrmpRelay(pallet_hrmp_relay::Call::<Runtime>::relay_request { .. }) =>
-				!pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_ongoing(),
-			RegistrarRelay(..) | HrmpRelay(..) => true,
-
-			// The para-facing registrar calls a parachain dispatches for *itself*. These stay
-			// reachable for good, because after the migration their bodies no longer touch this
-			// chain — they forward the request to Coretime on the para's behalf (see
-			// `para_control::ForwardToCoretime`). A parachain reaches HRMP through
-			// `HrmpRelay::relay_request` instead, above.
-			//
-			// Blocked only *while the migration runs*, and that window is load-bearing: the
-			// forwarder turns on when the migration is **finished**, so mid-migration these would
-			// still take the local path and act on a half-drained registry. `is_ongoing` is
-			// therefore the right predicate here where `has_started` is right below.
-			//
-			// `schedule_code_upgrade` is deliberately **not** in this list: it carries the whole
-			// validation code, which cannot be forwarded — see `registrar_primitives`. It falls
-			// through to the blanket arm below.
-			Registrar(
-				paras_registrar::Call::<Runtime>::deregister { .. } |
-				paras_registrar::Call::<Runtime>::add_lock { .. } |
-				paras_registrar::Call::<Runtime>::remove_lock { .. } |
-				paras_registrar::Call::<Runtime>::set_current_head { .. },
-			) => !pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().is_ongoing(),
-
-			// Everything else on those two pallets is closed to direct callers. The registrar moves
-			// to the Coretime chain; HRMP stays here and is reached through
-			// `HrmpRelay::relay_request`, which dispatches into it as the para. Root still reaches
-			// both — Root bypasses this filter — which is what governance and the migration need,
-			// and the relay-side pallets above drive them by direct call rather than by dispatch,
-			// so they are unaffected.
-			//
-			// Gated on the migration rather than on the upgrade, and the distinction matters: the
-			// Coretime pallets hold no state until the migration hands it over, so closing these
-			// at the upgrade would leave nobody able to register a para or open a channel on
-			// *either* chain for however long governance takes to schedule the start. A scheduled
-			// migration has not started, so the relay chain serves its users right up to the
-			// start block, and never again after it.
-			Registrar(..) | Hrmp(..) =>
-				!pallet_rc2_migrator::RcMigrationStage::<Runtime>::get().has_started(),
-
 			// Everything else is allowed.
 			_ => true,
 		}
@@ -335,7 +258,7 @@ parameter_types! {
 }
 
 impl frame_system::Config for Runtime {
-	type BaseCallFilter = PostAhmFilter;
+	type BaseCallFilter = frame_support::traits::InsideBoth<PostAhmFilter, Rc2Migrator>;
 	type BlockWeights = BlockWeights;
 	type BlockLength = RuntimeBlockLength;
 	type RuntimeOrigin = RuntimeOrigin;

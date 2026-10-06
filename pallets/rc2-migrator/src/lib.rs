@@ -43,8 +43,11 @@ pub mod ti_correction;
 
 #[cfg(test)]
 mod mock;
+#[cfg(feature = "std")]
+pub mod test_utils;
 #[cfg(test)]
 mod tests;
+pub mod xcm_config;
 
 pub use multisig::{ManagerMultisig, ManagerMultisigVote};
 pub use pallet::*;
@@ -59,7 +62,7 @@ use frame_support::{
 	traits::{
 		fungible::{Inspect, Mutate},
 		tokens::{Fortitude, Precision, Preservation},
-		EnsureOrigin, ReservableCurrency, Time,
+		Contains, EnsureOrigin, GetCallMetadata, ReservableCurrency, Time,
 	},
 	weights::WeightMeter,
 };
@@ -486,6 +489,15 @@ pub mod pallet {
 		/// report answers a query this chain registered, rather than being a call the Coretime
 		/// chain chose to make.
 		type ResponseOrigin: EnsureOrigin<<Self as frame_system::Config>::RuntimeOrigin>;
+
+		/// Calls that are allowed before the migration starts.
+		type PreMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed during the migration.
+		type IntraMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
+
+		/// Calls that are allowed after the migration finished.
+		type PostMigrationCalls: Contains<<Self as frame_system::Config>::RuntimeCall>;
 	}
 
 	#[pallet::pallet]
@@ -799,7 +811,9 @@ pub mod pallet {
 		/// - `start`: The wall-clock time at which the migration will start.
 		/// - `warm_up`: Duration in blocks used to prepare for the migration. Calls are filtered
 		///   during this period. It is intended to give enough time for UMP and DMP queues to
-		///   empty. Counted from the transition to the warm-up stage.
+		///   empty, and must be longer than one Coretime timeslice: on-demand orders close at the
+		///   start, and the Coretime chain claims the revenue earned before it at its next
+		///   timeslice boundary. Counted from the transition to the warm-up stage.
 		/// - `cool_off`: Duration in blocks of the post migration cool-off period. Counted from the
 		///   transition to the cool-off stage.
 		///
@@ -1706,5 +1720,33 @@ pub mod pallet {
 			Self::track_batch(query_id, UnconfirmedBatch { call, stage, sent_at: now });
 			Ok(query_id)
 		}
+	}
+}
+
+/// The call filter for the current migration stage. Meant to be part of the runtime's
+/// `BaseCallFilter`.
+impl<T: Config> Contains<<T as frame_system::Config>::RuntimeCall> for Pallet<T>
+where
+	<T as frame_system::Config>::RuntimeCall: GetCallMetadata,
+{
+	fn contains(call: &<T as frame_system::Config>::RuntimeCall) -> bool {
+		let stage = RcMigrationStage::<T>::get();
+		let allowed = if stage.is_finished() {
+			T::PostMigrationCalls::contains(call)
+		} else if stage.is_ongoing() {
+			T::IntraMigrationCalls::contains(call)
+		} else {
+			T::PreMigrationCalls::contains(call)
+		};
+		if !allowed {
+			let call = call.get_call_metadata();
+			log::debug!(
+				target: LOG_TARGET,
+				"Call filtered at {stage:?}: {}::{}",
+				call.pallet_name,
+				call.function_name,
+			);
+		}
+		allowed
 	}
 }

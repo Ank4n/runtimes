@@ -21,7 +21,7 @@ use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use cumulus_primitives_core::AggregateMessageOrigin;
 use frame_support::{
 	derive_impl, parameter_types,
-	traits::{fungible::Mutate, ConstU32, InstanceFilter, OnFinalize},
+	traits::{fungible::Mutate, ConstU32, Contains, InstanceFilter, OnFinalize},
 	weights::WeightMeter,
 };
 use frame_system::EnsureRoot;
@@ -253,6 +253,28 @@ impl pallet_ct_migrator::Config for Test {
 	type AdminOrigin = EnsureRoot<AccountId32>;
 	type MessageQueue = RecordingHead;
 	type DmpQueuePriorityPattern = DmpQueuePriorityPattern;
+	type PreMigrationCalls = TaggedRemark<PRE_MIGRATION>;
+	type IntraMigrationCalls = TaggedRemark<INTRA_MIGRATION>;
+	type PostMigrationCalls = TaggedRemark<POST_MIGRATION>;
+}
+
+/// Tags for [`TaggedRemark`], one per call set.
+pub const PRE_MIGRATION: u8 = 0;
+pub const INTRA_MIGRATION: u8 = 1;
+pub const POST_MIGRATION: u8 = 2;
+
+/// Allows only a remark of the single byte `TAG`, so a test can tell which call set was consulted.
+pub struct TaggedRemark<const TAG: u8>;
+
+impl<const TAG: u8> Contains<RuntimeCall> for TaggedRemark<TAG> {
+	fn contains(call: &RuntimeCall) -> bool {
+		*call == tagged_remark(TAG)
+	}
+}
+
+/// The remark that only the call set tagged `tag` allows.
+pub fn tagged_remark(tag: u8) -> RuntimeCall {
+	RuntimeCall::System(frame_system::Call::remark { remark: vec![tag] })
 }
 
 pub fn new_test_ext() -> sp_io::TestExternalities {

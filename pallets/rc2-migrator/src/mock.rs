@@ -19,7 +19,9 @@ use crate as pallet_rc2_migrator;
 use codec::{Decode, DecodeWithMemTracking, Encode, MaxEncodedLen};
 use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
-	traits::{Currency, InstanceFilter, OnFinalize, OnInitialize, ReservableCurrency, Time},
+	traits::{
+		Contains, Currency, InstanceFilter, OnFinalize, OnInitialize, ReservableCurrency, Time,
+	},
 	weights::WeightMeter,
 };
 use frame_system::{EnsureRoot, EnsureSignedBy};
@@ -455,6 +457,28 @@ impl pallet_rc2_migrator::Config for Test {
 	// real runtime distinguishes a query response from a Coretime-chain call, which is a
 	// distinction `pallet-xcm` draws and this mock has no executor to reproduce.
 	type ResponseOrigin = EnsureSignedBy<CoretimeAccount, AccountId32>;
+	type PreMigrationCalls = TaggedRemark<PRE_MIGRATION>;
+	type IntraMigrationCalls = TaggedRemark<INTRA_MIGRATION>;
+	type PostMigrationCalls = TaggedRemark<POST_MIGRATION>;
+}
+
+/// Tags for [`TaggedRemark`], one per call set.
+pub const PRE_MIGRATION: u8 = 0;
+pub const INTRA_MIGRATION: u8 = 1;
+pub const POST_MIGRATION: u8 = 2;
+
+/// Allows only a remark of the single byte `TAG`, so a test can tell which call set was consulted.
+pub struct TaggedRemark<const TAG: u8>;
+
+impl<const TAG: u8> Contains<RuntimeCall> for TaggedRemark<TAG> {
+	fn contains(call: &RuntimeCall) -> bool {
+		*call == tagged_remark(TAG)
+	}
+}
+
+/// The remark that only the call set tagged `tag` allows.
+pub fn tagged_remark(tag: u8) -> RuntimeCall {
+	RuntimeCall::System(frame_system::Call::remark { remark: vec![tag] })
 }
 
 parameter_types! {

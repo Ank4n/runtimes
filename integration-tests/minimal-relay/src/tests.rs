@@ -2446,7 +2446,7 @@ mod call_encoding {
 ///
 /// Two gates stand between a parachain and the relay-side control plane, and neither can do the
 /// other's job: `SystemChildParachainAsNative` decides whether a para gets an origin of its own at
-/// all, and `PostAhmFilter` decides which calls that origin may reach. This drives a real
+/// all, and the call filter decides which calls that origin may reach. This drives a real
 /// `Transact` through both, because the failure mode they guard against is invisible — a call the
 /// relay chain refuses inside XCM produces no error anyone sees, just a `Transact` that did
 /// nothing.

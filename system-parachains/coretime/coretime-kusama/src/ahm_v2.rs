@@ -17,6 +17,8 @@
 //! AHM v2 migration wiring: the Coretime-chain side of receiving account, proxy, registrar and
 //! HRMP state from the relay chain.
 
+pub mod lockdown;
+
 use crate::{
 	xcm_config::XcmRouter, AccountId, Balances, BlockNumber, HrmpPara, MessageQueue, RegistrarPara,
 	Runtime, RuntimeEvent, RuntimeHoldReason,
@@ -44,6 +46,9 @@ impl pallet_ct_migrator::Config for Runtime {
 	type AdminOrigin = EnsureRoot<AccountId>;
 	type MessageQueue = MessageQueue;
 	type DmpQueuePriorityPattern = DmpQueuePriorityPattern;
+	type PreMigrationCalls = lockdown::CallsEnabledBeforeMigration;
+	type IntraMigrationCalls = lockdown::CallsEnabledDuringMigration;
+	type PostMigrationCalls = frame_support::traits::Everything;
 }
 
 #[cfg(test)]

@@ -26,7 +26,10 @@ use frame_support::{
 	assert_noop, assert_ok,
 	dispatch::Pays,
 	hypothetically,
-	traits::{LockableCurrency, OnInitialize, OnRuntimeUpgrade, WithdrawReasons},
+	traits::{
+		Contains, ContainsPair, Everything, LockableCurrency, OnInitialize, OnRuntimeUpgrade,
+		WithdrawReasons,
+	},
 };
 use migrator_types::{PortableHoldReason, PortableProxyDelegate, PortableProxyType};
 use runtime_parachains::{
@@ -1409,5 +1412,93 @@ fn abandoning_a_batch_drops_it_and_records_the_loss() {
 		assert_eq!(UnconfirmedBatchCount::<Test>::get(), 0);
 		assert!(take_sent_xcm().is_empty());
 		assert!(migrator_events().contains(&Event::BatchAbandoned { query_id, stage: sent_in }));
+	});
+}
+
+/// Every stage, in the order the machine walks them.
+fn all_stages() -> Vec<Stage> {
+	vec![
+		Stage::Pending,
+		Stage::Scheduled { start: 10 },
+		Stage::WaitingForCt,
+		Stage::WarmUp { end_at: 10 },
+		Stage::AccountsInit,
+		Stage::AccountsOngoing { last_key: None },
+		Stage::AccountsDone,
+		Stage::ProxyInit,
+		Stage::ProxyOngoing { last_key: None },
+		Stage::ProxyDone,
+		Stage::RegistrarInit,
+		Stage::RegistrarOngoing { last_key: None },
+		Stage::RegistrarDone,
+		Stage::HrmpInit,
+		Stage::HrmpOngoing { last_key: None },
+		Stage::HrmpDone,
+		Stage::Sweep,
+		Stage::SweepDust { last_key: None },
+		Stage::TiCorrection,
+		Stage::CoolOff { end_at: 10 },
+		Stage::MigrationDone,
+	]
+}
+
+#[test]
+fn each_stage_allows_only_its_own_call_set() {
+	new_test_ext().execute_with(|| {
+		for stage in all_stages() {
+			let allowed = match stage {
+				Stage::Pending | Stage::Scheduled { .. } => PRE_MIGRATION,
+				Stage::WaitingForCt |
+				Stage::WarmUp { .. } |
+				Stage::AccountsInit |
+				Stage::AccountsOngoing { .. } |
+				Stage::AccountsDone |
+				Stage::ProxyInit |
+				Stage::ProxyOngoing { .. } |
+				Stage::ProxyDone |
+				Stage::RegistrarInit |
+				Stage::RegistrarOngoing { .. } |
+				Stage::RegistrarDone |
+				Stage::HrmpInit |
+				Stage::HrmpOngoing { .. } |
+				Stage::HrmpDone |
+				Stage::Sweep |
+				Stage::SweepDust { .. } |
+				Stage::TiCorrection |
+				Stage::CoolOff { .. } => INTRA_MIGRATION,
+				Stage::MigrationDone => POST_MIGRATION,
+			};
+
+			// GIVEN the machine at `stage`.
+			set_stage(stage.clone());
+
+			// THEN only the remark of that stage's call set passes.
+			for tag in [PRE_MIGRATION, INTRA_MIGRATION, POST_MIGRATION] {
+				assert_eq!(
+					<Rc2Migrator as Contains<RuntimeCall>>::contains(&tagged_remark(tag)),
+					tag == allowed,
+					"call set {tag} at {stage:?}"
+				);
+			}
+		}
+	});
+}
+
+#[test]
+fn teleport_trust_ends_when_the_migration_starts() {
+	new_test_ext().execute_with(|| {
+		let asset: Asset = (Here, 1u128).into();
+		let origin = Location::new(0, [Parachain(CT_PARA_ID)]);
+		for stage in all_stages() {
+			// GIVEN the machine at `stage`.
+			set_stage(stage.clone());
+
+			// THEN the inner filter's answer stands until the start, and nothing is trusted after.
+			assert_eq!(
+				xcm_config::FalseOnceStarted::<Test, Everything>::contains(&asset, &origin),
+				!stage.has_started(),
+				"at {stage:?}"
+			);
+		}
 	});
 }

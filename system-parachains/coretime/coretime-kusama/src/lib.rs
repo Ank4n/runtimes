@@ -211,56 +211,6 @@ impl Contains<RuntimeCall> for IsFilteredBrokerCall {
 	}
 }
 
-/// The parachain control plane, before the migration has handed it anything.
-///
-/// These pallets ship with the runtime upgrade but must not serve users until the migration has
-/// moved the relay chain's state across, because until then they contradict it. Concretely: their
-/// `Paras` map is empty and `NextFreeParaId` is 0, so `reserve` would hand out `FirstPublicParaId`
-/// — a parachain that is very much alive on the relay chain. Whoever took it would then park the
-/// real one, which arrives later to find its id occupied.
-///
-/// Only the user-facing calls are closed. The relay chain's reports arrive as Root and bypass this
-/// filter entirely, and the migration hands records over by direct call rather than by dispatch,
-/// so both keep working while this is engaged.
-pub struct ParaControlBeforeMigration;
-impl Contains<RuntimeCall> for ParaControlBeforeMigration {
-	fn contains(c: &RuntimeCall) -> bool {
-		matches!(c, RuntimeCall::RegistrarPara(..) | RuntimeCall::HrmpPara(..)) &&
-			!pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_finished()
-	}
-}
-
-/// Proxy *mutations*, blocked while the migration is running.
-///
-/// The proxy stage rewrites this chain's `Proxies` map from the relay chain's, resizing each
-/// deposit to local rates as it goes. A user adding or removing a delegation while that is in
-/// flight either loses it — the migrated record overwrites theirs — or leaves the deposit
-/// accounting disagreeing with the map, and neither is recoverable by anything short of
-/// governance.
-///
-/// Only the calls that *mutate* the map are closed, which is the distinction the PRD draws: an
-/// existing proxy keeps working throughout, because `proxy` and `proxy_announced` read the map
-/// rather than writing it. Somebody mid-migration who relies on a proxy to reach their funds is
-/// not locked out; they simply cannot change the arrangement until it is over.
-///
-/// Opens again at `MigrationDone`, unlike the para-control gate, which opens then for the opposite
-/// reason.
-pub struct ProxyMutationsDuringMigration;
-impl Contains<RuntimeCall> for ProxyMutationsDuringMigration {
-	fn contains(c: &RuntimeCall) -> bool {
-		matches!(
-			c,
-			RuntimeCall::Proxy(
-				pallet_proxy::Call::add_proxy { .. } |
-					pallet_proxy::Call::remove_proxy { .. } |
-					pallet_proxy::Call::remove_proxies { .. } |
-					pallet_proxy::Call::create_pure { .. } |
-					pallet_proxy::Call::kill_pure { .. },
-			)
-		) && pallet_ct_migrator::CtMigrationStage::<Runtime>::get().is_ongoing()
-	}
-}
-
 /// Implements [`pallet_broker::BlockToRelayHeightConversion`] for the migration to relay chain
 /// block numbers for the broker pallet.
 pub struct BrokerMigrationV4BlockConversion;
@@ -285,11 +235,8 @@ impl pallet_broker::migration::v4::BlockToRelayHeightConversion<Runtime>
 // Configure FRAME pallets to include in runtime.
 #[derive_impl(frame_system::config_preludes::ParaChainDefaultConfig as frame_system::DefaultConfig)]
 impl frame_system::Config for Runtime {
-	type BaseCallFilter = EverythingBut<(
-		IsFilteredBrokerCall,
-		ParaControlBeforeMigration,
-		ProxyMutationsDuringMigration,
-	)>;
+	type BaseCallFilter =
+		frame_support::traits::InsideBoth<EverythingBut<IsFilteredBrokerCall>, CtMigrator>;
 	/// The identifier used to distinguish between accounts.
 	type AccountId = AccountId;
 	/// The nonce type for storing how many extrinsics an account has signed.
