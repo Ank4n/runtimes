@@ -25,6 +25,7 @@ use codec::Encode;
 use cumulus_primitives_core::UpwardMessage;
 use frame_support::assert_ok;
 use network::constants::{system_parachain, time::MINUTES};
+use pallet_message_queue::Event::{Processed, ProcessingFailed};
 use pallet_rc2_migrator::MigrationStage as RcStage;
 use sp_io::TestExternalities;
 use xcm::{latest::prelude::*, VersionedXcm};
@@ -143,13 +144,12 @@ where
 const WARM_UP: u32 = 10;
 const COOL_OFF: u32 = 10;
 
-/// A para that is not a system chain. The relay chain's barrier refuses its unpaid messages at
-/// every stage.
+/// A para the relay chain's barrier turns away outright, because it is not a system chain.
 const OUTSIDER_PARA: u32 = 4242;
 
-/// A para whose messages pass the relay chain's barrier but which is not the Coretime chain, so
-/// only `CtOrigin` stands between it and the migrator. From the start the barrier admits only the
-/// Coretime chain and Asset Hub, so this must be Asset Hub.
+/// A system para that is not the Coretime chain. The barrier lets its message in, so the only
+/// thing standing between it and the migration is `CtOrigin`.
+/// Once the migration starts, the barrier admits only this para and the Coretime chain.
 const SYSTEM_IMPOSTOR_PARA: u32 = system_parachain::ASSET_HUB_ID;
 
 /// Schedule the migration and walk both chains through the handshake over their real queues: the
@@ -282,29 +282,29 @@ async fn readiness_from_another_parachain_is_refused() {
 
 	// GIVEN a relay chain waiting for the Coretime chain to be ready
 	let ump = run_handshake(&mut rc, &mut ct);
-	let [ready]: [UpwardMessage; 1] =
-		ump.try_into().expect("the Coretime chain's only message is its readiness");
 
 	// WHEN a para that is not a system chain sends that same message. THEN the barrier turns it
 	// away before it executes, and the relay chain is still waiting.
 	rc.execute_with(|| {
 		drain_inbound_queues(OUTSIDER_PARA);
 		drain_inbound_queues(SYSTEM_IMPOSTOR_PARA);
+		enqueue_ump(OUTSIDER_PARA.into(), ump.clone());
 		assert_eq!(
-			deliver_encoded_ump(OUTSIDER_PARA, ready.clone()),
-			Delivery::Refused,
+			ump_outcome(OUTSIDER_PARA),
+			Some(false),
 			"the barrier must refuse a message from a para that is not a system chain"
 		);
 		assert_eq!(rc_stage(), RcStage::WaitingForCt);
 	});
 
-	// WHEN Asset Hub sends it. THEN the barrier admits the message and `Transact` runs, so this is
-	// `CtOrigin` refusing the call rather than the barrier refusing the message -- and the
-	// `ExpectTransactStatus` that follows the call turns that refusal into a failed message.
+	// WHEN a system para sends it. THEN the barrier admits the message and `Transact` runs, so
+	// this is `CtOrigin` refusing the call rather than the barrier refusing the message -- and
+	// the `ExpectTransactStatus` that follows the call turns that refusal into a failed message.
 	rc.execute_with(|| {
+		enqueue_ump(SYSTEM_IMPOSTOR_PARA.into(), ump);
 		assert_eq!(
-			deliver_encoded_ump(SYSTEM_IMPOSTOR_PARA, ready),
-			Delivery::Failed(XcmError::ExpectationFalse),
+			ump_outcome(SYSTEM_IMPOSTOR_PARA),
+			Some(false),
 			"a refused call must fail the message, not report success"
 		);
 		assert_eq!(rc_stage(), RcStage::WaitingForCt);
@@ -334,6 +334,28 @@ fn has_queued_ump(para: u32) -> bool {
 	let queue = UmpOrigin::Ump(UmpQueue::Para(para.into()));
 	pallet_message_queue::Pages::<network::relay::Runtime>::iter_keys()
 		.any(|(origin, _page)| origin == queue)
+}
+
+/// Run relay-chain blocks until the message queue reports on a message from `para`'s upward queue,
+/// and say whether the executor accepted it. `None` if none was reported at all.
+fn ump_outcome(para: u32) -> Option<bool> {
+	let queue = UmpOrigin::Ump(UmpQueue::Para(para.into()));
+
+	for _ in 0..10 {
+		next_block_rc_unchecked();
+		for record in frame_system::Pallet::<network::relay::Runtime>::events() {
+			match record.event {
+				network::relay::RuntimeEvent::MessageQueue(Processed {
+					origin, success, ..
+				}) if origin == queue => return Some(success),
+				network::relay::RuntimeEvent::MessageQueue(ProcessingFailed { origin, .. })
+					if origin == queue =>
+					return Some(false),
+				_ => (),
+			}
+		}
+	}
+	None
 }
 
 fn rc_stage() -> pallet_rc2_migrator::MigrationStageOf<network::relay::Runtime> {

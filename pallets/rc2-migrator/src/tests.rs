@@ -808,7 +808,31 @@ fn the_stage_predicates_say_what_their_consumers_need() {
 		}
 	}
 
-	for stage in all_stages() {
+	let cases = [
+		Stage::Pending,
+		Stage::Scheduled { start: 10 },
+		Stage::WaitingForCt,
+		Stage::WarmUp { end_at: 10 },
+		Stage::AccountsInit,
+		Stage::AccountsOngoing { last_key: None },
+		Stage::AccountsDone,
+		Stage::ProxyInit,
+		Stage::ProxyOngoing { last_key: None },
+		Stage::ProxyDone,
+		Stage::RegistrarInit,
+		Stage::RegistrarOngoing { last_key: None },
+		Stage::RegistrarDone,
+		Stage::HrmpInit,
+		Stage::HrmpOngoing { last_key: None },
+		Stage::HrmpDone,
+		Stage::Sweep,
+		Stage::SweepDust { last_key: None },
+		Stage::TiCorrection,
+		Stage::CoolOff { end_at: 10 },
+		Stage::MigrationDone,
+	];
+
+	for stage in cases {
 		let (ongoing, started, finished) = expected(&stage);
 		assert_eq!(stage.is_ongoing(), ongoing, "is_ongoing for {stage:?}");
 		assert_eq!(stage.has_started(), started, "has_started for {stage:?}");

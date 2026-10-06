@@ -18,22 +18,26 @@
 //! both chains, checked at every stage of a real run.
 
 use crate::mock::*;
+use codec::Encode;
 use core::{cell::RefCell, mem::discriminant};
 use cumulus_primitives_core::ParaId;
 use frame_support::{
-	assert_ok, dispatch::PostDispatchInfo, hypothetically, traits::fungible::Mutate,
+	assert_ok,
+	dispatch::PostDispatchInfo,
+	hypothetically,
+	traits::{fungible::Mutate, OnFinalize, OnInitialize},
 };
 use network::constants::{currency::UNITS, system_parachain, time::MINUTES};
 use pallet_ct_migrator::MigrationStage as CtStage;
 use pallet_rc2_migrator::MigrationStage as RcStage;
 use sp_core::H256;
-use sp_io::TestExternalities;
+use sp_io::{hashing::blake2_256, TestExternalities};
 use sp_runtime::{
 	traits::{AccountIdConversion, Dispatchable},
 	AccountId32, DispatchError,
 };
 use std::collections::HashSet;
-use xcm::latest::prelude::*;
+use xcm::{latest::prelude::*, VersionedXcm};
 
 /// The windows the walk schedules with.
 const WARM_UP: u32 = 10;
@@ -376,6 +380,62 @@ fn drain_all_inbound_queues() {
 		next_block_rc_unchecked();
 	}
 	panic!("the relay chain's inbound queues did not drain");
+}
+
+/// What became of one inbound message.
+#[derive(Debug, PartialEq, Eq)]
+enum Delivery {
+	/// Admitted, and every instruction succeeded.
+	Executed,
+	/// Admitted, and an instruction failed with this error.
+	Failed(XcmError),
+	/// Turned away by the barrier before any instruction ran.
+	Refused,
+}
+
+/// Send `message` up from `para` and service the relay chain's message queue until it reports on
+/// that message. Only the queue runs, not the migrator, so the stage stays where it was.
+///
+/// `message` must not end in a `SetTopic`: the queue reports an admitted message under that topic
+/// rather than under the hash of its bytes.
+fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
+	let encoded = VersionedXcm::from(message).encode();
+	let hash = blake2_256(&encoded);
+	enqueue_ump(para.into(), vec![encoded]);
+
+	for _ in 0..10 {
+		let now = frame_system::Pallet::<network::relay::Runtime>::block_number() + 1;
+		frame_system::Pallet::<network::relay::Runtime>::set_block_number(now);
+		frame_system::Pallet::<network::relay::Runtime>::reset_events();
+		<network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
+		<network::relay::MessageQueue as OnFinalize<_>>::on_finalize(now);
+
+		let events = frame_system::Pallet::<network::relay::Runtime>::events();
+		let success = events.iter().find_map(|record| match record.event {
+			network::relay::RuntimeEvent::MessageQueue(
+				pallet_message_queue::Event::Processed { id, success, .. },
+			) if id.0 == hash => Some(success),
+			_ => None,
+		});
+		// The executor reports a failed instruction with its error. A barrier refusal is reported
+		// only as an unsuccessful `Processed`.
+		let failure = events.iter().find_map(|record| match &record.event {
+			network::relay::RuntimeEvent::XcmPallet(pallet_xcm::Event::ProcessXcmError {
+				error,
+				message_id,
+				..
+			}) if *message_id == hash => Some(*error),
+			_ => None,
+		});
+		match (success, failure) {
+			(Some(true), None) => return Delivery::Executed,
+			(Some(false), Some(error)) => return Delivery::Failed(error),
+			(Some(false), None) => return Delivery::Refused,
+			(None, None) => (),
+			outcome => panic!("inconsistent report for the message from para {para}: {outcome:?}"),
+		}
+	}
+	panic!("the relay chain never processed the message from para {para}");
 }
 
 /// A message that asks for free execution and does nothing else, so whether it runs is the

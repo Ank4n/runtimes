@@ -376,9 +376,9 @@ pub mod pallet {
 		/// - `start`: The wall-clock time at which the migration will start.
 		/// - `warm_up`: Duration in blocks used to prepare for the migration. Calls are filtered
 		///   during this period. It is intended to give enough time for UMP and DMP queues to
-		///   empty, and must be longer than one Coretime timeslice: on-demand orders close at the
-		///   start, and the Coretime chain claims the revenue earned before it at its next
-		///   timeslice boundary. Counted from the transition to the warm-up stage.
+		///   empty. Counted from the transition to the warm-up stage. Must be longer than one
+		///   Coretime timeslice: on-demand orders close at the start, and the Coretime chain claims
+		///   the revenue earned before it at its next timeslice boundary.
 		/// - `cool_off`: Duration in blocks of the post migration cool-off period. Counted from the
 		///   transition to the cool-off stage.
 		///
@@ -622,8 +622,7 @@ pub mod pallet {
 				MigrationStage::Sweep => {
 					// TODO(ahm-v2): sweep the on-demand pot to the Asset Hub beneficiary with the
 					// other pots, and emit an event for it, so governance can move it later. It
-					// holds revenue only if the Coretime chain has not claimed
-					// it yet.
+					// holds revenue only if the Coretime chain has not claimed it yet.
 					Self::transition(MigrationStage::SweepDust { last_key: None });
 					T::DbWeight::get().reads_writes(1, 1)
 				},

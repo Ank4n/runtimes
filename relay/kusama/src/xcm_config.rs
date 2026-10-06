@@ -181,7 +181,7 @@ impl Contains<Location> for AssetHubPlurality {
 }
 
 /// The barriers one of which must be passed for an XCM message to be executed.
-pub type AllowBarriers = (
+pub type Barrier = TrailingSetTopicAsId<(
 	// Weight that is paid for may be consumed.
 	TakeWeightCredit,
 	// Expected responses are OK.
@@ -198,15 +198,7 @@ pub type AllowBarriers = (
 		UniversalLocation,
 		ConstU32<8>,
 	>,
-);
-
-#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
-pub type Barrier = TrailingSetTopicAsId<AllowBarriers>;
-/// [`AllowBarriers`], behind the AHM v2 migration's inbound lockdown.
-#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
-pub type Barrier = TrailingSetTopicAsId<
-	xcm_builder::DenyThenTry<crate::ahm_v2::lockdown::DenyOnceMigrationStarts, AllowBarriers>,
->;
+)>;
 
 /// Locations that will not be charged fees in the executor, neither for execution nor delivery.
 /// We only waive fees for system functions, which these locations represent.
@@ -233,6 +225,11 @@ impl xcm_executor::Config for XcmConfig {
 	#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
 	type IsTeleporter = TrustedTeleporters;
 	type UniversalLocation = UniversalLocation;
+	// Once the AHM v2 migration starts, only the Coretime chain and Asset Hub get through.
+	#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
+	type Barrier =
+		xcm_builder::DenyThenTry<crate::ahm_v2::lockdown::DenyOnceMigrationStarts, Barrier>;
+	#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
 	type Barrier = Barrier;
 	type Weigher = WeightInfoBounds<
 		crate::weights::xcm::KusamaXcmWeight<RuntimeCall>,

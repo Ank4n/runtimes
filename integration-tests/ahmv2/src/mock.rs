@@ -41,11 +41,11 @@ use runtime_parachains::{
 	dmp::{self, DownwardMessageQueues},
 };
 use sp_core::H256;
-use sp_io::{hashing::blake2_256, TestExternalities};
+use sp_io::TestExternalities;
 use sp_runtime::{traits::One, BoundedVec};
 use tokio::sync::OnceCell;
 use xcm::{
-	latest::prelude::{Instruction, Xcm, XcmError},
+	latest::prelude::{Instruction, Xcm},
 	VersionedXcm,
 };
 
@@ -381,77 +381,6 @@ pub fn enqueue_ump(para: ParaId, msgs: Vec<UpwardMessage>) {
 			bounded.as_bounded_slice(),
 			UmpOrigin::Ump(UmpQueue::Para(para)),
 		);
-	}
-}
-
-/// What became of one inbound message.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Delivery {
-	/// Admitted, and every instruction succeeded.
-	Executed,
-	/// Admitted, and an instruction failed with this error.
-	Failed(XcmError),
-	/// Turned away by the barrier before any instruction ran.
-	Refused,
-}
-
-/// Send `message` up from `para` and service the relay chain's message queue until it reports on
-/// that message. Only the queue runs, not the migrator, so the stage stays where it was.
-pub fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
-	deliver_encoded_ump(para, VersionedXcm::from(message).encode())
-}
-
-/// [`deliver_ump`] for a message already encoded, such as one taken from a parachain's queue.
-pub fn deliver_encoded_ump(para: u32, encoded: UpwardMessage) -> Delivery {
-	// The message queue reports a message under the hash of its bytes, unless the barrier admits it
-	// and it ends in a `SetTopic`: then under that topic (`TrailingSetTopicAsId`).
-	let hash = blake2_256(&encoded);
-	let topic = trailing_topic(&encoded).unwrap_or(hash);
-	let is_this = |id: &[u8; 32]| *id == hash || *id == topic;
-	enqueue_ump(para.into(), vec![encoded]);
-
-	for _ in 0..10 {
-		let now = frame_system::Pallet::<RelayRuntime>::block_number() + 1;
-		frame_system::Pallet::<RelayRuntime>::set_block_number(now);
-		frame_system::Pallet::<RelayRuntime>::reset_events();
-		<network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
-		<network::relay::MessageQueue as OnFinalize<_>>::on_finalize(now);
-
-		let events = frame_system::Pallet::<RelayRuntime>::events();
-		let success = events.iter().find_map(|record| match record.event {
-			network::relay::RuntimeEvent::MessageQueue(
-				pallet_message_queue::Event::Processed { id: got, success, .. },
-			) if is_this(&got.0) => Some(success),
-			_ => None,
-		});
-		// The executor reports a failed instruction with its error. A barrier refusal is reported
-		// only as an unsuccessful `Processed`.
-		let failure = events.iter().find_map(|record| match &record.event {
-			network::relay::RuntimeEvent::XcmPallet(pallet_xcm::Event::ProcessXcmError {
-				error,
-				message_id,
-				..
-			}) if is_this(message_id) => Some(*error),
-			_ => None,
-		});
-		match (success, failure) {
-			(Some(true), None) => return Delivery::Executed,
-			(Some(false), Some(error)) => return Delivery::Failed(error),
-			(Some(false), None) => return Delivery::Refused,
-			(None, None) => (),
-			outcome => panic!("inconsistent report for the message from para {para}: {outcome:?}"),
-		}
-	}
-	panic!("the relay chain never processed the message from para {para}");
-}
-
-/// The topic an encoded XCM ends with, if its last instruction is a `SetTopic`.
-fn trailing_topic(encoded: &[u8]) -> Option<[u8; 32]> {
-	let versioned = VersionedXcm::<()>::decode(&mut &encoded[..]).ok()?;
-	let xcm: Xcm<()> = versioned.try_into().ok()?;
-	match xcm.0.last() {
-		Some(Instruction::SetTopic(topic)) => Some(*topic),
-		_ => None,
 	}
 }
 
