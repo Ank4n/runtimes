@@ -751,7 +751,7 @@ construct_runtime!(
 		#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
 		CtMigrator: pallet_ct_migrator = 255,
 		// TODO(ahm-v2): `RegistrarPara` and `HrmpPara` go here, closed until the migration is done
-		// (`ahm_v2.rs`).
+		// (`ahm_v2/lockdown.rs`).
 	}
 );
 
