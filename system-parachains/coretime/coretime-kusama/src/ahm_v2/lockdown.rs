@@ -155,6 +155,7 @@ mod tests {
 			MigrationStage::DataMigrationOngoing,
 			MigrationStage::MigrationDone,
 		] {
+			// GIVEN the chain at `stage`.
 			// THEN a proxy change is refused exactly while the migration runs.
 			for call in &changes {
 				assert_eq!(allowed_at(&stage, call), !stage.is_ongoing(), "{call:?} at {stage:?}");

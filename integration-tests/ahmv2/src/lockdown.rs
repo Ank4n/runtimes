@@ -57,7 +57,7 @@ const CAROL: AccountId32 = AccountId32::new([0xca; 32]); // receives through the
 /// From the relay chain's start signal on: a signed transfer is filtered, the manager still drives
 /// the migrator, only the Coretime chain and Asset Hub get past the barrier, and a teleport from
 /// Asset Hub mints nothing. None of that reopens at the end. On the Coretime chain, adding a proxy
-/// is refused exactly while its migration runs, and an existing proxy works throughout.
+/// is refused exactly while its migration runs, and a proxy already in place works throughout.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lockdown_holds_at_every_stage() {
 	let (mut rc, mut ct) = tokio::join!(load(Chain::Relay), load(CoretimePara::CHAIN));
@@ -192,7 +192,10 @@ fn probe_rc_lockdown() {
 
 	// A signed transfer.
 	hypothetically!({
+		// GIVEN Alice has funds.
 		assert_ok!(pallet_balances::Pallet::<Rc>::mint_into(&ALICE, 100 * UNITS));
+
+		// WHEN she transfers to Bob. THEN it is filtered from the start on.
 		let transfer =
 			network::relay::RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
 				dest: BOB.into(),
@@ -212,10 +215,14 @@ fn probe_rc_lockdown() {
 
 	// The manager drives the migration with signed calls, which the filter lets through.
 	hypothetically!({
+		// GIVEN Alice is the manager.
 		assert_ok!(pallet_rc2_migrator::Pallet::<Rc>::set_manager(
 			network::relay::RuntimeOrigin::root(),
 			Some(ALICE),
 		));
+
+		// WHEN she pauses the migration. THEN it pauses while the migration runs, and is refused
+		// by the migrator, not the filter, otherwise.
 		let pause =
 			network::relay::RuntimeCall::Rc2Migrator(pallet_rc2_migrator::Call::pause_migration {});
 		if stage.is_ongoing() {
@@ -243,8 +250,11 @@ fn probe_rc_lockdown() {
 
 	// An ordinary para paying from its sovereign account here.
 	hypothetically!({
+		// GIVEN the para's sovereign account here has funds.
 		let sovereign: AccountId32 = ParaId::from(OUTSIDER_PARA).into_account_truncating();
 		assert_ok!(pallet_balances::Pallet::<Rc>::mint_into(&sovereign, 100 * UNITS));
+
+		// WHEN it sends a paid message. THEN the barrier refuses it from the start on.
 		assert_eq!(
 			deliver_ump(OUTSIDER_PARA, paid_transfer_to(&BOB)),
 			if started { Delivery::Refused } else { Delivery::Executed },
@@ -296,8 +306,9 @@ fn probe_ct_lockdown() {
 		}
 	});
 
-	// Using an existing proxy, here to make a transfer.
+	// Using a proxy, here to make a transfer.
 	hypothetically!({
+		// GIVEN Alice is already Bob's proxy.
 		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&BOB, 100 * UNITS));
 		assert_ok!(pallet_proxy::Pallet::<Ct>::add_proxy_delegate(
 			&BOB,
@@ -305,6 +316,8 @@ fn probe_ct_lockdown() {
 			network::ct::ProxyType::Any,
 			0,
 		));
+
+		// WHEN Alice transfers from Bob's account through the proxy.
 		let transfer =
 			network::ct::RuntimeCall::Balances(pallet_balances::Call::transfer_keep_alive {
 				dest: CAROL.into(),
@@ -316,7 +329,9 @@ fn probe_ct_lockdown() {
 			call: Box::new(transfer),
 		});
 		assert_ok!(dispatch_signed(&ALICE, proxy));
-		// `proxy` succeeds even when the inner call fails, so check what the inner call did.
+
+		// THEN the transfer lands. `proxy` succeeds even when the inner call fails, so check what
+		// the inner call did.
 		assert_eq!(
 			pallet_balances::Pallet::<Ct>::free_balance(&CAROL),
 			10 * UNITS,
@@ -326,6 +341,7 @@ fn probe_ct_lockdown() {
 
 	// Announcing through a time-delayed proxy, and the owner cancelling it.
 	hypothetically!({
+		// GIVEN Alice is already Bob's proxy, with a delay.
 		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&ALICE, 100 * UNITS));
 		assert_ok!(pallet_balances::Pallet::<Ct>::mint_into(&BOB, 100 * UNITS));
 		assert_ok!(pallet_proxy::Pallet::<Ct>::add_proxy_delegate(
@@ -334,6 +350,8 @@ fn probe_ct_lockdown() {
 			network::ct::ProxyType::Any,
 			10,
 		));
+
+		// WHEN Alice announces a call. THEN the announcement is recorded.
 		let call_hash = H256::repeat_byte(1);
 		let announce = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::announce {
 			real: BOB.into(),
@@ -342,6 +360,7 @@ fn probe_ct_lockdown() {
 		assert_ok!(dispatch_signed(&ALICE, announce));
 		assert_eq!(pallet_proxy::Announcements::<Ct>::get(&ALICE).0.len(), 1);
 
+		// WHEN Bob rejects it. THEN it is gone and Alice's deposit is released.
 		let reject = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::reject_announcement {
 			delegate: ALICE.into(),
 			call_hash,
