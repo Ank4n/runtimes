@@ -15,7 +15,7 @@
 // along with Polkadot. If not, see <http://www.gnu.org/licenses/>.
 
 use crate::{
-	mock::*, xcm_config::FalseOnceStarted, CtMigratorCall, CtRuntimeCall, Error, Event, Manager,
+	mock::*, xcm_config::NothingOnceStarted, CtMigratorCall, CtRuntimeCall, Error, Event, Manager,
 	MigrationStage, Paused, RcMigrationStage,
 };
 use codec::Encode;
@@ -897,7 +897,7 @@ fn teleport_trust_ends_when_the_migration_starts() {
 
 			// THEN the inner filter's answer stands until the start, and nothing is trusted after.
 			assert_eq!(
-				FalseOnceStarted::<Test, Everything>::contains(&asset, &origin),
+				NothingOnceStarted::<Test, Everything>::contains(&asset, &origin),
 				!stage.has_started(),
 				"at {stage:?}"
 			);

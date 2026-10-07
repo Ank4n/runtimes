@@ -229,7 +229,7 @@ impl xcm_executor::Config for XcmConfig {
 	// Teleports to and from this chain are refused once the AHM v2 migration starts.
 	#[cfg(all(feature = "ahm-v2", not(feature = "on-chain-release-build")))]
 	type IsTeleporter =
-		pallet_rc2_migrator::xcm_config::FalseOnceStarted<Runtime, TrustedTeleporters>;
+		pallet_rc2_migrator::xcm_config::NothingOnceStarted<Runtime, TrustedTeleporters>;
 	#[cfg(not(all(feature = "ahm-v2", not(feature = "on-chain-release-build"))))]
 	type IsTeleporter = TrustedTeleporters;
 	type UniversalLocation = UniversalLocation;

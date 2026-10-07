@@ -25,7 +25,7 @@ use frame_support::{
 	assert_noop, assert_ok,
 	dispatch::PostDispatchInfo,
 	hypothetically,
-	traits::{fungible::Mutate, OnFinalize, OnInitialize},
+	traits::{fungible::Mutate, ServiceQueues},
 };
 use network::constants::{currency::UNITS, system_parachain, time::MINUTES};
 use pallet_ct_migrator::MigrationStage as CtStage;
