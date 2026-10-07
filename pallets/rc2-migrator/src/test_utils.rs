@@ -19,6 +19,7 @@
 use alloc::{vec, vec::Vec};
 use codec::Decode;
 use scale_info::{TypeDef, TypeInfo};
+use sp_runtime::traits::TrailingZeroInput;
 
 /// A call of a runtime, by pallet and call name.
 pub type CallName = (&'static str, &'static str);
@@ -36,10 +37,7 @@ pub fn every_call<Call: TypeInfo + Decode>() -> (Vec<(CallName, Call)>, Vec<Call
 		};
 		for variant in variants.variants {
 			// The pallet and call indices, then zeros for the arguments.
-			let mut bytes = [0u8; 2 + 1024];
-			bytes[0] = pallet.index;
-			bytes[1] = variant.index;
-			match Call::decode(&mut &bytes[..]) {
+			match Call::decode(&mut TrailingZeroInput::new(&[pallet.index, variant.index])) {
 				Ok(call) => calls.push(((pallet.name, variant.name), call)),
 				Err(_) => skipped.push((pallet.name, variant.name)),
 			}
