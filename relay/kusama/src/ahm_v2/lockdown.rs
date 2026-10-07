@@ -186,7 +186,10 @@ mod tests {
 		xcm_config::SovereignAccountOf, AccountId, Balances, PostAhmFilter, Runtime, RuntimeCall,
 		RuntimeOrigin,
 	};
-	use frame_support::traits::{fungible::Mutate, Contains};
+	use frame_support::{
+		assert_err, assert_noop, assert_ok,
+		traits::{fungible::Mutate, Contains},
+	};
 	use kusama_runtime_constants::{
 		currency::UNITS,
 		system_parachain::{ASSET_HUB_ID, BRIDGE_HUB_ID, BROKER_ID},
@@ -330,12 +333,11 @@ mod tests {
 		for stage in stages_from_start() {
 			at(&stage, || {
 				// THEN a signed account's remark is filtered, and Root's is not.
-				assert_eq!(
+				assert_noop!(
 					remark.clone().dispatch(RuntimeOrigin::signed(ALICE)).map_err(|e| e.error),
-					Err(frame_system::Error::<Runtime>::CallFiltered.into()),
-					"at {stage:?}"
+					frame_system::Error::<Runtime>::CallFiltered
 				);
-				assert!(remark.clone().dispatch(RuntimeOrigin::root()).is_ok(), "at {stage:?}");
+				assert_ok!(remark.clone().dispatch(RuntimeOrigin::root()));
 			});
 		}
 	}
@@ -346,16 +348,15 @@ mod tests {
 
 		// GIVEN the migration has not started. THEN a teleport from Asset Hub lands.
 		for stage in stages_before_start() {
-			assert_eq!(execute_from(&stage, asset_hub.clone(), teleport()), Ok(()), "at {stage:?}");
+			assert_ok!(execute_from(&stage, asset_hub.clone(), teleport()));
 		}
 
 		// GIVEN the migration has started. THEN the same teleport is refused as untrusted, also
 		// after it is done.
 		for stage in stages_from_start() {
-			assert_eq!(
+			assert_err!(
 				execute_from(&stage, asset_hub.clone(), teleport()),
-				Err(XcmError::UntrustedTeleportLocation),
-				"at {stage:?}"
+				XcmError::UntrustedTeleportLocation
 			);
 		}
 	}
@@ -369,7 +370,7 @@ mod tests {
 	) -> Result<(), XcmError> {
 		at(stage, || {
 			let account = SovereignAccountOf::convert_location(&origin).expect("origin converts");
-			<Balances as Mutate<AccountId>>::mint_into(&account, 100 * UNITS).unwrap();
+			assert_ok!(<Balances as Mutate<AccountId>>::mint_into(&account, 100 * UNITS));
 			XcmExecutor::<crate::xcm_config::XcmConfig>::prepare_and_execute(
 				origin,
 				message,
@@ -419,11 +420,7 @@ mod tests {
 				(para(BRIDGE_HUB_ID), paid()),
 				(para(BRIDGE_HUB_ID), unpaid()),
 			] {
-				assert_eq!(
-					execute_from(&stage, origin.clone(), message),
-					Ok(()),
-					"{origin:?} at {stage:?}"
-				);
+				assert_ok!(execute_from(&stage, origin, message));
 			}
 		}
 
@@ -432,18 +429,10 @@ mod tests {
 		for stage in stages_from_start() {
 			for message in [paid(), unpaid()] {
 				for origin in [para(2000), para(BRIDGE_HUB_ID)] {
-					assert_eq!(
-						execute_from(&stage, origin.clone(), message.clone()),
-						Err(XcmError::Barrier),
-						"{origin:?} at {stage:?}"
-					);
+					assert_err!(execute_from(&stage, origin, message.clone()), XcmError::Barrier);
 				}
 				for origin in [para(BROKER_ID), para(ASSET_HUB_ID)] {
-					assert_eq!(
-						execute_from(&stage, origin.clone(), message.clone()),
-						Ok(()),
-						"{origin:?} at {stage:?}"
-					);
+					assert_ok!(execute_from(&stage, origin, message.clone()));
 				}
 			}
 		}

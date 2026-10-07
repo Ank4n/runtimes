@@ -22,7 +22,7 @@ use codec::Encode;
 use core::{cell::RefCell, mem::discriminant};
 use cumulus_primitives_core::ParaId;
 use frame_support::{
-	assert_ok,
+	assert_noop, assert_ok,
 	dispatch::PostDispatchInfo,
 	hypothetically,
 	traits::{fungible::Mutate, OnFinalize, OnInitialize},
@@ -198,11 +198,11 @@ fn probe_rc_lockdown() {
 				dest: BOB.into(),
 				value: 10 * UNITS,
 			});
-		assert_eq!(
-			dispatch_signed(&ALICE, transfer),
-			if started { Err(filtered) } else { Ok(()) },
-			"a signed transfer at {stage:?}"
-		);
+		if started {
+			assert_noop!(dispatch_signed(&ALICE, transfer), filtered);
+		} else {
+			assert_ok!(dispatch_signed(&ALICE, transfer));
+		}
 		assert_eq!(
 			pallet_balances::Pallet::<Rc>::free_balance(&BOB),
 			if started { 0 } else { 10 * UNITS },
@@ -218,15 +218,14 @@ fn probe_rc_lockdown() {
 		));
 		let pause =
 			network::relay::RuntimeCall::Rc2Migrator(pallet_rc2_migrator::Call::pause_migration {});
-		assert_eq!(
-			dispatch_signed(&ALICE, pause),
-			if stage.is_ongoing() {
-				Ok(())
-			} else {
-				Err(pallet_rc2_migrator::Error::<Rc>::NotRunning.into())
-			},
-			"the manager pausing at {stage:?}"
-		);
+		if stage.is_ongoing() {
+			assert_ok!(dispatch_signed(&ALICE, pause));
+		} else {
+			assert_noop!(
+				dispatch_signed(&ALICE, pause),
+				pallet_rc2_migrator::Error::<Rc>::NotRunning
+			);
+		}
 	});
 
 	// Unpaid messages from system chains: from the start, only Coretime and Asset Hub get in.
@@ -290,11 +289,11 @@ fn probe_ct_lockdown() {
 			proxy_type: network::ct::ProxyType::Any,
 			delay: 0,
 		});
-		assert_eq!(
-			dispatch_signed(&ALICE, add),
-			if stage.is_ongoing() { Err(filtered) } else { Ok(()) },
-			"adding a proxy at {stage:?}"
-		);
+		if stage.is_ongoing() {
+			assert_noop!(dispatch_signed(&ALICE, add), filtered);
+		} else {
+			assert_ok!(dispatch_signed(&ALICE, add));
+		}
 	});
 
 	// Using an existing proxy, here to make a transfer.
@@ -316,7 +315,7 @@ fn probe_ct_lockdown() {
 			force_proxy_type: None,
 			call: Box::new(transfer),
 		});
-		assert_eq!(dispatch_signed(&ALICE, proxy), Ok(()), "using a proxy at {stage:?}");
+		assert_ok!(dispatch_signed(&ALICE, proxy));
 		// `proxy` succeeds even when the inner call fails, so check what the inner call did.
 		assert_eq!(
 			pallet_balances::Pallet::<Ct>::free_balance(&CAROL),
@@ -340,14 +339,14 @@ fn probe_ct_lockdown() {
 			real: BOB.into(),
 			call_hash,
 		});
-		assert_eq!(dispatch_signed(&ALICE, announce), Ok(()), "announcing at {stage:?}");
+		assert_ok!(dispatch_signed(&ALICE, announce));
 		assert_eq!(pallet_proxy::Announcements::<Ct>::get(&ALICE).0.len(), 1);
 
 		let reject = network::ct::RuntimeCall::Proxy(pallet_proxy::Call::reject_announcement {
 			delegate: ALICE.into(),
 			call_hash,
 		});
-		assert_eq!(dispatch_signed(&BOB, reject), Ok(()), "rejecting at {stage:?}");
+		assert_ok!(dispatch_signed(&BOB, reject));
 		assert!(pallet_proxy::Announcements::<Ct>::get(&ALICE).0.is_empty(), "at {stage:?}");
 		assert_eq!(
 			pallet_balances::Pallet::<Ct>::reserved_balance(&ALICE),
