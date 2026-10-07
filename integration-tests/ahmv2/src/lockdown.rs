@@ -411,8 +411,7 @@ enum Delivery {
 	Refused,
 }
 
-/// Send `message` up from `para` and service the relay chain's message queue until it reports on
-/// that message. Only the queue runs, not the migrator, so the stage stays where it was.
+/// Send `message` up from `para` and service the relay chain's message queue.
 ///
 /// `message` must not end in a `SetTopic`: the queue reports an admitted message under that topic
 /// rather than under the hash of its bytes.
@@ -421,39 +420,34 @@ fn deliver_ump(para: u32, message: Xcm<()>) -> Delivery {
 	let hash = blake2_256(&encoded);
 	enqueue_ump(para.into(), vec![encoded]);
 
-	for _ in 0..10 {
-		let now = frame_system::Pallet::<network::relay::Runtime>::block_number() + 1;
-		frame_system::Pallet::<network::relay::Runtime>::set_block_number(now);
-		frame_system::Pallet::<network::relay::Runtime>::reset_events();
-		<network::relay::MessageQueue as OnInitialize<_>>::on_initialize(now);
-		<network::relay::MessageQueue as OnFinalize<_>>::on_finalize(now);
+	frame_system::Pallet::<network::relay::Runtime>::reset_events();
+	<network::relay::MessageQueue as ServiceQueues>::service_queues(Weight::MAX);
 
-		let events = frame_system::Pallet::<network::relay::Runtime>::events();
-		let success = events.iter().find_map(|record| match record.event {
+	let events = frame_system::Pallet::<network::relay::Runtime>::events();
+	let success =
+		events.iter().find_map(|record| match record.event {
 			network::relay::RuntimeEvent::MessageQueue(
 				pallet_message_queue::Event::Processed { id, success, .. },
 			) if id.0 == hash => Some(success),
 			_ => None,
 		});
-		// The executor reports a failed instruction with its error. A barrier refusal is reported
-		// only as an unsuccessful `Processed`.
-		let failure = events.iter().find_map(|record| match &record.event {
-			network::relay::RuntimeEvent::XcmPallet(pallet_xcm::Event::ProcessXcmError {
-				error,
-				message_id,
-				..
-			}) if *message_id == hash => Some(*error),
-			_ => None,
-		});
-		match (success, failure) {
-			(Some(true), None) => return Delivery::Executed,
-			(Some(false), Some(error)) => return Delivery::Failed(error),
-			(Some(false), None) => return Delivery::Refused,
-			(None, None) => (),
-			outcome => panic!("inconsistent report for the message from para {para}: {outcome:?}"),
-		}
+	// The executor reports a failed instruction with its error. A barrier refusal is reported only
+	// as an unsuccessful `Processed`.
+	let failure = events.iter().find_map(|record| match &record.event {
+		network::relay::RuntimeEvent::XcmPallet(pallet_xcm::Event::ProcessXcmError {
+			error,
+			message_id,
+			..
+		}) if *message_id == hash => Some(*error),
+		_ => None,
+	});
+	match (success, failure) {
+		(Some(true), None) => Delivery::Executed,
+		(Some(false), Some(error)) => Delivery::Failed(error),
+		(Some(false), None) => Delivery::Refused,
+		(None, None) => panic!("the relay chain never processed the message from para {para}"),
+		outcome => panic!("inconsistent report for the message from para {para}: {outcome:?}"),
 	}
-	panic!("the relay chain never processed the message from para {para}");
 }
 
 /// A message that asks for free execution and does nothing else, so whether it runs is the
