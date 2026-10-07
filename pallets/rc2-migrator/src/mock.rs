@@ -39,6 +39,7 @@ frame_support::construct_runtime! {
 
 #[derive_impl(frame_system::config_preludes::TestDefaultConfig)]
 impl frame_system::Config for Test {
+	type BaseCallFilter = Rc2Migrator;
 	type Block = Block;
 	type AccountId = AccountId;
 	type Lookup = IdentityLookup<AccountId>;

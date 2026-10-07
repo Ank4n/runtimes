@@ -21,9 +21,9 @@ use crate::{
 use codec::Encode;
 use frame_support::{
 	assert_noop, assert_ok,
-	traits::{Contains, ContainsPair, Everything},
+	traits::{ContainsPair, Everything},
 };
-use sp_runtime::DispatchError::BadOrigin;
+use sp_runtime::{traits::Dispatchable, DispatchError::BadOrigin};
 use xcm::prelude::*;
 
 type Stage = MigrationStage<AccountId, u64, u64>;
@@ -872,11 +872,15 @@ fn each_stage_allows_only_its_own_call_set() {
 
 			// THEN only the remark of that stage's call set passes.
 			for tag in [PRE_MIGRATION, INTRA_MIGRATION, POST_MIGRATION] {
-				assert_eq!(
-					Rc2Migrator::contains(&tagged_remark(tag)),
-					tag == allowed,
-					"call set {tag} at {stage:?}"
-				);
+				let origin = RuntimeOrigin::signed(ALICE);
+				if tag == allowed {
+					assert_ok!(tagged_remark(tag).dispatch(origin));
+				} else {
+					assert_noop!(
+						tagged_remark(tag).dispatch(origin).map_err(|e| e.error),
+						frame_system::Error::<Test>::CallFiltered
+					);
+				}
 			}
 		}
 	});
