@@ -38,6 +38,8 @@ mod mock;
 #[cfg(test)]
 mod tests;
 
+pub mod accounts;
+
 pub use pallet::*;
 
 use alloc::vec;
