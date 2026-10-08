@@ -28,20 +28,14 @@ use frame_support::{
 	traits::{fungible::Mutate, ServiceQueues},
 };
 use network::constants::{currency::UNITS, system_parachain, time::MINUTES};
-use pallet_ct_migrator::MigrationStage as CtStage;
-use pallet_rc2_migrator::MigrationStage as RcStage;
 use sp_core::H256;
-use sp_io::{hashing::blake2_256, TestExternalities};
+use sp_io::hashing::blake2_256;
 use sp_runtime::{
 	traits::{AccountIdConversion, Dispatchable},
 	AccountId32, DispatchError,
 };
 use std::collections::HashSet;
 use xcm::{latest::prelude::*, VersionedXcm};
-
-/// The windows the walk schedules with.
-const WARM_UP: u32 = 10;
-const COOL_OFF: u32 = 10;
 
 /// A para that is not a system chain.
 const OUTSIDER_PARA: u32 = 4242;
@@ -76,6 +70,9 @@ async fn the_lockdown_holds_at_every_stage() {
 	walk_migration(
 		&mut rc,
 		&mut ct,
+		// One block per data stage; 30 is room to spare over the 15 there are.
+		30,
+		&mut [],
 		|| {
 			rc_stages.borrow_mut().insert(discriminant(&rc_stage()));
 			probe_rc_lockdown();
@@ -89,97 +86,6 @@ async fn the_lockdown_holds_at_every_stage() {
 	// Every variant of the relay chain's `MigrationStage` was probed, and all three of Coretime's.
 	assert_eq!(rc_stages.borrow().len(), 21);
 	assert_eq!(ct_stages.borrow().len(), 3);
-}
-
-/// Walk both chains from `Pending` to `MigrationDone` over their real queues. `probe_rc` runs
-/// inside the relay chain at every stage the walk passes, `probe_ct` inside the Coretime chain at
-/// each of its stages. Each probe runs in a storage layer that is rolled back, so it can change
-/// state without moving the walk.
-fn walk_migration(
-	rc: &mut TestExternalities,
-	ct: &mut TestExternalities,
-	probe_rc: impl Fn(),
-	probe_ct: impl Fn(),
-) {
-	let probe_rc = || hypothetically!(probe_rc());
-	let probe_ct = || hypothetically!(probe_ct());
-
-	// The relay chain schedules the start and sends its start signal.
-	let dmp = rc.execute_with(|| {
-		assert_eq!(rc_stage(), RcStage::Pending);
-		probe_rc();
-
-		// The block whose hooks first see a clock at or past `start` is the third from here,
-		// since hooks run before the timestamp inherent.
-		let start = now_ms_rc() + 2 * RC_BLOCK_TIME_MS;
-		assert_ok!(pallet_rc2_migrator::Pallet::<network::relay::Runtime>::schedule_migration(
-			network::relay::RuntimeOrigin::root(),
-			start,
-			WARM_UP,
-			COOL_OFF,
-		));
-		next_block_rc();
-		next_block_rc();
-		assert_eq!(rc_stage(), RcStage::Scheduled { start });
-		probe_rc();
-
-		next_block_rc();
-		assert_eq!(rc_stage(), RcStage::WaitingForCt);
-		probe_rc();
-		take_dmp(CoretimePara::PARA_ID.into())
-	});
-
-	// The Coretime chain opens and answers.
-	let ump = ct.execute_with(|| {
-		assert_eq!(ct_stage(), CtStage::Pending);
-		probe_ct();
-		enqueue_dmp::<CoretimePara>(dmp);
-		next_block_para::<CoretimePara>();
-		assert_eq!(ct_stage(), CtStage::DataMigrationOngoing);
-		probe_ct();
-		take_ump::<CoretimePara>()
-	});
-
-	// The relay chain warms up, walks every data stage and the cool-off, and sends its finish
-	// signal.
-	let dmp = rc.execute_with(|| {
-		enqueue_ump(CoretimePara::PARA_ID.into(), ump);
-		next_block_rc();
-		let RcStage::WarmUp { end_at } = rc_stage() else {
-			panic!("readiness did not admit the machine to the warm-up: {:?}", rc_stage())
-		};
-		probe_rc();
-
-		set_block_number_rc(end_at - 1);
-		next_block_rc();
-		assert_eq!(rc_stage(), RcStage::AccountsInit);
-
-		// One block per data stage; 30 is room to spare over the 15 there are.
-		let mut blocks = 0;
-		let end_at = loop {
-			probe_rc();
-			if let RcStage::CoolOff { end_at } = rc_stage() {
-				break end_at;
-			}
-			assert!(blocks < 30, "the data stages did not reach the cool-off: {:?}", rc_stage());
-			next_block_rc();
-			blocks += 1;
-		};
-
-		set_block_number_rc(end_at - 1);
-		next_block_rc();
-		assert_eq!(rc_stage(), RcStage::MigrationDone);
-		probe_rc();
-		take_dmp(CoretimePara::PARA_ID.into())
-	});
-
-	// The Coretime chain ends its lockdown.
-	ct.execute_with(|| {
-		enqueue_dmp::<CoretimePara>(dmp);
-		next_block_para::<CoretimePara>();
-		assert_eq!(ct_stage(), CtStage::MigrationDone);
-		probe_ct();
-	});
 }
 
 /// The relay chain's lockdown at its current stage: open before the start, closed from the start
@@ -480,12 +386,4 @@ fn teleport_to(to: &AccountId32, amount: u128) -> Xcm<()> {
 
 fn account(who: &AccountId32) -> Location {
 	Junction::AccountId32 { network: None, id: who.clone().into() }.into()
-}
-
-fn rc_stage() -> pallet_rc2_migrator::MigrationStageOf<network::relay::Runtime> {
-	pallet_rc2_migrator::RcMigrationStage::<network::relay::Runtime>::get()
-}
-
-fn ct_stage() -> CtStage {
-	pallet_ct_migrator::CtMigrationStage::<network::ct::Runtime>::get()
 }
