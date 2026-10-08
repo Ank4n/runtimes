@@ -20,7 +20,7 @@ use crate as pallet_rc2_migrator;
 use codec::Decode;
 use frame_support::{
 	derive_impl, ord_parameter_types, parameter_types,
-	traits::{OnInitialize, Time},
+	traits::{fungible::Mutate, OnInitialize, ReservableCurrency, Time},
 };
 use frame_system::EnsureSignedBy;
 use sp_runtime::{traits::IdentityLookup, AccountId32, BuildStorage};
@@ -45,10 +45,18 @@ impl frame_system::Config for Test {
 	type AccountData = pallet_balances::AccountData<u128>;
 }
 
+/// The Relay Chain's existential deposit.
+pub const ED: u128 = 10;
+
+parameter_types! {
+	pub const ExistentialDeposit: u128 = ED;
+}
+
 #[derive_impl(pallet_balances::config_preludes::TestDefaultConfig)]
 impl pallet_balances::Config for Test {
 	type Balance = u128;
 	type AccountStore = System;
+	type ExistentialDeposit = ExistentialDeposit;
 }
 
 /// The account the mock treats as the Coretime chain's dispatch origin.
@@ -56,6 +64,9 @@ pub const CORETIME: AccountId = AccountId32::new([5; 32]);
 
 /// Somebody
 pub const ALICE: AccountId = AccountId32::new([1; 32]);
+
+/// Somebody else
+pub const BOB: AccountId = AccountId32::new([3; 32]);
 
 /// The account behind the admin origin.
 pub const ADMIN: AccountId = AccountId32::new([2; 32]);
@@ -174,4 +185,15 @@ pub fn sent_call(n: usize) -> crate::CtRuntimeCall {
 		}
 	}
 	panic!("message {n} carried no Transact");
+}
+
+/// Give `who` exactly `amount` of free balance.
+pub fn fund(who: &AccountId, amount: u128) {
+	<Balances as Mutate<AccountId>>::set_balance(who, amount);
+}
+
+/// Reserve part of `who`'s balance the way the registrar, HRMP, proxy and multisig pallets take
+/// their deposits on the Relay Chain: an unnamed reserve.
+pub fn reserve(who: &AccountId, amount: u128) {
+	<Balances as ReservableCurrency<AccountId>>::reserve(who, amount).unwrap();
 }

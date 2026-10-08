@@ -6,13 +6,13 @@ The migration ends with zero DOT on the Relay Chain. A few accounts are not with
 
 ## What is on the Relay Chain
 
-Each row is one case this stage handles. The rule is filled in as the case is implemented, with the unit test that pins it.
+Each row is one case this stage handles; the rule is filled in as the case is implemented. `tests::migrate_one_account_per_case` runs one account per row.
 
 ### Balances
 
 | # | Case | Rule |
 |---|------|------|
-| 1 | Free balance | |
+| 1 | Free balance | Burned here, teleported to Asset Hub as free balance of the same account. |
 | 2 | Registrar deposit, reserved on the para manager (`paras_registrar::Paras`). A record can say more than the manager has reserved. | |
 | 3 | HRMP channel deposit, reserved on the para sovereign (`hrmp::HrmpChannels`) | |
 | 4 | HRMP open-channel request deposit, reserved on the sender and, once accepted, the recipient (`hrmp::HrmpOpenChannelRequests`) | |
